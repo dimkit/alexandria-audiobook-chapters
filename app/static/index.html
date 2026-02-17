@@ -48,6 +48,14 @@
         .chunk-row.expanded .chunk-expand-btn {
             transform: rotate(180deg);
         }
+        /* Core pipeline tabs - green */
+        .nav-link.nav-pipeline { color: rgba(125, 227, 161, 0.7); }
+        .nav-link.nav-pipeline:hover { color: #7de3a1; }
+        .nav-link.nav-pipeline.active { color: #fff; background-color: #198754; border-radius: 4px; }
+        /* Advanced tabs - blue */
+        .nav-link.nav-advanced { color: rgba(130, 177, 255, 0.7); }
+        .nav-link.nav-advanced:hover { color: #82b1ff; }
+        .nav-link.nav-advanced.active { color: #fff; background-color: #0d6efd; border-radius: 4px; }
     </style>
 </head>
 <body>
@@ -59,14 +67,14 @@
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav me-auto">
-                    <li class="nav-item"><a class="nav-link active" data-tab="setup">1. Setup</a></li>
-                    <li class="nav-item"><a class="nav-link" data-tab="script">2. Script</a></li>
-                    <li class="nav-item"><a class="nav-link" data-tab="voices">3. Voices</a></li>
-                    <li class="nav-item"><a class="nav-link" data-tab="designer">4. Designer</a></li>
-                    <li class="nav-item"><a class="nav-link" data-tab="training">5. Training</a></li>
-                    <li class="nav-item"><a class="nav-link" data-tab="dataset-builder">6. Dataset</a></li>
-                    <li class="nav-item"><a class="nav-link" data-tab="editor">7. Editor</a></li>
-                    <li class="nav-item"><a class="nav-link" data-tab="audio">8. Result</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline active" data-tab="setup">1. Setup</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="script">2. Script</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="voices">3. Voices</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="editor">4. Editor</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="audio">5. Result</a></li>
+                    <li class="nav-item ms-3 border-start border-secondary ps-3"><a class="nav-link nav-advanced" data-tab="designer">Designer</a></li>
+                    <li class="nav-item"><a class="nav-link nav-advanced" data-tab="dataset-builder">Dataset</a></li>
+                    <li class="nav-item"><a class="nav-link nav-advanced" data-tab="training">Training</a></li>
                 </ul>
             </div>
         </div>
@@ -303,9 +311,11 @@
                         <button class="btn btn-success btn-lg" id="btn-gen-script">
                             <i class="fas fa-magic me-2"></i>Generate Annotated Script
                         </button>
-                        <button class="btn btn-outline-primary btn-lg" id="btn-review-script">
-                            <i class="fas fa-check-double me-2"></i>Review Script
+                        <small class="text-muted">Sends the book to your LLM to split it into annotated chunks with speaker labels and voice directions.</small>
+                        <button class="btn btn-outline-secondary btn-lg" id="btn-review-script">
+                            <i class="fas fa-check-double me-2"></i>Review Script (Optional)
                         </button>
+                        <small class="text-muted">Runs a second LLM pass to fix speaker misattributions or formatting issues. Only needed if the generated script has problems.</small>
                     </div>
                 </div>
             </div>
@@ -683,15 +693,29 @@
         <div id="editor-tab" class="tab-content" style="display:none;">
             <div class="card">
                 <div class="card-header d-flex justify-content-between align-items-center">
-                     <h4 class="m-0"><span class="step-indicator step-active">7</span>Audio Editor</h4>
-                     <div class="d-flex gap-2">
-                        <button class="btn btn-primary btn-sm" id="btn-play-seq" onclick="playSequence()"><i class="fas fa-play me-1"></i>Play Sequence</button>
-                        <button class="btn btn-success btn-sm" id="btn-render-all" onclick="renderAll(false)"><i class="fas fa-layer-group me-1"></i>Render Pending</button>
-                        <button class="btn btn-info btn-sm" id="btn-batch-fast" onclick="renderBatchFast(false)" title="Requires custom Qwen3-TTS with batch API"><i class="fas fa-bolt me-1"></i>Batch (Fast) <i class="fas fa-flask"></i></button>
-                        <button class="btn btn-outline-success btn-sm" id="btn-regen-all" onclick="renderAll(true)"><i class="fas fa-redo me-1"></i>Regenerate All</button>
-                        <button class="btn btn-danger btn-sm" id="btn-cancel-render" onclick="cancelRender()" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button>
-                        <button class="btn btn-warning btn-sm" id="btn-merge"><i class="fas fa-file-audio me-1"></i>Merge All</button>
-                     </div>
+                     <h4 class="m-0"><span class="step-indicator step-active">4</span>Audio Editor</h4>
+                     <table class="mb-0" style="border-collapse:separate; border-spacing:8px 0;">
+                        <tr>
+                            <td class="text-center align-top" style="min-width:110px;"><button class="btn btn-primary btn-sm w-100" id="btn-play-seq" onclick="playSequence()"><i class="fas fa-play me-1"></i>Play Sequence</button></td>
+                            <td class="align-middle text-muted px-1">|</td>
+                            <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-success btn-sm w-100" id="btn-batch-fast" onclick="renderBatchFast(false)"><i class="fas fa-bolt me-1"></i>Render Pending</button></td>
+                            <td class="align-middle text-muted px-1">|</td>
+                            <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-outline-success btn-sm w-100" id="btn-regen-all" onclick="renderBatchFast(true)"><i class="fas fa-redo me-1"></i>Regenerate All</button></td>
+                            <td class="text-center align-top"><button class="btn btn-danger btn-sm w-100" id="btn-cancel-render" onclick="cancelRender()" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button></td>
+                            <td class="align-middle text-muted px-1">|</td>
+                            <td class="text-center align-top" style="min-width:100px;"><button class="btn btn-warning btn-sm w-100" id="btn-merge"><i class="fas fa-file-audio me-1"></i>Merge All</button></td>
+                        </tr>
+                        <tr>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Preview generated audio</td>
+                            <td></td>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Generate audio for all unrendered chunks</td>
+                            <td></td>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Re-render everything from scratch</td>
+                            <td></td>
+                            <td></td>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Combine all chunks into final audiobook</td>
+                        </tr>
+                     </table>
                 </div>
                 <div class="card-body">
                      <!-- Full Progress Bar -->
@@ -724,7 +748,7 @@
         <div id="audio-tab" class="tab-content" style="display:none;">
             <div class="card">
                 <div class="card-header">
-                    <h4><span class="step-indicator step-active">8</span>Final Result</h4>
+                    <h4><span class="step-indicator step-active">5</span>Final Result</h4>
                 </div>
                 <div class="card-body">
                     <div id="audio-player-container" class="text-center" style="display:none;">
@@ -1833,7 +1857,6 @@
 
         window.cancelRender = () => {
             isRenderingAll = false;
-            document.getElementById('btn-render-all').style.display = 'inline-block';
             document.getElementById('btn-batch-fast').style.display = 'inline-block';
             document.getElementById('btn-regen-all').style.display = 'inline-block';
             document.getElementById('btn-cancel-render').style.display = 'none';
@@ -1841,7 +1864,7 @@
 
         window.renderAll = async (regenerateAll = false) => {
             isRenderingAll = true;
-            document.getElementById('btn-render-all').style.display = 'none';
+            document.getElementById('btn-batch-fast').style.display = 'none';
             document.getElementById('btn-regen-all').style.display = 'none';
             document.getElementById('btn-cancel-render').style.display = 'inline-block';
 
@@ -1921,7 +1944,6 @@
 
         window.renderBatchFast = async (regenerateAll = false) => {
             isRenderingAll = true;
-            document.getElementById('btn-render-all').style.display = 'none';
             document.getElementById('btn-batch-fast').style.display = 'none';
             document.getElementById('btn-regen-all').style.display = 'none';
             document.getElementById('btn-cancel-render').style.display = 'inline-block';

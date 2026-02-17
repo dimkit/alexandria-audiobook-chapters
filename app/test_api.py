@@ -143,10 +143,56 @@ def test_save_config_roundtrip():
     if original.get("generation") and not readback.get("generation"):
         raise TestFailure("Config round-trip failed: generation section dropped")
 
+    # Verify review prompts persist through config save
+    readback_prompts = readback.get("prompts", {})
+    if original.get("prompts", {}).get("review_system_prompt"):
+        if not readback_prompts.get("review_system_prompt"):
+            raise TestFailure("Config round-trip failed: review_system_prompt dropped")
+
     # Restore original
     restore = {
         "llm": original["llm"],
         "tts": original.get("tts", {"mode": "external", "url": "http://127.0.0.1:7860", "device": "auto"}),
+        "prompts": original.get("prompts"),
+        "generation": original.get("generation"),
+    }
+    post("/api/config", json=restore)
+
+
+def test_save_review_prompts_roundtrip():
+    # Read current config
+    r = get("/api/config")
+    assert_status(r, 200)
+    original = r.json()
+
+    # Save config with custom review prompts
+    test_config = {
+        "llm": original["llm"],
+        "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
+        "prompts": {
+            **(original.get("prompts") or {}),
+            "review_system_prompt": f"{TEST_PREFIX}review_sys",
+            "review_user_prompt": f"{TEST_PREFIX}review_usr",
+        },
+        "generation": original.get("generation"),
+    }
+    r = post("/api/config", json=test_config)
+    assert_status(r, 200)
+
+    # Read back and verify
+    r = get("/api/config")
+    assert_status(r, 200)
+    readback = r.json()
+    prompts = readback.get("prompts", {})
+    if prompts.get("review_system_prompt") != f"{TEST_PREFIX}review_sys":
+        raise TestFailure(f"review_system_prompt not persisted: {prompts.get('review_system_prompt')}")
+    if prompts.get("review_user_prompt") != f"{TEST_PREFIX}review_usr":
+        raise TestFailure(f"review_user_prompt not persisted: {prompts.get('review_user_prompt')}")
+
+    # Restore original
+    restore = {
+        "llm": original["llm"],
+        "tts": original.get("tts", {"mode": "local", "url": "http://127.0.0.1:7860", "device": "auto"}),
         "prompts": original.get("prompts"),
         "generation": original.get("generation"),
     }
@@ -161,6 +207,12 @@ def test_get_default_prompts():
     assert_key(data, "user_prompt")
     if not data["system_prompt"]:
         raise TestFailure("system_prompt is empty")
+    assert_key(data, "review_system_prompt")
+    assert_key(data, "review_user_prompt")
+    if not data["review_system_prompt"]:
+        raise TestFailure("review_system_prompt is empty")
+    if not data["review_user_prompt"]:
+        raise TestFailure("review_user_prompt is empty")
 
 
 # ── Section 3: Upload ───────────────────────────────────────
@@ -776,6 +828,7 @@ def run_all_tests():
     section("Config")
     run_test("get_config", test_get_config)
     run_test("save_config_roundtrip", test_save_config_roundtrip)
+    run_test("save_review_prompts_roundtrip", test_save_review_prompts_roundtrip)
     run_test("get_default_prompts", test_get_default_prompts)
 
     section("Upload")

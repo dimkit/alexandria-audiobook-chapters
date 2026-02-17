@@ -95,7 +95,7 @@ class LLMConfig(BaseModel):
     model_name: str
 
 class TTSConfig(BaseModel):
-    mode: str = "external"  # "local" or "external"
+    mode: str = "local"  # "local" or "external"
     url: str = "http://127.0.0.1:7860"  # external mode only
     device: str = "auto"  # local mode: "auto", "cuda:0", "cpu", etc.
     language: str = "English"  # TTS language
@@ -300,7 +300,7 @@ async def get_config():
             "model_name": "richardyoung/qwen3-14b-abliterated:Q8_0"
         },
         "tts": {
-            "mode": "external",
+            "mode": "local",
             "url": "http://127.0.0.1:7860",
             "device": "auto"
         },
