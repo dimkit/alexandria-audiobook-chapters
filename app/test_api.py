@@ -548,7 +548,18 @@ def test_lora_list_models():
     data = r.json()
     if not isinstance(data, list):
         raise TestFailure(f"Expected list, got {type(data).__name__}")
+    # Verify built-in adapters have 'downloaded' field
+    for m in data:
+        if m.get("builtin"):
+            if "downloaded" not in m:
+                raise TestFailure(f"Built-in adapter {m['id']} missing 'downloaded' field")
     shared["lora_models"] = data
+
+
+def test_lora_download_invalid():
+    r = post(f"/api/lora/download/{TEST_PREFIX}fake_adapter", json={})
+    if r.status_code < 400:
+        raise TestFailure(f"Expected error for invalid adapter, got {r.status_code}")
 
 
 def test_lora_delete_model_404():
@@ -875,6 +886,7 @@ def run_all_tests():
 
     section("LoRA Models")
     run_test("lora_list_models", test_lora_list_models)
+    run_test("lora_download_invalid", test_lora_download_invalid)
     run_test("lora_delete_model_404", test_lora_delete_model_404)
     run_test("lora_train_bad_dataset", test_lora_train_bad_dataset)
     run_test("lora_preview_404", test_lora_preview_404)

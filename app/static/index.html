@@ -1231,12 +1231,12 @@
                                                     let html = '';
                                                     if (males.length) {
                                                         html += '<optgroup label="Male">';
-                                                        html += males.map(m => `<option value="${m.id}" ${config.adapter_id === m.id ? 'selected' : ''}>${m.name} — ${m.description || ''}</option>`).join('');
+                                                        html += males.map(m => `<option value="${m.id}" ${config.adapter_id === m.id ? 'selected' : ''} ${m.downloaded === false ? 'disabled' : ''}>${m.name}${m.downloaded === false ? ' (not downloaded)' : ''} — ${m.description || ''}</option>`).join('');
                                                         html += '</optgroup>';
                                                     }
                                                     if (females.length) {
                                                         html += '<optgroup label="Female">';
-                                                        html += females.map(m => `<option value="${m.id}" ${config.adapter_id === m.id ? 'selected' : ''}>${m.name} — ${m.description || ''}</option>`).join('');
+                                                        html += females.map(m => `<option value="${m.id}" ${config.adapter_id === m.id ? 'selected' : ''} ${m.downloaded === false ? 'disabled' : ''}>${m.name}${m.downloaded === false ? ' (not downloaded)' : ''} — ${m.description || ''}</option>`).join('');
                                                         html += '</optgroup>';
                                                     }
                                                     return html;
@@ -1247,6 +1247,7 @@
                                             <input type="text" class="form-control builtin-lora-style" placeholder="Character style (e.g. refined aristocratic tone, heavy Scottish accent)" value="${voiceType === 'builtin_lora' ? (config.character_style || '') : ''}">
                                         </div>
                                     </div>
+                                    <small class="text-muted mt-1 d-block">Grayed-out voices need to be downloaded first. Go to the <strong>Training</strong> tab to download them.</small>
                                 </div>
 
                                 <!-- Clone Options -->
@@ -2524,15 +2525,19 @@
                         <tbody>
                             ${models.map(m => `
                                 <tr${m.builtin ? ' class="table-light"' : ''}>
-                                    <td><strong>${m.name}</strong>${m.builtin ? ' <span class="badge bg-secondary">built-in</span>' : ''}</td>
+                                    <td><strong>${m.name}</strong>${m.builtin ? ` <span class="badge bg-secondary">built-in</span>${m.downloaded === false ? ' <span class="badge bg-warning text-dark">not downloaded</span>' : ''}` : ''}</td>
                                     <td>${m.dataset_id || (m.builtin ? '--' : '--')}</td>
                                     <td>${m.epochs || '--'}</td>
                                     <td>${m.final_loss != null ? m.final_loss.toFixed(4) : '--'}</td>
                                     <td>${m.sample_count || '--'}</td>
                                     <td>
-                                        <button class="btn btn-sm ${m.preview_audio_url ? 'btn-outline-success' : 'btn-outline-secondary'} me-1" id="lora-preview-btn-${m.id}" onclick="playLoraPreview('${m.id}')" title="${m.preview_audio_url ? 'Play preview' : 'Generate and play preview (first time may take a moment)'}"><i class="fas fa-volume-up"></i></button>
-                                        <button class="btn btn-sm btn-outline-primary me-1" onclick="testLoraModel('${m.id}')" title="Generate test line with custom text"><i class="fas fa-flask me-1"></i>Test</button>
-                                        ${m.builtin ? '' : `<button class="btn btn-sm btn-outline-danger" onclick="deleteLoraModel('${m.id}')" title="Delete"><i class="fas fa-trash"></i></button>`}
+                                        ${m.builtin && m.downloaded === false ? `
+                                            <button class="btn btn-sm btn-outline-warning" id="lora-dl-btn-${m.id}" onclick="downloadBuiltinAdapter('${m.id}')" title="Download from HuggingFace"><i class="fas fa-download me-1"></i>Download</button>
+                                        ` : `
+                                            <button class="btn btn-sm ${m.preview_audio_url ? 'btn-outline-success' : 'btn-outline-secondary'} me-1" id="lora-preview-btn-${m.id}" onclick="playLoraPreview('${m.id}')" title="${m.preview_audio_url ? 'Play preview' : 'Generate and play preview (first time may take a moment)'}"><i class="fas fa-volume-up"></i></button>
+                                            <button class="btn btn-sm btn-outline-primary me-1" onclick="testLoraModel('${m.id}')" title="Generate test line with custom text"><i class="fas fa-flask me-1"></i>Test</button>
+                                            ${m.builtin ? '' : `<button class="btn btn-sm btn-outline-danger" onclick="deleteLoraModel('${m.id}')" title="Delete"><i class="fas fa-trash"></i></button>`}
+                                        `}
                                     </td>
                                 </tr>
                             `).join('')}
@@ -2542,7 +2547,7 @@
                 // Populate test dropdown
                 const dropdown = document.getElementById('lora-test-adapter');
                 const prevVal = dropdown.value;
-                dropdown.innerHTML = models.map(m =>
+                dropdown.innerHTML = models.filter(m => m.downloaded !== false).map(m =>
                     `<option value="${m.id}">${m.name}</option>`
                 ).join('');
                 if (prevVal && models.some(m => m.id === prevVal)) dropdown.value = prevVal;
@@ -2612,6 +2617,23 @@
                 loadLoraModels();
             } catch (e) {
                 showToast('Error deleting adapter: ' + e.message, 'error');
+            }
+        };
+
+        window.downloadBuiltinAdapter = async (adapterId) => {
+            const btn = document.getElementById(`lora-dl-btn-${adapterId}`);
+            const origHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Downloading...';
+
+            try {
+                await API.post(`/api/lora/download/${encodeURIComponent(adapterId)}`, {});
+                showToast('Adapter downloaded successfully.', 'success');
+                loadLoraModels();
+            } catch (e) {
+                showToast('Download failed: ' + e.message, 'error');
+                btn.disabled = false;
+                btn.innerHTML = origHtml;
             }
         };
 

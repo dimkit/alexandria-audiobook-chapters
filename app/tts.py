@@ -661,8 +661,20 @@ class TTSEngine:
                 adapter_path = os.path.join(root_dir, adapter_path)
 
             if not os.path.isdir(adapter_path):
-                print(f"Error: LoRA adapter path not found: {adapter_path}")
-                return False
+                # Auto-download built-in adapters from HF
+                adapter_id = os.path.basename(adapter_path)
+                if adapter_id.startswith("builtin_"):
+                    print(f"Adapter {adapter_id} not downloaded, attempting auto-download...")
+                    try:
+                        from hf_utils import download_builtin_adapter
+                        builtin_dir = os.path.dirname(adapter_path)
+                        download_builtin_adapter(adapter_id, builtin_dir)
+                    except Exception as e:
+                        print(f"Error: Auto-download failed for {adapter_id}: {e}")
+                        return False
+                else:
+                    print(f"Error: LoRA adapter path not found: {adapter_path}")
+                    return False
 
             # Load reference audio and text from adapter directory
             ref_wav_path = os.path.join(adapter_path, "ref_sample.wav")

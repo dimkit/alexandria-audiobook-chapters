@@ -1,6 +1,6 @@
 [
   {
-    "id": "builtin_watson",
+    "id": "watson",
     "name": "Watson",
     "gender": "male",
     "description": "Warm, measured baritone",
@@ -10,13 +10,13 @@
     "sample_count": 61
   },
   {
-    "id": "builtin_sion",
+    "id": "sion",
     "name": "Sion",
     "gender": "male",
     "description": "Clear, steady tenor",
     "lora_r": 32,
     "epochs": 10,
-    "final_loss": 4.10,
+    "final_loss": 4.1,
     "sample_count": 61
   }
 ]

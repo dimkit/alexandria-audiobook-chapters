@@ -54,8 +54,10 @@ designed_voices/
 lora_models/
 lora_datasets/
 
-# Built-in LoRA test audio (generated at runtime)
-builtin_lora/*/test_*.wav
+# Built-in LoRA adapter files (downloaded from HF on demand)
+builtin_lora/builtin_*/
+# Keep manifest.json tracked as offline fallback
+!builtin_lora/manifest.json
 
 # Dataset builder working directory
 dataset_builder/

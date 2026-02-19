@@ -21,6 +21,7 @@ import aiofiles
 from project import ProjectManager
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, load_default_prompts
 from review_prompts import load_review_prompts
+from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -946,17 +947,18 @@ async def voice_design_delete(voice_id: str):
 LORA_MODELS_MANIFEST = os.path.join(LORA_MODELS_DIR, "manifest.json")
 
 def _load_builtin_lora_manifest():
-    """Load built-in LoRA adapter manifest, filtering to adapters with files present."""
-    entries = _load_manifest(BUILTIN_LORA_MANIFEST)
+    """Load built-in LoRA manifest from HF (with local fallback). Returns ALL entries with download status."""
+    entries = fetch_builtin_manifest(BUILTIN_LORA_DIR)
     result = []
     for entry in entries:
-        adapter_dir = os.path.join(BUILTIN_LORA_DIR, entry["id"])
-        if os.path.isdir(adapter_dir) and os.path.exists(
-            os.path.join(adapter_dir, "adapter_model.safetensors")
-        ):
-            entry["builtin"] = True
-            entry["adapter_path"] = f"builtin_lora/{entry['id']}"
-            result.append(entry)
+        entry = dict(entry)  # avoid mutating cached list
+        local_id = entry["id"] if entry["id"].startswith("builtin_") else f"builtin_{entry['id']}"
+        downloaded = is_adapter_downloaded(local_id, BUILTIN_LORA_DIR)
+        entry["id"] = local_id
+        entry["builtin"] = True
+        entry["downloaded"] = downloaded
+        entry["adapter_path"] = f"builtin_lora/{local_id}" if downloaded else None
+        result.append(entry)
     return result
 
 @app.post("/api/lora/upload_dataset")
@@ -1235,8 +1237,13 @@ async def lora_list_models():
     """List all LoRA adapters (built-in + user-trained)."""
     models = _load_builtin_lora_manifest() + _load_manifest(LORA_MODELS_MANIFEST)
     for m in models:
-        # Add ref sample URL if available
         is_builtin = m.get("builtin", False)
+        is_downloaded = m.get("downloaded", True)  # user-trained are always downloaded
+
+        if not is_downloaded:
+            m["preview_audio_url"] = None
+            continue
+
         if is_builtin:
             adapter_dir = os.path.join(BUILTIN_LORA_DIR, m["id"])
             url_prefix = f"/builtin_lora/{m['id']}"
@@ -1270,6 +1277,26 @@ async def lora_delete_model(adapter_id: str):
     logger.info(f"LoRA adapter deleted: {adapter_id}")
     return {"status": "deleted", "adapter_id": adapter_id}
 
+@app.post("/api/lora/download/{adapter_id}")
+async def lora_download_builtin(adapter_id: str):
+    """Download a built-in LoRA adapter from HuggingFace."""
+    manifest = fetch_builtin_manifest(BUILTIN_LORA_DIR)
+    hf_name = adapter_id.replace("builtin_", "", 1)
+    entry = next((e for e in manifest if e["id"] == hf_name or e["id"] == adapter_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Unknown built-in adapter: {adapter_id}")
+
+    if is_adapter_downloaded(adapter_id, BUILTIN_LORA_DIR):
+        return {"status": "already_downloaded", "adapter_id": adapter_id}
+
+    try:
+        download_builtin_adapter(adapter_id, BUILTIN_LORA_DIR)
+        logger.info(f"Built-in adapter downloaded: {adapter_id}")
+        return {"status": "downloaded", "adapter_id": adapter_id}
+    except Exception as e:
+        logger.error(f"Download failed for {adapter_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/lora/test")
 async def lora_test_model(request: LoraTestRequest):
     """Generate test audio using a LoRA adapter (built-in or user-trained)."""
@@ -1289,7 +1316,13 @@ async def lora_test_model(request: LoraTestRequest):
         adapter_dir = os.path.join(LORA_MODELS_DIR, request.adapter_id)
         audio_url_prefix = f"/lora_models/{request.adapter_id}"
 
-    if not os.path.isdir(adapter_dir):
+    if not os.path.isdir(adapter_dir) and is_builtin:
+        try:
+            download_builtin_adapter(request.adapter_id, BUILTIN_LORA_DIR)
+            adapter_dir = os.path.join(BUILTIN_LORA_DIR, request.adapter_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Auto-download failed: {e}")
+    elif not os.path.isdir(adapter_dir):
         raise HTTPException(status_code=404, detail="Adapter files not found")
 
     engine = project_manager.get_engine()
@@ -1342,7 +1375,13 @@ async def lora_preview(adapter_id: str):
         adapter_dir = os.path.join(LORA_MODELS_DIR, adapter_id)
         url_prefix = f"/lora_models/{adapter_id}"
 
-    if not os.path.isdir(adapter_dir):
+    if not os.path.isdir(adapter_dir) and is_builtin:
+        try:
+            download_builtin_adapter(adapter_id, BUILTIN_LORA_DIR)
+            adapter_dir = os.path.join(BUILTIN_LORA_DIR, adapter_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Auto-download failed: {e}")
+    elif not os.path.isdir(adapter_dir):
         raise HTTPException(status_code=404, detail="Adapter files not found")
 
     preview_path = os.path.join(adapter_dir, "preview_sample.wav")
@@ -1747,4 +1786,4 @@ async def dataset_builder_delete(name: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=4200, access_log=False)
+    uvicorn.run(app, host="0.0.0.0", port=4200, access_log=False)
