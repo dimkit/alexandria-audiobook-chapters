@@ -5,6 +5,12 @@ module.exports = {
       message: "uv cache clean"
     }
   }, {
+    when: "{{!which('sox')}}",
+    method: "shell.run",
+    params: {
+      message: "conda install -y -c conda-forge sox"
+    }
+  }, {
     method: "shell.run",
     params: {
       path: "app",

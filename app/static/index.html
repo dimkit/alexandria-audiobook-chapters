@@ -762,6 +762,31 @@
                          </div>
                      </div>
 
+                     <div id="editor-estimate-panel" class="border rounded p-3 mb-3" style="background: var(--bs-light, #f8f9fa);">
+                         <div class="row g-3">
+                             <div class="col-md-2 col-sm-6">
+                                 <div class="small text-muted">Queue ETA</div>
+                                 <div class="fw-semibold" id="editor-estimate-eta">Waiting for data</div>
+                             </div>
+                             <div class="col-md-2 col-sm-6">
+                                 <div class="small text-muted">Rolling Clip Time</div>
+                                 <div class="fw-semibold" id="editor-estimate-clip-time">Waiting for data</div>
+                             </div>
+                             <div class="col-md-2 col-sm-6">
+                                 <div class="small text-muted">Rolling Speed</div>
+                                 <div class="fw-semibold" id="editor-estimate-speed">Not enough samples</div>
+                             </div>
+                             <div class="col-md-3 col-sm-6">
+                                 <div class="small text-muted">Remaining Queue Words</div>
+                                 <div class="fw-semibold" id="editor-estimate-words">0</div>
+                             </div>
+                             <div class="col-md-3 col-sm-6">
+                                 <div class="small text-muted">Errors</div>
+                                 <div class="fw-semibold" id="editor-estimate-errors">0 clips, 0.0%</div>
+                             </div>
+                         </div>
+                     </div>
+
                      <div class="table-responsive">
                          <table class="table table-bordered table-hover">
                              <thead>
@@ -1778,6 +1803,44 @@
             cancelBtn.style.display = hasAudioWork ? 'inline-block' : 'none';
         }
 
+        function formatDuration(seconds) {
+            if (seconds == null || !Number.isFinite(seconds)) return 'Waiting for data';
+            const rounded = Math.max(0, Math.round(seconds));
+            const hours = Math.floor(rounded / 3600);
+            const minutes = Math.floor((rounded % 3600) / 60);
+            const secs = rounded % 60;
+            if (hours > 0) return `${hours}h ${minutes}m`;
+            if (minutes > 0) return `${minutes}m ${secs}s`;
+            return `${secs}s`;
+        }
+
+        function formatNumber(value) {
+            return new Intl.NumberFormat('en-US').format(value || 0);
+        }
+
+        function renderAudioEstimatePanel(audioState) {
+            const metrics = audioState?.metrics || {};
+            const etaEl = document.getElementById('editor-estimate-eta');
+            const clipTimeEl = document.getElementById('editor-estimate-clip-time');
+            const speedEl = document.getElementById('editor-estimate-speed');
+            const wordsEl = document.getElementById('editor-estimate-words');
+            const errorsEl = document.getElementById('editor-estimate-errors');
+            if (!etaEl || !clipTimeEl || !speedEl || !wordsEl || !errorsEl) return;
+
+            etaEl.textContent = formatDuration(metrics.estimated_remaining_seconds);
+            const sampleCount = metrics.processed_clips || 0;
+            clipTimeEl.textContent = sampleCount > 0
+                ? formatDuration((metrics.total_elapsed_seconds || 0) / sampleCount)
+                : 'Waiting for data';
+            speedEl.textContent = metrics.words_per_minute
+                ? `${Math.round(metrics.words_per_minute)} words/min`
+                : 'Not enough samples';
+            wordsEl.textContent = formatNumber(metrics.remaining_words);
+            const errorCount = metrics.error_clips || 0;
+            const errorRate = ((metrics.error_rate || 0) * 100).toFixed(1);
+            errorsEl.textContent = `${errorCount} clip${errorCount === 1 ? '' : 's'}, ${errorRate}%`;
+        }
+
         function renderAudioQueueStatus(audioState) {
             const el = document.getElementById('editor-queue-status');
             if (!el) return;
@@ -1797,6 +1860,7 @@
             const audioState = await API.get('/api/status/audio');
             updateAudioQueueControls(audioState);
             renderAudioQueueStatus(audioState);
+            renderAudioEstimatePanel(audioState);
             return audioState;
         }
 

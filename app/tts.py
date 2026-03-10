@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import re
 import json
@@ -342,6 +344,34 @@ class TTSEngine:
             print(f"  Model not cached locally, downloading {model_id}...")
             return model_cls.from_pretrained(model_id, **load_kwargs)
 
+    @staticmethod
+    def _import_qwen_tts_model(device):
+        """Import Qwen3TTSModel while suppressing irrelevant flash-attn warnings.
+
+        qwen-tts prints a flash-attn installation warning during import even on
+        non-CUDA runtimes such as Apple Silicon and CPU, where flash-attn is not
+        applicable for this session. Keep the import noise on CUDA, where the
+        warning is actionable, and suppress only the known upstream message
+        elsewhere.
+        """
+        if "cuda" in str(device).lower():
+            from qwen_tts import Qwen3TTSModel
+            return Qwen3TTSModel
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            from qwen_tts import Qwen3TTSModel
+
+        captured = buffer.getvalue()
+        if captured:
+            filtered = captured.replace(
+                "\n********\nWarning: flash-attn is not installed. Will only run the manual PyTorch version. Please install flash-attn for faster inference.\n********\n ",
+                "",
+            ).strip()
+            if filtered:
+                print(filtered)
+        return Qwen3TTSModel
+
     def _init_local_custom(self):
         """Load Qwen3-TTS CustomVoice model on demand."""
         if self._local_custom_model is not None:
@@ -354,9 +384,8 @@ class TTSEngine:
             self._enable_rocm_optimizations()
 
             import torch
-            from qwen_tts import Qwen3TTSModel
-
             device = self._resolve_device()
+            Qwen3TTSModel = self._import_qwen_tts_model(device)
             dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
             print(f"Loading Qwen3-TTS CustomVoice model on {device} ({dtype})...")
@@ -383,9 +412,8 @@ class TTSEngine:
             self._enable_rocm_optimizations()
 
             import torch
-            from qwen_tts import Qwen3TTSModel
-
             device = self._resolve_device()
+            Qwen3TTSModel = self._import_qwen_tts_model(device)
             dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
             print(f"Loading Qwen3-TTS Base model (voice cloning) on {device} ({dtype})...")
@@ -412,9 +440,8 @@ class TTSEngine:
             self._enable_rocm_optimizations()
 
             import torch
-            from qwen_tts import Qwen3TTSModel
-
             device = self._resolve_device()
+            Qwen3TTSModel = self._import_qwen_tts_model(device)
             dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
             print(f"Loading Qwen3-TTS VoiceDesign model on {device} ({dtype})...")
@@ -454,10 +481,10 @@ class TTSEngine:
             self._enable_rocm_optimizations()
 
             import torch
-            from qwen_tts import Qwen3TTSModel
             from peft import PeftModel
 
             device = self._resolve_device()
+            Qwen3TTSModel = self._import_qwen_tts_model(device)
             dtype = torch.bfloat16 if "cuda" in device else torch.float32
 
             print(f"Loading Qwen3-TTS Base model + LoRA adapter on {device} ({dtype})...")

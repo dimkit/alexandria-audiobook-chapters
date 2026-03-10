@@ -833,7 +833,7 @@ class ProjectManager:
         return chapters
 
     def generate_chunks_parallel(self, indices, max_workers=2, progress_callback=None,
-                                  cancel_check=None):
+                                  cancel_check=None, item_callback=None):
         """Generate multiple chunks in parallel using ThreadPoolExecutor.
 
         Uses individual TTS API calls with per-speaker voice settings.
@@ -843,6 +843,7 @@ class ProjectManager:
             max_workers: Number of concurrent TTS workers
             progress_callback: Optional callback(completed, failed, total) for progress updates
             cancel_check: Optional callable returning True when cancellation is requested
+            item_callback: Optional callback(index, success, elapsed_seconds, input_words, output_words)
 
         Returns:
             dict with 'completed', 'failed', and 'cancelled' keys
@@ -862,10 +863,22 @@ class ProjectManager:
             return results
 
         print(f"Starting parallel generation of {total} chunks with {max_workers} workers...")
+        word_counts = {
+            idx: len(re.findall(r"\b\w+\b", chunks[idx].get("text", "")))
+            for idx in indices if 0 <= idx < len(chunks)
+        }
+
+        def _timed_generate(idx):
+            start = time.time()
+            try:
+                success, msg = self.generate_chunk_audio(idx)
+                return success, msg, time.time() - start
+            except Exception as e:
+                return False, str(e), time.time() - start
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(self.generate_chunk_audio, idx): idx
+                executor.submit(_timed_generate, idx): idx
                 for idx in indices
             }
 
@@ -878,18 +891,17 @@ class ProjectManager:
                     break
 
                 idx = futures[future]
-                try:
-                    success, msg = future.result()
-                    if success:
-                        results["completed"].append(idx)
-                        print(f"Chunk {idx} completed: {msg}")
-                    else:
-                        results["failed"].append((idx, msg))
-                        print(f"Chunk {idx} failed: {msg}")
-                except Exception as e:
-                    results["failed"].append((idx, str(e)))
-                    print(f"Chunk {idx} error: {e}")
-
+                success, msg, elapsed_seconds = future.result()
+                if success:
+                    results["completed"].append(idx)
+                    print(f"Chunk {idx} completed: {msg}")
+                    if item_callback:
+                        item_callback(idx, True, elapsed_seconds, word_counts.get(idx, 0), word_counts.get(idx, 0))
+                else:
+                    results["failed"].append((idx, msg))
+                    print(f"Chunk {idx} failed: {msg}")
+                    if item_callback:
+                        item_callback(idx, False, elapsed_seconds, word_counts.get(idx, 0), 0)
                 if progress_callback:
                     progress_callback(len(results["completed"]), len(results["failed"]), total)
 
@@ -952,7 +964,7 @@ class ProjectManager:
         return reordered
 
     def generate_chunks_batch(self, indices, batch_seed=-1, batch_size=4, progress_callback=None,
-                               batch_group_by_type=False, cancel_check=None):
+                               batch_group_by_type=False, cancel_check=None, item_callback=None):
         """Generate multiple chunks using batch TTS API with a single seed.
 
         Args:
@@ -963,6 +975,7 @@ class ProjectManager:
             batch_group_by_type: Group indices by voice type before batching for
                 GPU efficiency. When False, indices are batched in sequential order.
             cancel_check: Optional callable returning True when cancellation is requested
+            item_callback: Optional callback(index, success, elapsed_seconds, input_words, output_words)
 
         Returns:
             dict with 'completed', 'failed', and 'cancelled' keys
@@ -983,6 +996,10 @@ class ProjectManager:
 
         print(f"Starting batch generation of {total} chunks (batch_size={batch_size}, seed={batch_seed}, "
               f"group_by_type={batch_group_by_type})...")
+        word_counts = {
+            idx: len(re.findall(r"\b\w+\b", chunks[idx].get("text", "")))
+            for idx in indices if 0 <= idx < len(chunks)
+        }
         voice_config = {}
         if os.path.exists(self.voice_config_path):
             with open(self.voice_config_path, "r", encoding="utf-8") as f:
@@ -1035,10 +1052,14 @@ class ProjectManager:
                     })
 
             # Call batch TTS with single seed
+            batch_start = time.time()
             batch_results = engine.generate_batch(batch_chunks, voice_config, self.root_dir, batch_seed)
 
             # Process completed chunks - convert to MP3 and update status
             chunks = self.load_chunks()  # Reload for each batch
+
+            processed_in_batch = len(batch_results["completed"]) + len(batch_results["failed"])
+            shared_elapsed = (time.time() - batch_start) / processed_in_batch if processed_in_batch > 0 else 0.0
 
             for idx in batch_results["completed"]:
                 if not (0 <= idx < len(chunks)):
@@ -1066,19 +1087,29 @@ class ProjectManager:
                     if result["status"] == "done":
                         results["completed"].append(idx)
                         print(f"Chunk {idx} completed: {chunks[idx]['audio_path']}")
+                        if item_callback:
+                            item_callback(idx, True, shared_elapsed, word_counts.get(idx, 0), word_counts.get(idx, 0))
                     elif auto_regenerate_bad_clips:
                         print(f"Chunk {idx} failed validation in batch; retrying immediately at the front of the queue")
+                        retry_start = time.time()
                         retry_success, retry_msg = self.generate_chunk_audio(idx, attempt=1)
+                        retry_elapsed = time.time() - retry_start
                         chunks = self.load_chunks()
                         if retry_success:
                             results["completed"].append(idx)
                             print(f"Chunk {idx} completed after auto-regeneration: {retry_msg}")
+                            if item_callback:
+                                item_callback(idx, True, shared_elapsed + retry_elapsed, word_counts.get(idx, 0), word_counts.get(idx, 0))
                         else:
                             results["failed"].append((idx, retry_msg))
                             print(f"Chunk {idx} failed after auto-regeneration: {retry_msg}")
+                            if item_callback:
+                                item_callback(idx, False, shared_elapsed + retry_elapsed, word_counts.get(idx, 0), 0)
                     else:
                         results["failed"].append((idx, result["error"]))
                         print(f"Chunk {idx} failed validation: {result['error']}")
+                        if item_callback:
+                            item_callback(idx, False, shared_elapsed, word_counts.get(idx, 0), 0)
 
                     self._cleanup_temp_file(temp_path)
 
@@ -1088,12 +1119,16 @@ class ProjectManager:
                     chunks[idx]["status"] = "error"
                     chunks[idx]["audio_validation"] = None
                     self._cleanup_temp_file(temp_path)
+                    if item_callback:
+                        item_callback(idx, False, shared_elapsed, word_counts.get(idx, 0), 0)
 
             for idx, error in batch_results["failed"]:
                 if 0 <= idx < len(chunks):
                     chunks[idx]["status"] = "error"
                     chunks[idx]["audio_validation"] = None
                 results["failed"].append((idx, error))
+                if item_callback:
+                    item_callback(idx, False, shared_elapsed, word_counts.get(idx, 0), 0)
 
             self.save_chunks(chunks)
 

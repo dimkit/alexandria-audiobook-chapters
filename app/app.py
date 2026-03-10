@@ -245,10 +245,13 @@ class DatasetBuilderUpdateRowsRequest(BaseModel):
     rows: List[dict]  # [{emotion, text, seed}]
 
 # Global state for process tracking
+ROLLING_AUDIO_SAMPLE_LIMIT = 50
+
+
 process_state = {
     "script": {"running": False, "logs": []},
     "voices": {"running": False, "logs": []},
-    "audio": {"running": False, "logs": [], "cancel": False, "queue": [], "current_job": None, "recent_jobs": [], "merge_running": False},
+    "audio": {"running": False, "logs": [], "cancel": False, "queue": [], "current_job": None, "recent_jobs": [], "merge_running": False, "metrics": {}},
     "audacity_export": {"running": False, "logs": []},
     "m4b_export": {"running": False, "logs": []},
     "review": {"running": False, "logs": []},
@@ -269,6 +272,73 @@ def _trim_logs(logs, limit=1000):
         logs.pop(0)
 
 
+def _count_words(text):
+    return len(re.findall(r"\b\w+\b", text or ""))
+
+
+def _new_audio_metrics():
+    return {
+        "sample_window_size": ROLLING_AUDIO_SAMPLE_LIMIT,
+        "samples": [],
+        "processed_clips": 0,
+        "successful_clips": 0,
+        "error_clips": 0,
+        "rolling_seconds": 0.0,
+        "rolling_output_words": 0,
+        "rolling_input_words": 0,
+        "total_elapsed_seconds": 0.0,
+        "total_output_words": 0,
+        "total_input_words": 0,
+        "remaining_words": 0,
+        "estimated_remaining_seconds": None,
+        "words_per_minute": None,
+        "error_rate": 0.0,
+    }
+
+
+process_state["audio"]["metrics"] = _new_audio_metrics()
+
+
+def _format_audio_metrics_locked():
+    metrics = process_state["audio"]["metrics"]
+    return {
+        "sample_window_size": metrics["sample_window_size"],
+        "processed_clips": metrics["processed_clips"],
+        "successful_clips": metrics["successful_clips"],
+        "error_clips": metrics["error_clips"],
+        "rolling_seconds": metrics["rolling_seconds"],
+        "rolling_output_words": metrics["rolling_output_words"],
+        "rolling_input_words": metrics["rolling_input_words"],
+        "total_elapsed_seconds": metrics["total_elapsed_seconds"],
+        "total_output_words": metrics["total_output_words"],
+        "total_input_words": metrics["total_input_words"],
+        "remaining_words": metrics["remaining_words"],
+        "estimated_remaining_seconds": metrics["estimated_remaining_seconds"],
+        "words_per_minute": metrics["words_per_minute"],
+        "error_rate": metrics["error_rate"],
+    }
+
+
+def _recompute_audio_metrics_locked():
+    metrics = process_state["audio"]["metrics"]
+    metrics["remaining_words"] = sum(job.get("remaining_words", 0) for job in audio_queue)
+    if audio_current_job is not None:
+        metrics["remaining_words"] += audio_current_job.get("remaining_words", 0)
+
+    if metrics["rolling_seconds"] > 0 and metrics["rolling_output_words"] > 0:
+        words_per_second = metrics["rolling_output_words"] / metrics["rolling_seconds"]
+        metrics["words_per_minute"] = words_per_second * 60.0
+        metrics["estimated_remaining_seconds"] = metrics["remaining_words"] / words_per_second if metrics["remaining_words"] > 0 else 0.0
+    else:
+        metrics["words_per_minute"] = None
+        metrics["estimated_remaining_seconds"] = None if metrics["remaining_words"] > 0 else 0.0
+
+    if metrics["processed_clips"] > 0:
+        metrics["error_rate"] = metrics["error_clips"] / metrics["processed_clips"]
+    else:
+        metrics["error_rate"] = 0.0
+
+
 def _serialize_audio_job(job):
     return {
         "id": job["id"],
@@ -278,6 +348,10 @@ def _serialize_audio_job(job):
         "scope": job["scope"],
         "indices": list(job["indices"]),
         "total_chunks": job["total_chunks"],
+        "total_words": job.get("total_words", 0),
+        "remaining_words": job.get("remaining_words", 0),
+        "processed_clips": job.get("processed_clips", 0),
+        "error_clips": job.get("error_clips", 0),
         "queued_at": job["queued_at"],
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
@@ -288,6 +362,7 @@ def _refresh_audio_process_state_locked():
     process_state["audio"]["queue"] = [_serialize_audio_job(job) for job in audio_queue]
     process_state["audio"]["current_job"] = _serialize_audio_job(audio_current_job) if audio_current_job else None
     process_state["audio"]["running"] = audio_current_job is not None or process_state["audio"].get("merge_running", False)
+    process_state["audio"]["metrics"] = _format_audio_metrics_locked()
 
 
 def _append_audio_log(message):
@@ -303,6 +378,42 @@ def _append_audio_log_locked(message):
 def _record_audio_recent_job_locked(job):
     process_state["audio"]["recent_jobs"].insert(0, _serialize_audio_job(job))
     del process_state["audio"]["recent_jobs"][10:]
+
+
+def _record_audio_sample_locked(job, chunk_index, elapsed_seconds, input_words, output_words, success):
+    metrics = process_state["audio"]["metrics"]
+    sample = {
+        "job_id": job["id"],
+        "chunk_index": chunk_index,
+        "elapsed_seconds": max(0.0, float(elapsed_seconds)),
+        "input_words": max(0, int(input_words)),
+        "output_words": max(0, int(output_words)),
+        "success": bool(success),
+    }
+    metrics["samples"].append(sample)
+    metrics["rolling_seconds"] += sample["elapsed_seconds"]
+    metrics["rolling_input_words"] += sample["input_words"]
+    metrics["rolling_output_words"] += sample["output_words"]
+    while len(metrics["samples"]) > metrics["sample_window_size"]:
+        removed = metrics["samples"].pop(0)
+        metrics["rolling_seconds"] -= removed["elapsed_seconds"]
+        metrics["rolling_input_words"] -= removed["input_words"]
+        metrics["rolling_output_words"] -= removed["output_words"]
+
+    metrics["processed_clips"] += 1
+    metrics["total_elapsed_seconds"] += sample["elapsed_seconds"]
+    metrics["total_input_words"] += sample["input_words"]
+    metrics["total_output_words"] += sample["output_words"]
+    if success:
+        metrics["successful_clips"] += 1
+    else:
+        metrics["error_clips"] += 1
+
+    job["processed_clips"] = job.get("processed_clips", 0) + 1
+    if not success:
+        job["error_clips"] = job.get("error_clips", 0) + 1
+    job["remaining_words"] = max(0, job.get("remaining_words", 0) - sample["input_words"])
+    _recompute_audio_metrics_locked()
 
 
 def _load_audio_worker_settings():
@@ -341,12 +452,30 @@ def _enqueue_audio_job(kind, indices, label=None, scope=None):
         if audio_current_job is None and not audio_queue:
             process_state["audio"]["logs"] = []
             process_state["audio"]["recent_jobs"] = []
+            process_state["audio"]["metrics"] = _new_audio_metrics()
+
+        chunks = project_manager.load_chunks()
+        valid_indices = []
+        word_counts = {}
+        for idx in indices:
+            if 0 <= idx < len(chunks):
+                text = chunks[idx].get("text", "")
+                if text and text.strip():
+                    valid_indices.append(idx)
+                    word_counts[idx] = _count_words(text)
+        if not valid_indices:
+            raise HTTPException(status_code=400, detail="No non-empty chunk indices provided")
 
         job = {
             "id": audio_job_counter,
             "kind": kind,
-            "indices": list(indices),
-            "total_chunks": len(indices),
+            "indices": valid_indices,
+            "word_counts": word_counts,
+            "total_chunks": len(valid_indices),
+            "total_words": sum(word_counts.values()),
+            "remaining_words": sum(word_counts.values()),
+            "processed_clips": 0,
+            "error_clips": 0,
             "label": label or f"Audio Job {audio_job_counter}",
             "scope": scope or "custom",
             "status": "queued",
@@ -366,8 +495,10 @@ def _enqueue_audio_job(kind, indices, label=None, scope=None):
             "job_id": job["id"],
             "queue_position": queue_position,
             "total_chunks": job["total_chunks"],
+            "total_words": job["total_words"],
             "label": job["label"],
             "scope": job["scope"],
+            "estimated_remaining_seconds": process_state["audio"]["metrics"]["estimated_remaining_seconds"],
         }
 
 
@@ -397,6 +528,11 @@ def _audio_queue_worker():
                 f"{job_prefix} Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
             )
 
+        def item_callback(idx, success, elapsed_seconds, input_words, output_words):
+            with audio_queue_lock:
+                _record_audio_sample_locked(job, idx, elapsed_seconds, input_words, output_words, success)
+                _refresh_audio_process_state_locked()
+
         def cancel_check():
             with audio_queue_lock:
                 return process_state["audio"]["cancel"]
@@ -412,6 +548,7 @@ def _audio_queue_worker():
                     settings["workers"],
                     progress_callback,
                     cancel_check=cancel_check,
+                    item_callback=item_callback,
                 )
             else:
                 results = project_manager.generate_chunks_batch(
@@ -421,6 +558,7 @@ def _audio_queue_worker():
                     progress_callback,
                     batch_group_by_type=settings["batch_group_by_type"],
                     cancel_check=cancel_check,
+                    item_callback=item_callback,
                 )
 
             completed = len(results["completed"])

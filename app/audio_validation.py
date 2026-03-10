@@ -6,8 +6,6 @@ import soundfile as sf
 DEFAULT_WORDS_PER_MINUTE = 150.0
 DEFAULT_DURATION_TOLERANCE_FACTOR = 2.5
 DEFAULT_DURATION_OVERHEAD_SECONDS = 0.35
-MIN_AUDIO_FILE_SIZE_BYTES = 10 * 1024
-
 WORD_RE = re.compile(r"\b[\w']+\b", re.UNICODE)
 
 
@@ -71,12 +69,7 @@ def validate_audio_clip(
     max_duration = expected_duration * tolerance_factor if expected_duration > 0 else 0.0
 
     error = None
-    if file_size_bytes < MIN_AUDIO_FILE_SIZE_BYTES:
-        error = (
-            f"Audio file is too small ({file_size_bytes} bytes). "
-            f"Anything under {MIN_AUDIO_FILE_SIZE_BYTES} bytes is treated as invalid."
-        )
-    elif actual_duration_sec <= 0:
+    if actual_duration_sec <= 0:
         error = "Audio duration is 0 seconds."
     elif word_count > 0 and actual_duration_sec < min_duration:
         error = (
