@@ -173,6 +173,8 @@ class ChunkUpdate(BaseModel):
 
 class BatchGenerateRequest(BaseModel):
     indices: List[int]
+    label: Optional[str] = None
+    scope: Optional[str] = None
 
 class VoiceDesignPreviewRequest(BaseModel):
     description: str
@@ -246,7 +248,7 @@ class DatasetBuilderUpdateRowsRequest(BaseModel):
 process_state = {
     "script": {"running": False, "logs": []},
     "voices": {"running": False, "logs": []},
-    "audio": {"running": False, "logs": [], "cancel": False},
+    "audio": {"running": False, "logs": [], "cancel": False, "queue": [], "current_job": None, "recent_jobs": [], "merge_running": False},
     "audacity_export": {"running": False, "logs": []},
     "m4b_export": {"running": False, "logs": []},
     "review": {"running": False, "logs": []},
@@ -254,6 +256,207 @@ process_state = {
     "dataset_gen": {"running": False, "logs": []},
     "dataset_builder": {"running": False, "logs": [], "cancel": False}
 }
+
+audio_queue_lock = threading.Lock()
+audio_queue_condition = threading.Condition(audio_queue_lock)
+audio_queue = []
+audio_current_job = None
+audio_job_counter = 0
+
+
+def _trim_logs(logs, limit=1000):
+    while len(logs) > limit:
+        logs.pop(0)
+
+
+def _serialize_audio_job(job):
+    return {
+        "id": job["id"],
+        "kind": job["kind"],
+        "status": job["status"],
+        "label": job["label"],
+        "scope": job["scope"],
+        "indices": list(job["indices"]),
+        "total_chunks": job["total_chunks"],
+        "queued_at": job["queued_at"],
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+
+
+def _refresh_audio_process_state_locked():
+    process_state["audio"]["queue"] = [_serialize_audio_job(job) for job in audio_queue]
+    process_state["audio"]["current_job"] = _serialize_audio_job(audio_current_job) if audio_current_job else None
+    process_state["audio"]["running"] = audio_current_job is not None or process_state["audio"].get("merge_running", False)
+
+
+def _append_audio_log(message):
+    with audio_queue_lock:
+        _append_audio_log_locked(message)
+
+
+def _append_audio_log_locked(message):
+    process_state["audio"]["logs"].append(message)
+    _trim_logs(process_state["audio"]["logs"])
+
+
+def _record_audio_recent_job_locked(job):
+    process_state["audio"]["recent_jobs"].insert(0, _serialize_audio_job(job))
+    del process_state["audio"]["recent_jobs"][10:]
+
+
+def _load_audio_worker_settings():
+    workers = 2
+    batch_seed = -1
+    batch_size = 4
+    batch_group_by_type = False
+    tts_cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                tts_cfg = cfg.get("tts", {})
+                workers = max(1, tts_cfg.get("parallel_workers", 2))
+                seed_val = tts_cfg.get("batch_seed")
+                if seed_val is not None and seed_val != "":
+                    batch_seed = int(seed_val)
+                batch_size = max(1, tts_cfg.get("parallel_workers", 4))
+                batch_group_by_type = tts_cfg.get("batch_group_by_type", False)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {
+        "workers": workers,
+        "batch_seed": batch_seed,
+        "batch_size": batch_size,
+        "batch_group_by_type": batch_group_by_type,
+        "tts_cfg": tts_cfg,
+    }
+
+
+def _enqueue_audio_job(kind, indices, label=None, scope=None):
+    global audio_job_counter
+
+    with audio_queue_condition:
+        audio_job_counter += 1
+        if audio_current_job is None and not audio_queue:
+            process_state["audio"]["logs"] = []
+            process_state["audio"]["recent_jobs"] = []
+
+        job = {
+            "id": audio_job_counter,
+            "kind": kind,
+            "indices": list(indices),
+            "total_chunks": len(indices),
+            "label": label or f"Audio Job {audio_job_counter}",
+            "scope": scope or "custom",
+            "status": "queued",
+            "queued_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+        }
+        audio_queue.append(job)
+        _append_audio_log_locked(
+            f"[QUEUE] Job #{job['id']} queued: {job['label']} ({job['total_chunks']} chunks, scope={job['scope']})"
+        )
+        _refresh_audio_process_state_locked()
+        queue_position = len(audio_queue)
+        audio_queue_condition.notify()
+        return {
+            "status": "queued",
+            "job_id": job["id"],
+            "queue_position": queue_position,
+            "total_chunks": job["total_chunks"],
+            "label": job["label"],
+            "scope": job["scope"],
+        }
+
+
+def _audio_queue_worker():
+    global audio_current_job
+
+    while True:
+        with audio_queue_condition:
+            while not audio_queue:
+                audio_current_job = None
+                process_state["audio"]["cancel"] = False
+                _refresh_audio_process_state_locked()
+                audio_queue_condition.wait()
+
+            job = audio_queue.pop(0)
+            audio_current_job = job
+            job["status"] = "running"
+            job["started_at"] = time.time()
+            process_state["audio"]["cancel"] = False
+            _refresh_audio_process_state_locked()
+
+        settings = _load_audio_worker_settings()
+        job_prefix = f"[JOB {job['id']}]"
+
+        def progress_callback(completed, failed, total):
+            _append_audio_log(
+                f"{job_prefix} Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
+            )
+
+        def cancel_check():
+            with audio_queue_lock:
+                return process_state["audio"]["cancel"]
+
+        _append_audio_log(
+            f"{job_prefix} Starting {job['kind']} generation for {job['total_chunks']} chunks ({job['label']})"
+        )
+
+        try:
+            if job["kind"] == "parallel":
+                results = project_manager.generate_chunks_parallel(
+                    job["indices"],
+                    settings["workers"],
+                    progress_callback,
+                    cancel_check=cancel_check,
+                )
+            else:
+                results = project_manager.generate_chunks_batch(
+                    job["indices"],
+                    settings["batch_seed"],
+                    settings["batch_size"],
+                    progress_callback,
+                    batch_group_by_type=settings["batch_group_by_type"],
+                    cancel_check=cancel_check,
+                )
+
+            completed = len(results["completed"])
+            failed = len(results["failed"])
+            cancelled = results.get("cancelled", 0)
+
+            if cancelled:
+                job["status"] = "cancelled"
+            elif failed:
+                job["status"] = "completed_with_errors"
+            else:
+                job["status"] = "completed"
+
+            msg = f"{job_prefix} Complete: {completed} succeeded, {failed} failed"
+            if cancelled:
+                msg += f", {cancelled} cancelled"
+            _append_audio_log(msg)
+            if results["failed"]:
+                for idx, err in results["failed"]:
+                    _append_audio_log(f"{job_prefix} Chunk {idx} failed: {err}")
+        except Exception as e:
+            logger.error(f"Audio queue job error: {e}")
+            job["status"] = "failed"
+            _append_audio_log(f"{job_prefix} Batch generation error: {e}")
+        finally:
+            with audio_queue_condition:
+                job["finished_at"] = time.time()
+                _record_audio_recent_job_locked(job)
+                audio_current_job = None
+                process_state["audio"]["cancel"] = False
+                _refresh_audio_process_state_locked()
+                audio_queue_condition.notify_all()
+
+
+audio_worker_thread = threading.Thread(target=_audio_queue_worker, daemon=True, name="audio-queue-worker")
+audio_worker_thread.start()
 
 def run_process(command: List[str], task_name: str):
     """Run a subprocess and capture logs."""
@@ -480,6 +683,9 @@ async def get_annotated_script():
 async def get_status(task_name: str):
     if task_name not in process_state:
         raise HTTPException(status_code=404, detail="Task not found")
+    if task_name == "audio":
+        with audio_queue_lock:
+            _refresh_audio_process_state_locked()
     return process_state[task_name]
 
 @app.get("/api/voices")
@@ -619,11 +825,16 @@ async def generate_chunk_endpoint(index: int, background_tasks: BackgroundTasks)
 
 @app.post("/api/merge")
 async def merge_audio_endpoint(background_tasks: BackgroundTasks):
+    with audio_queue_lock:
+        if audio_current_job is not None or audio_queue or process_state["audio"].get("merge_running", False):
+            raise HTTPException(status_code=400, detail="Audio queue is active. Wait for queued jobs to finish or cancel them first.")
+
     # Reuse audio process state for merge if possible, or just background it
     # For simplicity, we just background it and frontend will assume it works
     # Or we can link it to process_state["audio"]
 
     def task():
+        process_state["audio"]["merge_running"] = True
         process_state["audio"]["running"] = True
         process_state["audio"]["logs"] = ["Starting merge..."]
         try:
@@ -635,6 +846,7 @@ async def merge_audio_endpoint(background_tasks: BackgroundTasks):
         except Exception as e:
             process_state["audio"]["logs"].append(f"Merge error: {e}")
         finally:
+            process_state["audio"]["merge_running"] = False
             process_state["audio"]["running"] = False
 
     background_tasks.add_task(task)
@@ -735,136 +947,60 @@ async def delete_m4b_cover():
 @app.post("/api/generate_batch")
 async def generate_batch_endpoint(request: BatchGenerateRequest, background_tasks: BackgroundTasks):
     """Generate multiple chunks in parallel using configured worker count."""
-    if process_state["audio"]["running"]:
-        raise HTTPException(status_code=400, detail="Audio generation already running")
-
-    # Load worker count from config
-    workers = 2
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                workers = max(1, cfg.get("tts", {}).get("parallel_workers", 2))
-        except (json.JSONDecodeError, ValueError):
-            pass
-
     indices = request.indices
-    total = len(indices)
-
-    def progress_callback(completed, failed, total):
-        """Update logs with progress."""
-        process_state["audio"]["logs"].append(
-            f"Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
-        )
-
-    def cancel_check():
-        return process_state["audio"]["cancel"]
-
-    def task():
-        process_state["audio"]["running"] = True
-        process_state["audio"]["cancel"] = False
-        process_state["audio"]["logs"] = [
-            f"Starting parallel generation of {total} chunks with {workers} workers..."
-        ]
-        try:
-            results = project_manager.generate_chunks_parallel(
-                indices, workers, progress_callback, cancel_check=cancel_check
-            )
-            completed = len(results["completed"])
-            failed = len(results["failed"])
-            cancelled = results.get("cancelled", 0)
-            msg = f"Batch generation complete: {completed} succeeded, {failed} failed"
-            if cancelled:
-                msg += f", {cancelled} cancelled"
-            process_state["audio"]["logs"].append(msg)
-            if results["failed"]:
-                for idx, err in results["failed"]:
-                    process_state["audio"]["logs"].append(f"  Chunk {idx} failed: {err}")
-        except Exception as e:
-            logger.error(f"Batch generation error: {e}")
-            process_state["audio"]["logs"].append(f"Batch generation error: {e}")
-        finally:
-            process_state["audio"]["running"] = False
-            process_state["audio"]["cancel"] = False
-
-    background_tasks.add_task(task)
-    return {"status": "started", "workers": workers, "total_chunks": total}
+    if not indices:
+        raise HTTPException(status_code=400, detail="No chunk indices provided")
+    settings = _load_audio_worker_settings()
+    return _enqueue_audio_job(
+        "parallel",
+        indices,
+        label=request.label or f"Parallel render ({len(indices)} chunks)",
+        scope=request.scope or "custom",
+    ) | {"workers": settings["workers"]}
 
 @app.post("/api/generate_batch_fast")
 async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background_tasks: BackgroundTasks):
     """Generate multiple chunks using batch TTS API with single seed. Faster but less flexible.
     Requires custom Qwen3-TTS with /generate_batch endpoint."""
-    if process_state["audio"]["running"]:
-        raise HTTPException(status_code=400, detail="Audio generation already running")
-
-    # Load batch_seed and batch_size from config
-    batch_seed = -1
-    batch_size = 4
-    batch_group_by_type = False
-    tts_cfg = {}
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-                tts_cfg = cfg.get("tts", {})
-                seed_val = tts_cfg.get("batch_seed")
-                if seed_val is not None and seed_val != "":
-                    batch_seed = int(seed_val)
-                batch_size = max(1, tts_cfg.get("parallel_workers", 4))
-                batch_group_by_type = tts_cfg.get("batch_group_by_type", False)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
     indices = request.indices
-    total = len(indices)
-
-    def progress_callback(completed, failed, total):
-        process_state["audio"]["logs"].append(
-            f"Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
-        )
-
-    def cancel_check():
-        return process_state["audio"]["cancel"]
-
-    def task():
-        process_state["audio"]["running"] = True
-        process_state["audio"]["cancel"] = False
-        process_state["audio"]["logs"] = [
-            f"Starting batch generation of {total} chunks (batch_size={batch_size}, seed={batch_seed}, auto_regen_bad_clips={tts_cfg.get('auto_regenerate_bad_clips', False)})..."
-        ]
-        try:
-            results = project_manager.generate_chunks_batch(
-                indices, batch_seed, batch_size, progress_callback,
-                batch_group_by_type=batch_group_by_type,
-                cancel_check=cancel_check,
-            )
-            completed = len(results["completed"])
-            failed = len(results["failed"])
-            cancelled = results.get("cancelled", 0)
-            msg = f"Batch generation complete: {completed} succeeded, {failed} failed"
-            if cancelled:
-                msg += f", {cancelled} cancelled"
-            process_state["audio"]["logs"].append(msg)
-            if results["failed"]:
-                for idx, err in results["failed"]:
-                    process_state["audio"]["logs"].append(f"  Chunk {idx} failed: {err}")
-        except Exception as e:
-            logger.error(f"Batch generation error: {e}")
-            process_state["audio"]["logs"].append(f"Batch generation error: {e}")
-        finally:
-            process_state["audio"]["running"] = False
-            process_state["audio"]["cancel"] = False
-
-    background_tasks.add_task(task)
-    return {"status": "started", "batch_seed": batch_seed, "batch_size": batch_size, "total_chunks": total}
+    if not indices:
+        raise HTTPException(status_code=400, detail="No chunk indices provided")
+    settings = _load_audio_worker_settings()
+    return _enqueue_audio_job(
+        "batch_fast",
+        indices,
+        label=request.label or f"Batch render ({len(indices)} chunks)",
+        scope=request.scope or "custom",
+    ) | {
+        "batch_seed": settings["batch_seed"],
+        "batch_size": settings["batch_size"],
+    }
 
 @app.post("/api/cancel_audio")
 async def cancel_audio():
-    """Cancel ongoing audio generation and reset in-progress chunks."""
-    if process_state["audio"]["running"]:
-        process_state["audio"]["cancel"] = True
-        process_state["audio"]["logs"].append("[CANCEL] Cancellation requested")
-        return {"status": "cancelling"}
+    """Cancel the current audio job and clear any queued jobs."""
+    with audio_queue_condition:
+        cleared = len(audio_queue)
+        now = time.time()
+        while audio_queue:
+            job = audio_queue.pop(0)
+            job["status"] = "cancelled"
+            job["finished_at"] = now
+            _record_audio_recent_job_locked(job)
+
+        if audio_current_job is not None:
+            process_state["audio"]["cancel"] = True
+            _append_audio_log_locked(f"[CANCEL] Cancellation requested for job #{audio_current_job['id']}")
+            if cleared:
+                _append_audio_log_locked(f"[CANCEL] Cleared {cleared} queued job(s)")
+            _refresh_audio_process_state_locked()
+            return {"status": "cancelling", "cleared_queued_jobs": cleared}
+
+        if cleared:
+            _append_audio_log_locked(f"[CANCEL] Cleared {cleared} queued job(s)")
+            _refresh_audio_process_state_locked()
+            return {"status": "cancelled", "cleared_queued_jobs": cleared}
+
     # Not running — still reset any stuck "generating" chunks (e.g. from a crash)
     chunks = project_manager.load_chunks()
     if chunks:

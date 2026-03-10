@@ -756,7 +756,10 @@
                                  <label class="form-check-label fw-semibold" for="editor-chapter-only">Chapter Only</label>
                              </div>
                          </div>
-                         <div id="editor-chapter-summary" class="text-muted small">Showing all segments.</div>
+                         <div class="text-end">
+                             <div id="editor-chapter-summary" class="text-muted small">Showing all segments.</div>
+                             <div id="editor-queue-status" class="text-muted small"></div>
+                         </div>
                      </div>
 
                      <div class="table-responsive">
@@ -945,6 +948,8 @@
                 // Trigger tab specific loads
                 if (e.target.dataset.tab === 'editor') {
                     loadChunks();
+                    refreshAudioQueueUI().catch(err => console.error('Audio queue refresh error', err));
+                    ensureAudioQueuePolling();
                 } else if (e.target.dataset.tab === 'voices') {
                     loadVoices();
                 } else if (e.target.dataset.tab === 'designer') {
@@ -1579,10 +1584,10 @@
         // --- Editor Tab ---
         const WHOLE_PROJECT_CHAPTER_ID = '__whole_project__';
         let isPlayingSequence = false;
-        let isRenderingAll = false;
         let cachedChunks = []; // Cache to track changes
         let cachedVisibleChunkIds = [];
         let selectedEditorChapter = WHOLE_PROJECT_CHAPTER_ID;
+        let audioQueuePollTimer = null;
 
         // Check if any audio is currently playing
         function isAudioPlaying() {
@@ -1765,6 +1770,59 @@
         window.changeEditorScope = () => {
             syncEditorChapterState(cachedChunks);
         };
+
+        function updateAudioQueueControls(audioState) {
+            const cancelBtn = document.getElementById('btn-cancel-render');
+            if (!cancelBtn) return;
+            const hasAudioWork = Boolean(audioState?.running) || (audioState?.queue || []).length > 0;
+            cancelBtn.style.display = hasAudioWork ? 'inline-block' : 'none';
+        }
+
+        function renderAudioQueueStatus(audioState) {
+            const el = document.getElementById('editor-queue-status');
+            if (!el) return;
+
+            const current = audioState?.current_job;
+            const queued = (audioState?.queue || []).length;
+            if (current) {
+                el.textContent = `Running job #${current.id}: ${current.label}. ${queued} queued behind it.`;
+            } else if (queued > 0) {
+                el.textContent = `${queued} audio job${queued === 1 ? '' : 's'} queued.`;
+            } else {
+                el.textContent = '';
+            }
+        }
+
+        async function refreshAudioQueueUI() {
+            const audioState = await API.get('/api/status/audio');
+            updateAudioQueueControls(audioState);
+            renderAudioQueueStatus(audioState);
+            return audioState;
+        }
+
+        async function pollAudioQueueOnce() {
+            try {
+                const audioState = await refreshAudioQueueUI();
+                await loadChunks(false);
+                const hasAudioWork = Boolean(audioState?.running) || (audioState?.queue || []).length > 0;
+                if (!hasAudioWork && audioQueuePollTimer) {
+                    clearInterval(audioQueuePollTimer);
+                    audioQueuePollTimer = null;
+                }
+            } catch (e) {
+                console.error('Audio queue poll error', e);
+                if (audioQueuePollTimer) {
+                    clearInterval(audioQueuePollTimer);
+                    audioQueuePollTimer = null;
+                }
+            }
+        }
+
+        function ensureAudioQueuePolling() {
+            if (audioQueuePollTimer) return;
+            audioQueuePollTimer = setInterval(pollAudioQueueOnce, 2000);
+            pollAudioQueueOnce();
+        }
 
         async function loadChunks(forceFullRedraw = false) {
             const tbody = document.getElementById('chunks-table-body');
@@ -2153,16 +2211,16 @@
         };
 
         window.cancelRender = async (skipApi = false) => {
-            isRenderingAll = false;
-            document.getElementById('btn-batch-fast').style.display = 'inline-block';
-            document.getElementById('btn-regen-all').style.display = 'inline-block';
-            document.getElementById('btn-cancel-render').style.display = 'none';
             if (!skipApi) {
                 try {
-                    await API.post('/api/cancel_audio', {});
-                    await loadChunks(false);
+                    const result = await API.post('/api/cancel_audio', {});
+                    if (result.status === 'cancelling' || result.status === 'cancelled') {
+                        showToast('Audio queue cancellation requested.', 'warning');
+                    }
+                    ensureAudioQueuePolling();
                 } catch (e) { console.error('Cancel error:', e); }
             }
+            await refreshAudioQueueUI().catch(err => console.error('Audio queue refresh error', err));
         };
 
         window.startRender = (regenerateAll = false) => {
@@ -2175,11 +2233,6 @@
         };
 
         window.renderAll = async (regenerateAll = false) => {
-            isRenderingAll = true;
-            document.getElementById('btn-batch-fast').style.display = 'none';
-            document.getElementById('btn-regen-all').style.display = 'none';
-            document.getElementById('btn-cancel-render').style.display = 'inline-block';
-
             try {
                 const chunks = await API.get('/api/chunks');
                 const targetChunks = getActionTargetChunks(chunks);
@@ -2188,79 +2241,31 @@
 
                 if (toProcess.length === 0) {
                     showToast(`No non-empty segments to render in ${getActionScopeLabel()}.`, 'warning');
-                    cancelRender(true);
                     return;
                 }
 
                 if (regenerateAll && !await showConfirm(`Regenerate all ${toProcess.length} non-empty segments in ${getActionScopeLabel()}? This will replace existing audio.`)) {
-                    cancelRender(true);
                     return;
                 }
 
-                // Mark all chunks as generating in UI
-                const indices = toProcess.map(c => c.id);
-                for (const id of indices) {
-                    const tr = document.querySelector(`tr[data-id="${id}"]`);
-                    if (tr) {
-                        tr.classList.add('table-info');
-                        const badge = tr.querySelector('.badge');
-                        if (badge) {
-                            badge.className = 'badge bg-warning';
-                            badge.innerText = 'generating';
-                        }
-                    }
-                }
-
                 // Call batch endpoint for parallel processing
-                const response = await API.post('/api/generate_batch', { indices });
-                console.log(`Batch generation started: ${response.total_chunks} chunks with ${response.workers} workers`);
-
-                // Poll for completion
-                const pollInterval = setInterval(async () => {
-                    if (!isRenderingAll) {
-                        clearInterval(pollInterval);
-                        return;
-                    }
-
-                    try {
-                        await loadChunks(false);
-                        const updated = await API.get('/api/chunks');
-                        const stillGenerating = updated.filter(c =>
-                            indices.includes(c.id) && c.status === 'generating'
-                        );
-
-                        if (stillGenerating.length === 0) {
-                            clearInterval(pollInterval);
-                            // Clear highlights
-                            document.querySelectorAll('tr').forEach(r => r.classList.remove('table-info'));
-                            cancelRender(true);
-                            await loadChunks(false);
-
-                            // Show completion summary
-                            const completed = updated.filter(c => indices.includes(c.id) && c.status === 'done').length;
-                            const failed = updated.filter(c => indices.includes(c.id) && c.status === 'error').length;
-                            if (failed > 0) {
-                                showToast(`Batch complete: ${completed} succeeded, ${failed} failed`, 'warning');
-                            }
-                        }
-                    } catch (e) {
-                        console.error("Polling error", e);
-                    }
-                }, 2000);
+                const indices = toProcess.map(c => c.id);
+                const response = await API.post('/api/generate_batch', {
+                    indices,
+                    label: regenerateAll ? `Regenerate ${getActionScopeLabel()}` : `Render pending in ${getActionScopeLabel()}`,
+                    scope: getActionScopeLabel()
+                });
+                console.log(`Batch generation queued: ${response.total_chunks} chunks with ${response.workers} workers`);
+                showToast(`Queued job #${response.job_id} for ${response.total_chunks} segment${response.total_chunks === 1 ? '' : 's'}.`, 'success');
+                ensureAudioQueuePolling();
 
             } catch (e) {
                 console.error("Render All error:", e);
                 showToast("Error during batch rendering: " + e.message, 'error');
-                cancelRender(true);
             }
         };
 
         window.renderBatchFast = async (regenerateAll = false) => {
-            isRenderingAll = true;
-            document.getElementById('btn-batch-fast').style.display = 'none';
-            document.getElementById('btn-regen-all').style.display = 'none';
-            document.getElementById('btn-cancel-render').style.display = 'inline-block';
-
             try {
                 const chunks = await API.get('/api/chunks');
                 const targetChunks = getActionTargetChunks(chunks);
@@ -2269,63 +2274,22 @@
 
                 if (toProcess.length === 0) {
                     showToast(`No non-empty segments to render in ${getActionScopeLabel()}.`, 'warning');
-                    cancelRender(true);
                     return;
                 }
 
-                // Mark all chunks as generating in UI
                 const indices = toProcess.map(c => c.id);
-                for (const id of indices) {
-                    const tr = document.querySelector(`tr[data-id="${id}"]`);
-                    if (tr) {
-                        tr.classList.add('table-info');
-                        const badge = tr.querySelector('.badge');
-                        if (badge) {
-                            badge.className = 'badge bg-warning';
-                            badge.innerText = 'generating';
-                        }
-                    }
-                }
-
-                // Call fast batch endpoint (requires custom Qwen3-TTS)
-                const response = await API.post('/api/generate_batch_fast', { indices });
-                console.log(`Fast batch started: ${response.total_chunks} chunks (batch_size=${response.batch_size}, seed=${response.batch_seed})`);
-
-                // Poll for completion
-                const pollInterval = setInterval(async () => {
-                    if (!isRenderingAll) {
-                        clearInterval(pollInterval);
-                        return;
-                    }
-
-                    try {
-                        await loadChunks(false);
-                        const updated = await API.get('/api/chunks');
-                        const stillGenerating = updated.filter(c =>
-                            indices.includes(c.id) && c.status === 'generating'
-                        );
-
-                        if (stillGenerating.length === 0) {
-                            clearInterval(pollInterval);
-                            document.querySelectorAll('tr').forEach(r => r.classList.remove('table-info'));
-                            cancelRender(true);
-                            await loadChunks(false);
-
-                            const completed = updated.filter(c => indices.includes(c.id) && c.status === 'done').length;
-                            const failed = updated.filter(c => indices.includes(c.id) && c.status === 'error').length;
-                            if (failed > 0) {
-                                showToast(`Batch complete: ${completed} succeeded, ${failed} failed`, 'warning');
-                            }
-                        }
-                    } catch (e) {
-                        console.error("Polling error", e);
-                    }
-                }, 2000);
+                const response = await API.post('/api/generate_batch_fast', {
+                    indices,
+                    label: regenerateAll ? `Batch regenerate ${getActionScopeLabel()}` : `Batch render pending in ${getActionScopeLabel()}`,
+                    scope: getActionScopeLabel()
+                });
+                console.log(`Fast batch queued: ${response.total_chunks} chunks (batch_size=${response.batch_size}, seed=${response.batch_seed})`);
+                showToast(`Queued fast job #${response.job_id} for ${response.total_chunks} segment${response.total_chunks === 1 ? '' : 's'}.`, 'success');
+                ensureAudioQueuePolling();
 
             } catch (e) {
                 console.error("Batch Fast error:", e);
                 showToast("Error during batch rendering: " + e.message, 'error');
-                cancelRender(true);
             }
         };
 
