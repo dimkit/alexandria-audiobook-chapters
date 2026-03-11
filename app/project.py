@@ -486,6 +486,78 @@ class ProjectManager:
 
             return chunks
 
+    def _validate_chunk_audio(self, chunk, dictionary_entries):
+        audio_path = chunk.get("audio_path")
+        if not audio_path:
+            return None
+
+        full_audio_path = os.path.join(self.root_dir, audio_path)
+        if not os.path.exists(full_audio_path):
+            return None
+
+        transformed_text, _ = apply_dictionary_to_text(
+            chunk.get("text", ""),
+            dictionary_entries,
+        )
+        return validate_audio_clip(
+            text=transformed_text,
+            actual_duration_sec=get_audio_duration_seconds(full_audio_path),
+            file_size_bytes=os.path.getsize(full_audio_path),
+        ).to_dict()
+
+    def recover_interrupted_generating_chunks(self, indices=None, generation_token=None):
+        """Recover valid audio for interrupted generating chunks on restart.
+
+        If a chunk was left in "generating" but its audio file already exists and
+        validates, promote it to "done". Otherwise reset it back to "pending".
+        """
+        outcome = {"recovered": 0, "reset": 0}
+
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return outcome
+
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            if indices is None:
+                index_iter = range(len(chunks))
+            else:
+                index_iter = [index for index in indices if 0 <= index < len(chunks)]
+
+            dictionary_entries = self.load_dictionary_entries()
+            changed = False
+
+            for index in index_iter:
+                chunk = chunks[index]
+                if chunk.get("status") != "generating":
+                    continue
+                if generation_token is not None and chunk.get("generation_token") != generation_token:
+                    continue
+
+                try:
+                    validation = self._validate_chunk_audio(chunk, dictionary_entries)
+                except Exception as e:
+                    print(f"Warning: failed to validate interrupted chunk {chunk.get('id')}: {e}")
+                    validation = None
+
+                if validation and validation["is_valid"]:
+                    chunk["status"] = "done"
+                    chunk["audio_validation"] = validation
+                    chunk["auto_regen_count"] = 0
+                    outcome["recovered"] += 1
+                else:
+                    chunk["status"] = "pending"
+                    outcome["reset"] += 1
+
+                chunk.pop("generation_token", None)
+                changed = True
+
+            if changed:
+                self._atomic_json_write(chunks, self.chunks_path)
+
+        return outcome
+
     def load_script_document(self):
         if not os.path.exists(self.script_path):
             return {"entries": [], "dictionary": []}
@@ -1360,6 +1432,36 @@ class ProjectManager:
         reordered = []
         for key, group_indices in groups.items():
             print(f"  Voice group '{key}': {len(group_indices)} chunks")
+            reordered.extend(group_indices)
+
+        return reordered
+
+    def group_indices_by_resolved_speaker(self, indices, chunks=None, voice_config=None):
+        """Reorder indices so each resolved speaker is generated contiguously.
+
+        This is primarily useful for external TTS backends where clone prompt
+        reuse is much faster when all lines for the same character are rendered
+        back-to-back.
+        """
+        from collections import OrderedDict
+
+        chunks = chunks if chunks is not None else self.load_chunks()
+        voice_config = voice_config if voice_config is not None else self._load_voice_config()
+        groups = OrderedDict()
+
+        for idx in indices:
+            if not (0 <= idx < len(chunks)):
+                groups.setdefault("", []).append(idx)
+                continue
+
+            speaker = chunks[idx].get("speaker", "")
+            resolved = self.resolve_voice_speaker(speaker, voice_config)
+            groups.setdefault(resolved, []).append(idx)
+
+        reordered = []
+        for speaker, group_indices in groups.items():
+            label = speaker or "<unknown>"
+            print(f"  Speaker group '{label}': {len(group_indices)} chunks")
             reordered.extend(group_indices)
 
         return reordered

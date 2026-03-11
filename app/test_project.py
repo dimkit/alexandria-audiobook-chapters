@@ -71,6 +71,73 @@ class ReconcileChunkAudioStatesTests(unittest.TestCase):
         self.assertEqual(reconciled[0]["status"], "pending")
         self.assertIsNone(reconciled[0]["audio_validation"])
 
+    def test_groups_indices_by_resolved_speaker(self):
+        chunks = [
+            {"id": 0, "speaker": "Alice"},
+            {"id": 1, "speaker": "Bob Alias"},
+            {"id": 2, "speaker": "Alice"},
+            {"id": 3, "speaker": "Bob"},
+            {"id": 4, "speaker": "Narrator"},
+        ]
+        voice_config = {
+            "Bob Alias": {"alias": "Bob"},
+            "Bob": {},
+            "Alice": {},
+            "Narrator": {},
+        }
+
+        grouped = self.manager.group_indices_by_resolved_speaker(
+            [0, 1, 2, 3, 4],
+            chunks=chunks,
+            voice_config=voice_config,
+        )
+
+        self.assertEqual(grouped, [0, 2, 1, 3, 4])
+
+    def test_recovers_interrupted_generating_chunk_with_valid_audio(self):
+        self._write_wav("voicelines/recovered.wav", duration_seconds=3.0)
+        chunks = [{
+            "id": 0,
+            "speaker": "Narrator",
+            "text": "One two three four five six.",
+            "instruct": "",
+            "status": "generating",
+            "audio_path": "voicelines/recovered.wav",
+            "audio_validation": None,
+            "auto_regen_count": 1,
+            "generation_token": "abc",
+        }]
+        self.manager.save_chunks(chunks)
+
+        outcome = self.manager.recover_interrupted_generating_chunks()
+        recovered = self.manager.load_chunks()
+
+        self.assertEqual(outcome, {"recovered": 1, "reset": 0})
+        self.assertEqual(recovered[0]["status"], "done")
+        self.assertTrue(recovered[0]["audio_validation"]["is_valid"])
+        self.assertNotIn("generation_token", recovered[0])
+
+    def test_resets_interrupted_generating_chunk_without_valid_audio(self):
+        chunks = [{
+            "id": 0,
+            "speaker": "Narrator",
+            "text": "One two three four five six.",
+            "instruct": "",
+            "status": "generating",
+            "audio_path": "voicelines/missing.wav",
+            "audio_validation": None,
+            "auto_regen_count": 0,
+            "generation_token": "abc",
+        }]
+        self.manager.save_chunks(chunks)
+
+        outcome = self.manager.recover_interrupted_generating_chunks()
+        recovered = self.manager.load_chunks()
+
+        self.assertEqual(outcome, {"recovered": 0, "reset": 1})
+        self.assertEqual(recovered[0]["status"], "pending")
+        self.assertNotIn("generation_token", recovered[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -784,7 +784,7 @@
                          <div class="d-flex flex-wrap align-items-center gap-3">
                              <div class="d-flex align-items-center gap-2">
                                  <label for="editor-chapter-select" class="form-label mb-0 fw-semibold">Chapter</label>
-                                 <select id="editor-chapter-select" class="form-select form-select-sm" style="min-width: 260px;" onchange="changeEditorChapter(this.value)">
+                                 <select id="editor-chapter-select" class="form-select form-select-sm" style="min-width: 260px;" oninput="changeEditorChapter(this.value)" onchange="changeEditorChapter(this.value)">
                                      <option value="__whole_project__">Whole Project</option>
                                  </select>
                              </div>
@@ -2065,6 +2065,7 @@
         let cachedChunks = []; // Cache to track changes
         let cachedVisibleChunkIds = [];
         let selectedEditorChapter = WHOLE_PROJECT_CHAPTER_ID;
+        let editorChapterAutoSelected = false;
         let audioQueuePollTimer = null;
 
         // Check if any audio is currently playing
@@ -2101,6 +2102,17 @@
         function getChunkChapterName(chunk) {
             if (!chunk || typeof chunk.chapter !== 'string') return '';
             return chunk.chapter.trim();
+        }
+
+        function getChunkAudioFingerprint(chunk) {
+            if (!chunk || !chunk.audio_path) return '';
+            const validation = chunk.audio_validation || {};
+            return [
+                chunk.audio_path,
+                validation.file_size_bytes || 0,
+                validation.actual_duration_sec || 0,
+                chunk.status || '',
+            ].join('|');
         }
 
         function buildEditorChapterOptions(chunks) {
@@ -2161,18 +2173,31 @@
 
             const options = buildEditorChapterOptions(chunks);
             const firstRealChapter = options.find(option => option.id !== WHOLE_PROJECT_CHAPTER_ID);
-            if (selectedEditorChapter === WHOLE_PROJECT_CHAPTER_ID && firstRealChapter) {
+            if (!editorChapterAutoSelected && selectedEditorChapter === WHOLE_PROJECT_CHAPTER_ID && firstRealChapter) {
                 selectedEditorChapter = firstRealChapter.id;
+                editorChapterAutoSelected = true;
             }
             if (!options.some(option => option.id === selectedEditorChapter)) {
                 selectedEditorChapter = firstRealChapter ? firstRealChapter.id : WHOLE_PROJECT_CHAPTER_ID;
             }
 
-            select.innerHTML = options.map(option => `
+            const optionsHtml = options.map(option => `
                 <option value="${escapeHtml(option.id)}"${option.id === selectedEditorChapter ? ' selected' : ''}>
                     ${escapeHtml(option.label)} (${option.count})
                 </option>
             `).join('');
+            const optionsSignature = JSON.stringify(options.map(option => ({
+                id: option.id,
+                count: option.count,
+                selected: option.id === selectedEditorChapter,
+            })));
+
+            if (select.dataset.optionsSignature !== optionsSignature) {
+                select.innerHTML = optionsHtml;
+                select.dataset.optionsSignature = optionsSignature;
+            } else if (select.value !== selectedEditorChapter) {
+                select.value = selectedEditorChapter;
+            }
 
             const visibleCount = getVisibleChunks(chunks).length;
             const viewLabel = selectedEditorChapter === WHOLE_PROJECT_CHAPTER_ID
@@ -2227,16 +2252,20 @@
                     const existingAudio = actionContainer.querySelector('audio');
                     const existingNoAudio = actionContainer.querySelector('.text-muted');
                     const newSrc = `/${chunk.audio_path}?t=${Date.now()}`;
+                    const nextFingerprint = getChunkAudioFingerprint(chunk);
 
                     if (existingNoAudio) {
                         // No audio element yet, create one
-                        const audioHtml = `<audio class="chunk-audio" data-id="${chunk.id}" controls src="${newSrc}" style="width: 200px; height: 30px;" onplay="stopOthers(${chunk.id})"></audio>`;
+                        const audioHtml = `<audio class="chunk-audio" data-id="${chunk.id}" data-audio-path="${escapeHtml(chunk.audio_path)}" data-audio-fingerprint="${escapeHtml(nextFingerprint)}" controls src="${newSrc}" style="width: 200px; height: 30px;" onplay="stopOthers(${chunk.id})"></audio>`;
                         existingNoAudio.outerHTML = audioHtml;
                     } else if (existingAudio) {
-                        // Audio exists - just update the src with new cache-busting timestamp
-                        // This forces browser to fetch the regenerated file
-                        existingAudio.src = newSrc;
-                        existingAudio.load(); // Force reload
+                        const currentFingerprint = existingAudio.dataset.audioFingerprint || '';
+                        if (currentFingerprint !== nextFingerprint) {
+                            existingAudio.dataset.audioPath = chunk.audio_path;
+                            existingAudio.dataset.audioFingerprint = nextFingerprint;
+                            existingAudio.src = newSrc;
+                            existingAudio.load();
+                        }
                     }
                 }
             }
@@ -2386,10 +2415,6 @@
                     cachedVisibleChunkIds = visibleChunks.map(chunk => chunk.id);
                     refreshDictionaryCounts(chunks);
 
-                    // Continue polling if generating
-                    if (chunks.some(c => c.status === 'generating')) {
-                        setTimeout(() => loadChunks(false), 2000);
-                    }
                     return;
                 }
 
@@ -2417,9 +2442,10 @@
                         ? '<tr><td colspan="6" class="text-center text-muted">No segments in this chapter yet.</td></tr>'
                         : visibleChunks.map(chunk => {
                         const { statusColor, statusDetail } = getChunkStatusMeta(chunk);
+                        const audioFingerprint = getChunkAudioFingerprint(chunk);
 
                         const audioPlayer = chunk.audio_path ?
-                            `<audio class="chunk-audio" data-id="${chunk.id}" controls src="/${chunk.audio_path}?t=${Date.now()}" style="width: 200px; height: 30px;" onplay="stopOthers(${chunk.id})"></audio>` :
+                            `<audio class="chunk-audio" data-id="${chunk.id}" data-audio-path="${escapeHtml(chunk.audio_path)}" data-audio-fingerprint="${escapeHtml(audioFingerprint)}" controls src="/${chunk.audio_path}?t=${Date.now()}" style="width: 200px; height: 30px;" onplay="stopOthers(${chunk.id})"></audio>` :
                             '<span class="text-muted small">No audio</span>';
 
                         const actionArea = chunk.status === 'generating' ?
@@ -2451,11 +2477,6 @@
                 cachedChunks = chunks;
                 cachedVisibleChunkIds = visibleChunks.map(chunk => chunk.id);
                 refreshDictionaryCounts(chunks);
-
-                // If any chunk is generating, poll (without full redraw)
-                if (chunks.some(c => c.status === 'generating')) {
-                    setTimeout(() => loadChunks(false), 2000);
-                }
 
             } catch (e) {
                 console.error("Error loading chunks:", e);

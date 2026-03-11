@@ -105,17 +105,14 @@ app.mount("/dataset_builder", StaticFiles(directory=DATASET_BUILDER_DIR), name="
 project_manager = ProjectManager(ROOT_DIR)
 
 # Reset any chunks stuck in "generating" from a prior interrupted session
-_startup_chunks = project_manager.load_chunks()
-if _startup_chunks:
-    _reset_count = 0
-    for chunk in _startup_chunks:
-        if chunk.get("status") == "generating":
-            chunk["status"] = "pending"
-            _reset_count += 1
-    if _reset_count:
-        project_manager.save_chunks(_startup_chunks)
-        print(f"Startup: reset {_reset_count} stuck 'generating' chunk(s) to 'pending'")
-    del _startup_chunks, _reset_count
+_startup_recovery = project_manager.recover_interrupted_generating_chunks()
+if _startup_recovery["recovered"] or _startup_recovery["reset"]:
+    print(
+        "Startup: recovered "
+        f"{_startup_recovery['recovered']} interrupted chunk(s) with valid audio and reset "
+        f"{_startup_recovery['reset']} chunk(s) back to pending"
+    )
+del _startup_recovery
 
 # CORS for development
 app.add_middleware(
@@ -710,7 +707,7 @@ def _restore_audio_queue_state():
         return
 
     with audio_queue_condition:
-        project_manager.reset_generating_chunks()
+        project_manager.recover_interrupted_generating_chunks()
         chunks = project_manager.load_chunks()
         process_state["audio"]["metrics"] = _new_audio_metrics()
         process_state["audio"]["heartbeat"] = _new_audio_heartbeat_state()
@@ -902,6 +899,27 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
         done_event.set()
 
 
+def _prepare_job_indices_for_execution_locked(job, settings):
+    tts_cfg = settings.get("tts_cfg") or {}
+    if tts_cfg.get("mode") != "external":
+        return
+
+    chunks = project_manager.load_chunks()
+    if not chunks:
+        return
+
+    reordered = project_manager.group_indices_by_resolved_speaker(job.get("indices", []), chunks=chunks)
+    if reordered == job.get("indices", []):
+        return
+
+    pending_lookup = set(job.get("pending_indices", []))
+    job["indices"] = reordered
+    job["pending_indices"] = [idx for idx in reordered if idx in pending_lookup]
+    _append_audio_log_locked(
+        f"[JOB {job['id']}] Reordered external job by speaker for clone/cache locality"
+    )
+
+
 def _audio_queue_worker():
     global audio_current_job, audio_recovery_request
 
@@ -924,6 +942,10 @@ def _audio_queue_worker():
             _refresh_audio_process_state_locked(persist=True)
 
         settings = _load_audio_worker_settings()
+        with audio_queue_condition:
+            if audio_current_job is job:
+                _prepare_job_indices_for_execution_locked(job, settings)
+                _refresh_audio_process_state_locked(persist=True)
         job_prefix = f"[JOB {job['id']}]"
 
         _append_audio_log(
