@@ -5,7 +5,19 @@ import re
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 from script_store import load_script_document, save_script_document
+from task_checkpoint import (
+    build_signature,
+    clear_checkpoint,
+    file_fingerprint,
+    load_checkpoint,
+    save_checkpoint,
+)
 from source_document import load_source_document
+
+
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "script_generation_checkpoint.json")
+OUTPUT_PATH = os.path.join("..", "annotated_script.json")
+CHUNKS_PATH = os.path.join("..", "chunks.json")
 
 def clean_json_string(text):
     """Clean and extract valid JSON array from LLM response."""
@@ -442,12 +454,6 @@ def main():
     if banned_tokens:
         print(f"Banned tokens: {banned_tokens}")
 
-    # Create OpenAI client with custom base URL
-    client = OpenAI(
-        base_url=base_url,
-        api_key=api_key
-    )
-
     # Split into chunks at natural boundaries
     chunks = split_source_into_chunks(source_document, max_size=chunk_size)
     total_chunks = len(chunks)
@@ -457,8 +463,74 @@ def main():
 
     print(f"Split into {total_chunks} chunks at paragraph/sentence boundaries")
 
+    signature = build_signature({
+        "task": "script_generation",
+        "input_file": file_fingerprint(input_file_path),
+        "llm": {
+            "base_url": base_url,
+            "model_name": model_name,
+        },
+        "generation": {
+            "chunk_size": chunk_size,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "presence_penalty": presence_penalty,
+            "banned_tokens": banned_tokens,
+        },
+        "prompts": {
+            "system_prompt": system_prompt,
+            "user_prompt_template": user_prompt_template,
+        },
+        "source": {
+            "type": source_type,
+            "title": book_title,
+            "chunks": [
+                {
+                    "chapter": chunk.get("chapter"),
+                    "length": len(chunk["text"]),
+                }
+                for chunk in chunks
+            ],
+        },
+    })
+
+    checkpoint = load_checkpoint(CHECKPOINT_PATH)
     all_entries = []
-    for i, chunk in enumerate(chunks, 1):
+    start_index = 0
+    if checkpoint and checkpoint.get("task") == "script_generation" and checkpoint.get("signature") == signature:
+        checkpoint_entries = checkpoint.get("all_entries")
+        checkpoint_index = int(checkpoint.get("next_chunk_index") or 0)
+        if isinstance(checkpoint_entries, list) and 0 < checkpoint_index <= total_chunks:
+            all_entries = checkpoint_entries
+            start_index = checkpoint_index
+            print(f"Resuming prior progress from chunk {start_index + 1}/{total_chunks}")
+        else:
+            clear_checkpoint(CHECKPOINT_PATH)
+    elif checkpoint:
+        print("Discarding stale generation checkpoint because the source or configuration changed")
+        clear_checkpoint(CHECKPOINT_PATH)
+
+    existing_dictionary = []
+    if os.path.exists(OUTPUT_PATH):
+        try:
+            existing_dictionary = load_script_document(OUTPUT_PATH)["dictionary"]
+        except Exception:
+            existing_dictionary = []
+
+    if os.path.exists(CHUNKS_PATH):
+        os.remove(CHUNKS_PATH)
+        print("Cleared old chunks.json")
+
+    # Create OpenAI client with custom base URL
+    client = OpenAI(
+        base_url=base_url,
+        api_key=api_key
+    )
+
+    for i, chunk in enumerate(chunks[start_index:], start_index + 1):
         print(f"Processing chunk {i}/{total_chunks} ({len(chunk['text'])} chars)...")
         if chunk.get("chapter"):
             print(f"  Chapter: {chunk['chapter']}")
@@ -483,31 +555,42 @@ def main():
         all_entries.extend(entries)
         print(f"  Got {len(entries)} entries")
 
+        save_script_document(
+            OUTPUT_PATH,
+            entries=all_entries,
+            dictionary=existing_dictionary,
+            sanity_cache={"phrase_decisions": {}},
+        )
+        save_checkpoint(
+            CHECKPOINT_PATH,
+            task="script_generation",
+            signature=signature,
+            payload={
+                "input_file_path": os.path.abspath(input_file_path),
+                "book_title": book_title,
+                "total_chunks": total_chunks,
+                "next_chunk_index": i,
+                "all_entries": all_entries,
+            },
+        )
+
     if not all_entries:
         print("Error: No script entries generated")
         sys.exit(1)
 
-    # Save as JSON
-    output_path = os.path.join("..", "annotated_script.json")
-    existing_dictionary = []
-    if os.path.exists(output_path):
-        try:
-            existing_dictionary = load_script_document(output_path)["dictionary"]
-        except Exception:
-            existing_dictionary = []
-    save_script_document(output_path, entries=all_entries, dictionary=existing_dictionary)
-
-    # Delete old chunks.json so editor regenerates from new script
-    chunks_path = os.path.join("..", "chunks.json")
-    if os.path.exists(chunks_path):
-        os.remove(chunks_path)
-        print("Cleared old chunks.json")
+    save_script_document(
+        OUTPUT_PATH,
+        entries=all_entries,
+        dictionary=existing_dictionary,
+        sanity_cache={"phrase_decisions": {}},
+    )
+    clear_checkpoint(CHECKPOINT_PATH)
 
     # Summary (check both "speaker" and "type" fields)
     speakers = set(entry.get("speaker") or entry.get("type") or "UNKNOWN" for entry in all_entries)
     print(f"\nGenerated {len(all_entries)} script entries")
     print(f"Speakers found: {', '.join(sorted(speakers))}")
-    print(f"Output saved to: {output_path}")
+    print(f"Output saved to: {OUTPUT_PATH}")
 
 
 if __name__ == '__main__':

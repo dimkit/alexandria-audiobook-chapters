@@ -12,3 +12,4 @@ transformers==4.57.3
 peft==0.18.1
 python-multipart==0.0.22
 aiofiles==24.1.0
+pytest==8.4.1

@@ -7,6 +7,10 @@ from openai import OpenAI
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
 from script_store import load_script_document, save_script_document
+from task_checkpoint import build_signature, clear_checkpoint, load_checkpoint, save_checkpoint
+
+
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "script_review_checkpoint.json")
 
 
 def _is_section_break(text):
@@ -295,6 +299,13 @@ def diff_entries(original, corrected):
     return stats
 
 
+def flatten_pending_batches(batches, start_index):
+    pending = []
+    for batch_info in batches[start_index:]:
+        pending.extend(batch_info["entries"])
+    return pending
+
+
 def main():
     parser = argparse.ArgumentParser(description="Review and fix annotated audiobook script")
     parser.add_argument("--source", help="Path to original source text for comparison (mode 2, not yet implemented)")
@@ -307,7 +318,9 @@ def main():
         sys.exit(1)
 
     script_document = load_script_document(script_path)
-    entries = script_document["entries"]
+    checkpoint = load_checkpoint(CHECKPOINT_PATH)
+    checkpoint_original_entries = checkpoint.get("original_entries") if isinstance(checkpoint, dict) else None
+    entries = checkpoint_original_entries if isinstance(checkpoint_original_entries, list) else script_document["entries"]
 
     print(f"Loaded {len(entries)} script entries for review")
 
@@ -367,6 +380,36 @@ def main():
     total_batches = len(batches)
     print(f"Split into {total_batches} batches of ~{batch_size} entries")
 
+    chunks_path = os.path.join(os.path.dirname(__file__), "..", "chunks.json")
+    if os.path.exists(chunks_path):
+        os.remove(chunks_path)
+        print("Cleared old chunks.json")
+
+    signature = build_signature({
+        "task": "script_review",
+        "entries": entries,
+        "dictionary": script_document.get("dictionary", []),
+        "llm": {
+            "base_url": base_url,
+            "model_name": model_name,
+        },
+        "review": {
+            "batch_size": batch_size,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "presence_penalty": presence_penalty,
+            "banned_tokens": banned_tokens,
+            "merge_narrators": generation_config.get("merge_narrators", False),
+        },
+        "prompts": {
+            "system_prompt": review_sys,
+            "user_prompt_template": review_usr,
+        },
+    })
+
     all_corrected = []
     total_stats = {
         "text_changed": 0,
@@ -379,8 +422,33 @@ def main():
 
     previous_tail = None
     previous_chapter = None
+    start_batch_index = 0
 
-    for i, batch_info in enumerate(batches, 1):
+    if checkpoint and checkpoint.get("task") == "script_review" and checkpoint.get("signature") == signature:
+        checkpoint_corrected = checkpoint.get("all_corrected")
+        checkpoint_stats = checkpoint.get("total_stats")
+        checkpoint_batch_index = int(checkpoint.get("next_batch_index") or 0)
+        if isinstance(checkpoint_corrected, list) and isinstance(checkpoint_stats, dict) and 0 < checkpoint_batch_index <= total_batches:
+            all_corrected = checkpoint_corrected
+            total_stats.update(checkpoint_stats)
+            previous_tail = checkpoint.get("previous_tail")
+            previous_chapter = checkpoint.get("previous_chapter")
+            start_batch_index = checkpoint_batch_index
+            print(f"Resuming prior review progress from batch {start_batch_index + 1}/{total_batches}")
+        else:
+            clear_checkpoint(CHECKPOINT_PATH)
+    elif checkpoint:
+        print("Discarding stale review checkpoint because the script or configuration changed")
+        clear_checkpoint(CHECKPOINT_PATH)
+
+    if start_batch_index > 0:
+        save_script_document(
+            script_path,
+            entries=all_corrected + flatten_pending_batches(batches, start_batch_index),
+            dictionary=script_document["dictionary"],
+        )
+
+    for i, batch_info in enumerate(batches[start_batch_index:], start_batch_index + 1):
         batch = batch_info["entries"]
         batch_chapter = batch_info["chapter"]
         print(f"\nReviewing batch {i}/{total_batches} ({len(batch)} entries)...")
@@ -411,6 +479,25 @@ def main():
             total_stats["batches_failed"] += 1
             previous_tail = batch[-2:] if len(batch) >= 2 else batch
             previous_chapter = batch_chapter
+            save_script_document(
+                script_path,
+                entries=all_corrected + flatten_pending_batches(batches, i),
+                dictionary=script_document["dictionary"],
+            )
+            save_checkpoint(
+                CHECKPOINT_PATH,
+                task="script_review",
+                signature=signature,
+                payload={
+                    "original_entries": entries,
+                    "total_batches": total_batches,
+                    "next_batch_index": i,
+                    "all_corrected": all_corrected,
+                    "total_stats": total_stats,
+                    "previous_tail": previous_tail,
+                    "previous_chapter": previous_chapter,
+                },
+            )
             continue
 
         corrected = apply_batch_chapter(corrected, batch_chapter)
@@ -425,6 +512,25 @@ def main():
             total_stats["batches_failed"] += 1
             previous_tail = batch[-2:] if len(batch) >= 2 else batch
             previous_chapter = batch_chapter
+            save_script_document(
+                script_path,
+                entries=all_corrected + flatten_pending_batches(batches, i),
+                dictionary=script_document["dictionary"],
+            )
+            save_checkpoint(
+                CHECKPOINT_PATH,
+                task="script_review",
+                signature=signature,
+                payload={
+                    "original_entries": entries,
+                    "total_batches": total_batches,
+                    "next_batch_index": i,
+                    "all_corrected": all_corrected,
+                    "total_stats": total_stats,
+                    "previous_tail": previous_tail,
+                    "previous_chapter": previous_chapter,
+                },
+            )
             continue
 
         # Diff stats
@@ -455,6 +561,25 @@ def main():
         all_corrected.extend(corrected)
         previous_tail = corrected[-2:] if len(corrected) >= 2 else corrected
         previous_chapter = batch_chapter
+        save_script_document(
+            script_path,
+            entries=all_corrected + flatten_pending_batches(batches, i),
+            dictionary=script_document["dictionary"],
+        )
+        save_checkpoint(
+            CHECKPOINT_PATH,
+            task="script_review",
+            signature=signature,
+            payload={
+                "original_entries": entries,
+                "total_batches": total_batches,
+                "next_batch_index": i,
+                "all_corrected": all_corrected,
+                "total_stats": total_stats,
+                "previous_tail": previous_tail,
+                "previous_chapter": previous_chapter,
+            },
+        )
 
     # Post-processing: merge consecutive NARRATOR entries with same instruct
     merge_narrators_enabled = generation_config.get("merge_narrators", False)
@@ -470,9 +595,9 @@ def main():
 
     # Write corrected script
     save_script_document(script_path, entries=all_corrected, dictionary=script_document["dictionary"])
+    clear_checkpoint(CHECKPOINT_PATH)
 
     # Delete chunks.json so editor regenerates
-    chunks_path = os.path.join(os.path.dirname(__file__), "..", "chunks.json")
     if os.path.exists(chunks_path):
         os.remove(chunks_path)
         print("Cleared old chunks.json")
