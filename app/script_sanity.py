@@ -472,7 +472,14 @@ def build_attribution_classifier(client, model_name, system_prompt, user_prompt_
     return classify
 
 
-def run_script_sanity_check(source_document, script_document, chunk_size, attribution_resolver=None, known_phrase_decisions=None):
+def run_script_sanity_check(
+    source_document,
+    script_document,
+    chunk_size,
+    attribution_resolver=None,
+    known_phrase_decisions=None,
+    attribution_progress=None,
+):
     source_chapters = []
     for index, chapter in enumerate(source_document.get("chapters") or [], start=1):
         source_chapters.append({
@@ -585,14 +592,35 @@ def run_script_sanity_check(source_document, script_document, chunk_size, attrib
         })
 
     result["attribution_candidates"] = len(candidate_map)
+    if callable(attribution_progress):
+        attribution_progress(
+            "prepared",
+            {
+                "candidates": result["attribution_candidates"],
+                "cache_hits": result["attribution_cache_hits"],
+                "queries": result["attribution_model_queries"],
+            },
+        )
 
-    for phrase_key, payload in candidate_map.items():
+    total_candidates = len(candidate_map)
+    for index, (phrase_key, payload) in enumerate(candidate_map.items(), start=1):
         cached = phrase_decisions.get(phrase_key)
         if isinstance(cached, dict) and cached.get("decision") in ("accepted", "rejected"):
             payload["decision"] = cached["decision"]
             payload["source"] = "cache"
             payload["reply"] = cached.get("reply", "")
             result["attribution_cache_hits"] += 1
+            if callable(attribution_progress):
+                attribution_progress(
+                    "cache_hit",
+                    {
+                        "current": index,
+                        "total": total_candidates,
+                        "phrase_key": phrase_key,
+                        "cache_hits": result["attribution_cache_hits"],
+                        "queries": result["attribution_model_queries"],
+                    },
+                )
             continue
         if attribution_resolver is None:
             continue
@@ -607,6 +635,18 @@ def run_script_sanity_check(source_document, script_document, chunk_size, attrib
             "checked_at": time.time(),
         }
         result["attribution_model_queries"] += 1
+        if callable(attribution_progress):
+            attribution_progress(
+                "classified",
+                {
+                    "current": index,
+                    "total": total_candidates,
+                    "phrase_key": phrase_key,
+                    "decision": payload["decision"],
+                    "cache_hits": result["attribution_cache_hits"],
+                    "queries": result["attribution_model_queries"],
+                },
+            )
 
     pruned_keys = {
         phrase_key

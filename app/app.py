@@ -28,7 +28,7 @@ from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapte
 from script_store import apply_dictionary_to_text, clean_dictionary_entries, load_script_document, save_script_document
 from source_document import load_source_document
 from script_sanity import build_attribution_classifier, run_script_sanity_check
-from script_repair import repair_invalid_chunks
+from script_repair import RepairSupersededError, repair_invalid_chunks
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -376,6 +376,67 @@ def _new_audio_heartbeat_state():
 
 
 process_state["audio"]["heartbeat"] = _new_audio_heartbeat_state()
+
+task_state_lock = threading.RLock()
+task_processes = {}
+
+
+def _task_is_current(task_name: str, run_id: str) -> bool:
+    with task_state_lock:
+        return process_state.get(task_name, {}).get("run_id") == run_id
+
+
+def _append_task_log(task_name: str, run_id: str, message: str) -> bool:
+    with task_state_lock:
+        state = process_state.get(task_name)
+        if not state or state.get("run_id") != run_id:
+            return False
+        state["logs"].append(message)
+        _trim_logs(state["logs"])
+        return True
+
+
+def _start_task_run(task_name: str) -> str:
+    run_id = str(uuid.uuid4())
+    with task_state_lock:
+        previous_running = bool(process_state[task_name].get("running"))
+        previous_process = task_processes.get(task_name)
+        process_state[task_name]["run_id"] = run_id
+        process_state[task_name]["running"] = True
+        process_state[task_name]["logs"] = []
+        if previous_running:
+            process_state[task_name]["logs"].append(
+                "Restart requested. Using the latest Setup settings and attempting to continue from saved progress."
+            )
+            _trim_logs(process_state[task_name]["logs"])
+        if previous_process and previous_process.poll() is None:
+            try:
+                previous_process.terminate()
+            except Exception:
+                pass
+    return run_id
+
+
+def _finish_task_run(task_name: str, run_id: str, process=None):
+    with task_state_lock:
+        state = process_state.get(task_name)
+        if not state or state.get("run_id") != run_id:
+            return
+        state["running"] = False
+        if process is not None and task_processes.get(task_name) is process:
+            task_processes.pop(task_name, None)
+
+
+def _register_task_process(task_name: str, run_id: str, process):
+    with task_state_lock:
+        if process_state.get(task_name, {}).get("run_id") != run_id:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            return False
+        task_processes[task_name] = process
+        return True
 
 
 def _format_audio_metrics_locked():
@@ -1066,12 +1127,8 @@ audio_heartbeat_thread = threading.Thread(target=_audio_heartbeat_daemon, daemon
 audio_heartbeat_thread.start()
 _restore_audio_queue_state()
 
-def run_process(command: List[str], task_name: str):
+def run_process(command: List[str], task_name: str, run_id: str):
     """Run a subprocess and capture logs."""
-    global process_state
-    process_state[task_name]["running"] = True
-    process_state[task_name]["logs"] = []
-
     logger.info(f"Starting task {task_name}: {' '.join(command)}")
 
     try:
@@ -1086,37 +1143,71 @@ def run_process(command: List[str], task_name: str):
             universal_newlines=True,
             env=env,
         )
+        if not _register_task_process(task_name, run_id, process):
+            return
 
         for line in process.stdout:
+            if not _task_is_current(task_name, run_id):
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                break
             log_line = line.strip()
             if log_line:
-                process_state[task_name]["logs"].append(log_line)
-                # Keep log size manageable
-                if len(process_state[task_name]["logs"]) > 1000:
-                    process_state[task_name]["logs"].pop(0)
+                _append_task_log(task_name, run_id, log_line)
 
         process.wait()
+        if not _task_is_current(task_name, run_id):
+            return
         return_code = process.returncode
 
         if return_code == 0:
-            process_state[task_name]["logs"].append(f"Task {task_name} completed successfully.")
+            _append_task_log(task_name, run_id, f"Task {task_name} completed successfully.")
         else:
-            process_state[task_name]["logs"].append(f"Task {task_name} failed with return code {return_code}.")
+            _append_task_log(task_name, run_id, f"Task {task_name} failed with return code {return_code}.")
 
     except Exception as e:
         logger.error(f"Error running {task_name}: {e}")
-        process_state[task_name]["logs"].append(f"Error: {str(e)}")
+        _append_task_log(task_name, run_id, f"Error: {str(e)}")
     finally:
-        process_state[task_name]["running"] = False
+        _finish_task_run(task_name, run_id, locals().get("process"))
 
 
-def run_script_sanity_task():
-    process_state["sanity"]["running"] = True
-    process_state["sanity"]["logs"] = []
-
+def run_script_sanity_task(run_id: str):
     def log(message: str):
-        process_state["sanity"]["logs"].append(message)
-        _trim_logs(process_state["sanity"]["logs"])
+        return _append_task_log("sanity", run_id, message)
+
+    progress_state = {
+        "prepared_logged": False,
+        "last_logged_current": 0,
+    }
+
+    def on_attribution_progress(event: str, payload: dict):
+        if not _task_is_current("sanity", run_id):
+            return
+        total = int(payload.get("total") or payload.get("candidates") or 0)
+        current = int(payload.get("current") or 0)
+        cache_hits = int(payload.get("cache_hits") or 0)
+        queries = int(payload.get("queries") or 0)
+        if event == "prepared":
+            if total <= 0:
+                log("Attribution check: no candidate omissions detected.")
+            else:
+                log(f"Attribution check: evaluating {total} candidate omissions.")
+            progress_state["prepared_logged"] = True
+            return
+        if total <= 0:
+            return
+        should_log = current == total or current == 1 or (current - progress_state["last_logged_current"]) >= 10
+        if should_log:
+            decision = payload.get("decision")
+            suffix = f", latest_decision={decision}" if decision else ""
+            log(
+                f"Attribution progress: {current}/{total} checked "
+                f"(model_queries={queries}, cache_hits={cache_hits}{suffix})"
+            )
+            progress_state["last_logged_current"] = current
 
     try:
         if os.path.exists(SCRIPT_SANITY_PATH):
@@ -1183,7 +1274,10 @@ def run_script_sanity_task():
             chunk_size,
             attribution_resolver=attribution_resolver,
             known_phrase_decisions=(script_document.get("sanity_cache") or {}).get("phrase_decisions"),
+            attribution_progress=on_attribution_progress,
         )
+        if not _task_is_current("sanity", run_id):
+            return
 
         updated_sanity_cache = {
             "phrase_decisions": result.get("attribution_phrase_decisions", {}),
@@ -1228,24 +1322,28 @@ def run_script_sanity_task():
         log("Task sanity completed successfully.")
     except Exception as e:
         logger.error(f"Error running script sanity check: {e}")
-        log(f"Error: {str(e)}")
+        if _task_is_current("sanity", run_id):
+            log(f"Error: {str(e)}")
     finally:
-        process_state["sanity"]["running"] = False
+        _finish_task_run("sanity", run_id)
 
 
-def run_script_repair_task():
-    process_state["repair"]["running"] = True
-    process_state["repair"]["logs"] = []
-
+def run_script_repair_task(run_id: str):
     def log(message: str):
-        process_state["repair"]["logs"].append(message)
-        _trim_logs(process_state["repair"]["logs"])
+        if not _append_task_log("repair", run_id, message):
+            raise RepairSupersededError()
 
     try:
         if os.path.exists(SCRIPT_SANITY_PATH):
             os.remove(SCRIPT_SANITY_PATH)
 
-        result = repair_invalid_chunks(ROOT_DIR, log)
+        result = repair_invalid_chunks(
+            ROOT_DIR,
+            log,
+            should_continue=lambda: _task_is_current("repair", run_id),
+        )
+        if not _task_is_current("repair", run_id):
+            return
         final_sanity = result["final_sanity"]
 
         with open(SCRIPT_SANITY_PATH, "w", encoding="utf-8") as f:
@@ -1267,11 +1365,14 @@ def run_script_repair_task():
             )
 
         log("Task repair completed successfully.")
+    except RepairSupersededError:
+        logger.info("Repair task superseded by a newer request")
     except Exception as e:
         logger.error(f"Error running script repair: {e}")
-        log(f"Error: {str(e)}")
+        if _task_is_current("repair", run_id):
+            log(f"Error: {str(e)}")
     finally:
-        process_state["repair"]["running"] = False
+        _finish_task_run("repair", run_id)
 
 # Endpoints
 
@@ -1551,44 +1652,36 @@ async def generate_script(background_tasks: BackgroundTasks):
     if not input_file:
          raise HTTPException(status_code=400, detail="No input file found in state")
 
-    if process_state["script"]["running"]:
-         raise HTTPException(status_code=400, detail="Script generation already running")
-
-    background_tasks.add_task(run_process, [sys.executable, "-u", "generate_script.py", input_file], "script")
-    return {"status": "started"}
+    run_id = _start_task_run("script")
+    background_tasks.add_task(run_process, [sys.executable, "-u", "generate_script.py", input_file], "script", run_id)
+    return {"status": "started", "run_id": run_id}
 
 @app.post("/api/review_script")
 async def review_script(background_tasks: BackgroundTasks):
     if not os.path.exists(SCRIPT_PATH):
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
-    if process_state["review"]["running"]:
-        raise HTTPException(status_code=400, detail="Script review already running")
-
-    background_tasks.add_task(run_process, [sys.executable, "-u", "review_script.py"], "review")
-    return {"status": "started"}
+    run_id = _start_task_run("review")
+    background_tasks.add_task(run_process, [sys.executable, "-u", "review_script.py"], "review", run_id)
+    return {"status": "started", "run_id": run_id}
 
 @app.post("/api/script_sanity_check")
 async def script_sanity_check(background_tasks: BackgroundTasks):
     if not os.path.exists(SCRIPT_PATH):
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
-    if process_state["sanity"]["running"]:
-        raise HTTPException(status_code=400, detail="Script sanity check already running")
-
-    background_tasks.add_task(run_script_sanity_task)
-    return {"status": "started"}
+    run_id = _start_task_run("sanity")
+    background_tasks.add_task(run_script_sanity_task, run_id)
+    return {"status": "started", "run_id": run_id}
 
 @app.post("/api/replace_missing_chunks")
 async def replace_missing_chunks(background_tasks: BackgroundTasks):
     if not os.path.exists(SCRIPT_PATH):
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
-    if process_state["repair"]["running"]:
-        raise HTTPException(status_code=400, detail="Script repair already running")
-
-    background_tasks.add_task(run_script_repair_task)
-    return {"status": "started"}
+    run_id = _start_task_run("repair")
+    background_tasks.add_task(run_script_repair_task, run_id)
+    return {"status": "started", "run_id": run_id}
 
 @app.get("/api/annotated_script")
 async def get_annotated_script():
@@ -2486,10 +2579,11 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
         "--lora_alpha", str(request.lora_alpha),
         "--gradient_accumulation_steps", str(request.gradient_accumulation_steps),
     ]
+    run_id = _start_task_run("lora_training")
 
     def on_training_complete():
         """After training subprocess finishes, update manifest if adapter was saved."""
-        run_process(command, "lora_training")
+        run_process(command, "lora_training", run_id)
 
         # Check if training produced an adapter
         if os.path.isdir(output_dir) and os.path.exists(os.path.join(output_dir, "training_meta.json")):
@@ -2515,7 +2609,7 @@ async def lora_start_training(request: LoraTrainingRequest, background_tasks: Ba
                 logger.error(f"Failed to update LoRA manifest: {e}")
 
     background_tasks.add_task(on_training_complete)
-    return {"status": "started", "adapter_id": adapter_id}
+    return {"status": "started", "adapter_id": adapter_id, "run_id": run_id}
 
 @app.get("/api/lora/models")
 async def lora_list_models():

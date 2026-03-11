@@ -15,8 +15,17 @@ _WORD_RE = re.compile(r"[A-Za-z]+")
 _QUOTE_RE = re.compile(r'["“”]')
 
 
+class RepairSupersededError(Exception):
+    pass
+
+
 def _count_words(text):
     return len(_WORD_RE.findall(text or ""))
+
+
+def _ensure_continue(should_continue):
+    if callable(should_continue) and not should_continue():
+        raise RepairSupersededError()
 
 
 def _tokenize_with_positions(text):
@@ -398,7 +407,7 @@ def _splice_replacement(entries, chapter_group, replacement_chunk, replacement_e
     )
 
 
-def repair_invalid_chunks(root_dir, log):
+def repair_invalid_chunks(root_dir, log, should_continue=None):
     state_path = os.path.join(root_dir, "state.json")
     script_path = os.path.join(root_dir, "annotated_script.json")
     chunks_path = os.path.join(root_dir, "chunks.json")
@@ -428,6 +437,7 @@ def repair_invalid_chunks(root_dir, log):
     initial_result = None
 
     while True:
+        _ensure_continue(should_continue)
         script_document = load_script_document(script_path)
         sanity_cache = script_document.get("sanity_cache") or {}
         sanity_result = run_script_sanity_check(
@@ -478,6 +488,7 @@ def repair_invalid_chunks(root_dir, log):
                 log(f'Could not locate script chapter for "{chapter_title}".')
                 continue
 
+            _ensure_continue(should_continue)
             updated_entries = _splice_replacement(entries, script_group, replacement_chunk, [])
             save_script_document(
                 script_path,
@@ -527,6 +538,7 @@ def repair_invalid_chunks(root_dir, log):
 
         if int(replacement_chunk["source_word_start"]) == 0 and _is_structural_segment(target_source_text):
             replacement_entries = _build_literal_replacement_entries(source_chapter["title"], target_source_text)
+            _ensure_continue(should_continue)
             updated_entries = _splice_replacement(entries, script_group, replacement_chunk, replacement_entries)
             save_script_document(
                 script_path,
@@ -542,6 +554,7 @@ def repair_invalid_chunks(root_dir, log):
 
         if settings.get("orphaned_text_to_narrator_on_repair", True) and not target_is_inside_dialogue:
             replacement_entries = _build_narrator_replacement_entries(source_chapter["title"], target_source_text)
+            _ensure_continue(should_continue)
             updated_entries = _splice_replacement(entries, script_group, replacement_chunk, replacement_entries)
             save_script_document(
                 script_path,
@@ -599,6 +612,7 @@ def repair_invalid_chunks(root_dir, log):
 
         if not validated:
             replacement_entries = _build_literal_replacement_entries(source_chapter["title"], target_source_text)
+            _ensure_continue(should_continue)
             updated_entries = _splice_replacement(entries, script_group, replacement_chunk, replacement_entries)
             save_script_document(
                 script_path,
@@ -623,6 +637,7 @@ def repair_invalid_chunks(root_dir, log):
             log(f'Validated excerpt for "{chapter_title}" but could not isolate replacement span.')
             continue
 
+        _ensure_continue(should_continue)
         updated_entries = _splice_replacement(entries, script_group, replacement_chunk, replacement_entries)
         save_script_document(
             script_path,

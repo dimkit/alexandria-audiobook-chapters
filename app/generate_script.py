@@ -466,24 +466,6 @@ def main():
     signature = build_signature({
         "task": "script_generation",
         "input_file": file_fingerprint(input_file_path),
-        "llm": {
-            "base_url": base_url,
-            "model_name": model_name,
-        },
-        "generation": {
-            "chunk_size": chunk_size,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "min_p": min_p,
-            "presence_penalty": presence_penalty,
-            "banned_tokens": banned_tokens,
-        },
-        "prompts": {
-            "system_prompt": system_prompt,
-            "user_prompt_template": user_prompt_template,
-        },
         "source": {
             "type": source_type,
             "title": book_title,
@@ -510,7 +492,7 @@ def main():
         else:
             clear_checkpoint(CHECKPOINT_PATH)
     elif checkpoint:
-        print("Discarding stale generation checkpoint because the source or configuration changed")
+        print("Discarding stale generation checkpoint because the source or chunk layout changed")
         clear_checkpoint(CHECKPOINT_PATH)
 
     existing_dictionary = []

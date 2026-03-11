@@ -389,24 +389,12 @@ def main():
         "task": "script_review",
         "entries": entries,
         "dictionary": script_document.get("dictionary", []),
-        "llm": {
-            "base_url": base_url,
-            "model_name": model_name,
-        },
         "review": {
             "batch_size": batch_size,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "min_p": min_p,
-            "presence_penalty": presence_penalty,
-            "banned_tokens": banned_tokens,
-            "merge_narrators": generation_config.get("merge_narrators", False),
-        },
-        "prompts": {
-            "system_prompt": review_sys,
-            "user_prompt_template": review_usr,
+            "chapter_boundaries": [
+                batch_info["chapter"]
+                for batch_info in batches
+            ],
         },
     })
 
@@ -438,7 +426,7 @@ def main():
         else:
             clear_checkpoint(CHECKPOINT_PATH)
     elif checkpoint:
-        print("Discarding stale review checkpoint because the script or configuration changed")
+        print("Discarding stale review checkpoint because the script or batch layout changed")
         clear_checkpoint(CHECKPOINT_PATH)
 
     if start_batch_index > 0:
