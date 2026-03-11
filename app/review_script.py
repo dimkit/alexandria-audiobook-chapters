@@ -35,6 +35,7 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
     i = 0
     while i < len(entries):
         entry = entries[i]
+        entry_chapter = entry.get("chapter")
 
         if entry.get("speaker") != "NARRATOR" or _is_section_break(entry.get("text", "")):
             merged.append(entry)
@@ -53,6 +54,8 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
                 break
             if next_entry.get("instruct", "") != instruct:
                 break
+            if next_entry.get("chapter") != entry_chapter:
+                break
             if _is_section_break(next_entry.get("text", "")):
                 break
             candidate = combined_text + " " + next_entry["text"]
@@ -62,16 +65,57 @@ def merge_consecutive_narrators(entries, max_merged_length=800):
             run_count += 1
             j += 1
 
-        merged.append({
+        merged_entry = {
             "speaker": "NARRATOR",
             "text": combined_text,
             "instruct": instruct
-        })
+        }
+        if entry_chapter:
+            merged_entry["chapter"] = entry_chapter
+        merged.append(merged_entry)
         if run_count > 1:
             merges += run_count - 1
         i = j
 
     return merged, merges
+
+
+def build_review_batches(entries, batch_size):
+    batches = []
+    current_batch = []
+    current_chapter = None
+
+    for entry in entries:
+        entry_chapter = entry.get("chapter") or None
+        if current_batch and (entry_chapter != current_chapter or len(current_batch) >= batch_size):
+            batches.append({
+                "entries": current_batch,
+                "chapter": current_chapter,
+            })
+            current_batch = []
+
+        if not current_batch:
+            current_chapter = entry_chapter
+        current_batch.append(entry)
+
+    if current_batch:
+        batches.append({
+            "entries": current_batch,
+            "chapter": current_chapter,
+        })
+
+    return batches
+
+
+def apply_batch_chapter(corrected_entries, chapter):
+    if not chapter:
+        for entry in corrected_entries:
+            entry.pop("chapter", None)
+        return corrected_entries
+
+    for entry in corrected_entries:
+        entry["chapter"] = chapter
+    return corrected_entries
 
 
 def review_batch(client, model_name, batch_entries, batch_num, total_batches,
@@ -318,9 +362,7 @@ def main():
     client = OpenAI(base_url=base_url, api_key=api_key)
 
     # Split entries into batches
-    batches = []
-    for i in range(0, len(entries), batch_size):
-        batches.append(entries[i:i + batch_size])
+    batches = build_review_batches(entries, batch_size)
 
     total_batches = len(batches)
     print(f"Split into {total_batches} batches of ~{batch_size} entries")
@@ -336,9 +378,17 @@ def main():
     }
 
     previous_tail = None
+    previous_chapter = None
 
-    for i, batch in enumerate(batches, 1):
+    for i, batch_info in enumerate(batches, 1):
+        batch = batch_info["entries"]
+        batch_chapter = batch_info["chapter"]
         print(f"\nReviewing batch {i}/{total_batches} ({len(batch)} entries)...")
+        if batch_chapter:
+            print(f"  Chapter: {batch_chapter}")
+
+        if batch_chapter != previous_chapter:
+            previous_tail = None
 
         corrected = review_batch(
             client, model_name, batch, i, total_batches,
@@ -360,7 +410,10 @@ def main():
             all_corrected.extend(batch)
             total_stats["batches_failed"] += 1
             previous_tail = batch[-2:] if len(batch) >= 2 else batch
+            previous_chapter = batch_chapter
             continue
+
+        corrected = apply_batch_chapter(corrected, batch_chapter)
 
         # Text-loss safety check
         passed, orig_text, corr_text, ratio = check_text_loss(batch, corrected)
@@ -371,6 +424,7 @@ def main():
             all_corrected.extend(batch)
             total_stats["batches_failed"] += 1
             previous_tail = batch[-2:] if len(batch) >= 2 else batch
+            previous_chapter = batch_chapter
             continue
 
         # Diff stats
@@ -400,6 +454,7 @@ def main():
 
         all_corrected.extend(corrected)
         previous_tail = corrected[-2:] if len(corrected) >= 2 else corrected
+        previous_chapter = batch_chapter
 
     # Post-processing: merge consecutive NARRATOR entries with same instruct
     merge_narrators_enabled = generation_config.get("merge_narrators", False)

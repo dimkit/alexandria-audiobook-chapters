@@ -5,6 +5,7 @@ import re
 from openai import OpenAI
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 from script_store import load_script_document, save_script_document
+from source_document import load_source_document
 
 def clean_json_string(text):
     """Clean and extract valid JSON array from LLM response."""
@@ -226,6 +227,28 @@ def split_into_chunks(text, max_size=3000):
 
     return chunks
 
+
+def split_source_into_chunks(source_document, max_size=3000):
+    chunks = []
+    chapters = source_document.get("chapters") or []
+
+    for chapter_index, chapter in enumerate(chapters, start=1):
+        chapter_text = (chapter.get("text") or "").strip()
+        if not chapter_text:
+            continue
+        chapter_title = (chapter.get("title") or "").strip() or None
+        chapter_chunks = split_into_chunks(chapter_text, max_size=max_size)
+        for chunk_index, chunk_text in enumerate(chapter_chunks, start=1):
+            chunks.append({
+                "text": chunk_text,
+                "chapter": chapter_title,
+                "chapter_index": chapter_index,
+                "chunk_index": chunk_index,
+                "chapter_chunk_count": len(chapter_chunks),
+            })
+
+    return chunks
+
 def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_entries=None, max_retries=2, system_prompt=None, user_prompt_template=None, max_tokens=4096, temperature=0.6, top_p=0.8, top_k=20, min_p=0, presence_penalty=0.0, banned_tokens=None):
     """Process a text chunk and return JSON script entries"""
     # Use provided prompts or fall back to defaults
@@ -234,12 +257,23 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
 
     context_parts = []
 
+    chunk_text = chunk["text"] if isinstance(chunk, dict) else chunk
+    chunk_chapter = chunk.get("chapter") if isinstance(chunk, dict) else None
+    chunk_index_in_chapter = chunk.get("chunk_index") if isinstance(chunk, dict) else None
+    chapter_chunk_count = chunk.get("chapter_chunk_count") if isinstance(chunk, dict) else None
+
     if chunk_num == 1:
         context_parts.append("(Beginning of text)")
     elif chunk_num == total_chunks:
         context_parts.append("(End of text)")
     else:
         context_parts.append(f"(Part {chunk_num} of {total_chunks})")
+
+    if chunk_chapter:
+        if chunk_index_in_chapter and chapter_chunk_count:
+            context_parts.append(f'Chapter: "{chunk_chapter}" (section {chunk_index_in_chapter} of {chapter_chunk_count})')
+        else:
+            context_parts.append(f'Chapter: "{chunk_chapter}"')
 
     if previous_entries and len(previous_entries) > 0:
         # Build character roster for name consistency across chunks
@@ -257,7 +291,7 @@ def process_chunk(client, model_name, chunk, chunk_num, total_chunks, previous_e
             context_parts.append(json.dumps(entry, ensure_ascii=False))
 
     context = "\n".join(context_parts)
-    user_prompt = usr_template.format(context=context, chunk=chunk)
+    user_prompt = usr_template.format(context=context, chunk=chunk_text)
 
     for attempt in range(max_retries + 1):
         try:
@@ -359,13 +393,15 @@ def main():
         print(f"Error: Input file not found: {input_file_path}")
         sys.exit(1)
 
-    with open(input_file_path, 'r', encoding='utf-8') as f:
-        book_content = f.read()
+    source_document = load_source_document(input_file_path)
+    source_type = source_document.get("type", "text")
+    book_title = source_document.get("book_title") or source_document.get("title") or os.path.splitext(os.path.basename(input_file_path))[0]
+    total_chars = sum(len(chapter.get("text") or "") for chapter in source_document.get("chapters", []))
+    print(f"Loaded {source_type} source: {book_title}")
+    print(f"Read {total_chars} characters across {len(source_document.get('chapters', []))} chapter unit(s)")
 
-    # Fix encoding artifacts
-    book_content = fix_mojibake(book_content)
-
-    print(f"Read {len(book_content)} characters")
+    for chapter in source_document.get("chapters", []):
+        chapter["text"] = fix_mojibake(chapter.get("text", ""))
 
     # Load LLM config
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
@@ -413,14 +449,19 @@ def main():
     )
 
     # Split into chunks at natural boundaries
-    chunks = split_into_chunks(book_content, max_size=chunk_size)
+    chunks = split_source_into_chunks(source_document, max_size=chunk_size)
     total_chunks = len(chunks)
+    if total_chunks == 0:
+        print("Error: No readable content found in source document")
+        sys.exit(1)
 
     print(f"Split into {total_chunks} chunks at paragraph/sentence boundaries")
 
     all_entries = []
     for i, chunk in enumerate(chunks, 1):
-        print(f"Processing chunk {i}/{total_chunks} ({len(chunk)} chars)...")
+        print(f"Processing chunk {i}/{total_chunks} ({len(chunk['text'])} chars)...")
+        if chunk.get("chapter"):
+            print(f"  Chapter: {chunk['chapter']}")
 
         previous = all_entries if len(all_entries) > 0 else None
         entries = process_chunk(
@@ -436,6 +477,9 @@ def main():
             presence_penalty=presence_penalty,
             banned_tokens=banned_tokens
         )
+        if chunk.get("chapter"):
+            for entry in entries:
+                entry["chapter"] = chunk["chapter"]
         all_entries.extend(entries)
         print(f"  Got {len(entries)} entries")
 

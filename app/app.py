@@ -24,6 +24,7 @@ from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, load_def
 from review_prompts import load_review_prompts
 from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
 from script_store import apply_dictionary_to_text, clean_dictionary_entries, load_script_document, save_script_document
+from source_document import load_source_document
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -306,7 +307,7 @@ process_state = {
     "dataset_builder": {"running": False, "logs": [], "cancel": False}
 }
 
-audio_queue_lock = threading.Lock()
+audio_queue_lock = threading.RLock()
 audio_queue_condition = threading.Condition(audio_queue_lock)
 audio_queue = []
 audio_current_job = None
@@ -364,6 +365,7 @@ def _format_audio_metrics_locked():
     metrics = process_state["audio"]["metrics"]
     return {
         "sample_window_size": metrics["sample_window_size"],
+        "samples": list(metrics.get("samples", [])),
         "processed_clips": metrics["processed_clips"],
         "successful_clips": metrics["successful_clips"],
         "error_clips": metrics["error_clips"],
@@ -446,6 +448,7 @@ def _persist_audio_queue_state_locked():
         "job_counter": audio_job_counter,
         "queue": [_serialize_audio_job(job) | {"word_counts": job.get("word_counts", {})} for job in audio_queue],
         "current_job": (_serialize_audio_job(audio_current_job) | {"word_counts": audio_current_job.get("word_counts", {})}) if audio_current_job else None,
+        "metrics": _format_audio_metrics_locked(),
         "heartbeat": _format_audio_heartbeat_locked(),
         "updated_at": time.time(),
     }
@@ -479,6 +482,10 @@ def _record_audio_recent_job_locked(job):
 
 def _record_audio_sample_locked(job, chunk_index, elapsed_seconds, input_words, output_words, success):
     metrics = process_state["audio"]["metrics"]
+    # Older refresh paths may have serialized metrics without the rolling sample
+    # buffer. Recreate it so timing estimates continue updating instead of
+    # breaking on the next queue refresh.
+    metrics.setdefault("samples", [])
     now = time.time()
     sample = {
         "job_id": job["id"],
@@ -515,6 +522,52 @@ def _record_audio_sample_locked(job, chunk_index, elapsed_seconds, input_words, 
     job["remaining_words"] = max(0, job.get("remaining_words", 0) - sample["input_words"])
     job["last_output_at"] = now
     process_state["audio"]["heartbeat"]["last_output_at"] = now
+    _recompute_audio_metrics_locked()
+
+
+def _restore_job_progress_from_chunks(raw_job, chunks):
+    indices = [int(idx) for idx in raw_job.get("indices", [])]
+    word_counts = {int(k): int(v) for k, v in (raw_job.get("word_counts") or {}).items()}
+
+    reconciled_indices = [idx for idx in indices if 0 <= idx < len(chunks)]
+    pending_indices = []
+    processed_clips = 0
+    error_clips = 0
+
+    for idx in reconciled_indices:
+        status = chunks[idx].get("status")
+        if status == "done":
+            processed_clips += 1
+        elif status == "error":
+            processed_clips += 1
+            error_clips += 1
+        else:
+            pending_indices.append(idx)
+
+    total_words = sum(word_counts.get(idx, 0) for idx in reconciled_indices)
+    remaining_words = sum(word_counts.get(idx, 0) for idx in pending_indices)
+
+    return {
+        "indices": reconciled_indices,
+        "pending_indices": pending_indices,
+        "word_counts": word_counts,
+        "total_chunks": len(reconciled_indices),
+        "total_words": total_words,
+        "remaining_words": remaining_words,
+        "processed_clips": processed_clips,
+        "error_clips": error_clips,
+    }
+
+
+def _seed_audio_metrics_from_jobs_locked(*jobs):
+    metrics = _new_audio_metrics()
+    for job in jobs:
+        if not job:
+            continue
+        metrics["processed_clips"] += int(job.get("processed_clips", 0) or 0)
+        metrics["error_clips"] += int(job.get("error_clips", 0) or 0)
+    metrics["successful_clips"] = metrics["processed_clips"] - metrics["error_clips"]
+    process_state["audio"]["metrics"] = metrics
     _recompute_audio_metrics_locked()
 
 
@@ -658,28 +711,36 @@ def _restore_audio_queue_state():
 
     with audio_queue_condition:
         project_manager.reset_generating_chunks()
+        chunks = project_manager.load_chunks()
         process_state["audio"]["metrics"] = _new_audio_metrics()
         process_state["audio"]["heartbeat"] = _new_audio_heartbeat_state()
         process_state["audio"]["logs"] = []
         process_state["audio"]["recent_jobs"] = []
         audio_job_counter = max(audio_job_counter, int(payload.get("job_counter", 0) or 0))
 
+        saved_heartbeat = payload.get("heartbeat") or {}
+        process_state["audio"]["heartbeat"]["last_check_at"] = saved_heartbeat.get("last_check_at")
+        process_state["audio"]["heartbeat"]["last_output_at"] = saved_heartbeat.get("last_output_at")
+        process_state["audio"]["heartbeat"]["last_recovery_at"] = saved_heartbeat.get("last_recovery_at")
+        process_state["audio"]["heartbeat"]["recovery_count"] = int(saved_heartbeat.get("recovery_count", 0) or 0)
+        process_state["audio"]["heartbeat"]["last_recovery_reason"] = saved_heartbeat.get("last_recovery_reason")
+
         restored_jobs = []
         for raw_job in payload.get("queue", []):
-            pending_indices = [int(idx) for idx in raw_job.get("pending_indices", raw_job.get("indices", []))]
-            if not pending_indices:
+            progress = _restore_job_progress_from_chunks(raw_job, chunks)
+            if not progress["pending_indices"]:
                 continue
             restored_jobs.append({
                 "id": int(raw_job.get("id", 0) or 0),
                 "kind": raw_job.get("kind", "parallel"),
-                "indices": pending_indices,
-                "pending_indices": pending_indices,
-                "word_counts": {int(k): int(v) for k, v in (raw_job.get("word_counts") or {}).items()},
-                "total_chunks": len(pending_indices),
-                "total_words": int(raw_job.get("total_words", 0) or 0),
-                "remaining_words": int(raw_job.get("remaining_words", 0) or 0),
-                "processed_clips": 0,
-                "error_clips": 0,
+                "indices": progress["indices"],
+                "pending_indices": progress["pending_indices"],
+                "word_counts": progress["word_counts"],
+                "total_chunks": progress["total_chunks"],
+                "total_words": progress["total_words"],
+                "remaining_words": progress["remaining_words"],
+                "processed_clips": progress["processed_clips"],
+                "error_clips": progress["error_clips"],
                 "recovery_count": int(raw_job.get("recovery_count", 0) or 0),
                 "label": raw_job.get("label", "Recovered audio job"),
                 "scope": raw_job.get("scope", "custom"),
@@ -692,20 +753,21 @@ def _restore_audio_queue_state():
             })
 
         raw_current = payload.get("current_job")
+        resumed_job = None
         if raw_current:
-            pending_indices = [int(idx) for idx in raw_current.get("pending_indices", raw_current.get("indices", []))]
-            if pending_indices:
+            progress = _restore_job_progress_from_chunks(raw_current, chunks)
+            if progress["pending_indices"]:
                 resumed_job = {
                     "id": int(raw_current.get("id", 0) or 0),
                     "kind": raw_current.get("kind", "parallel"),
-                    "indices": pending_indices,
-                    "pending_indices": pending_indices,
-                    "word_counts": {int(k): int(v) for k, v in (raw_current.get("word_counts") or {}).items()},
-                    "total_chunks": len(pending_indices),
-                    "total_words": int(raw_current.get("total_words", 0) or 0),
-                    "remaining_words": int(raw_current.get("remaining_words", 0) or 0),
-                    "processed_clips": 0,
-                    "error_clips": 0,
+                    "indices": progress["indices"],
+                    "pending_indices": progress["pending_indices"],
+                    "word_counts": progress["word_counts"],
+                    "total_chunks": progress["total_chunks"],
+                    "total_words": progress["total_words"],
+                    "remaining_words": progress["remaining_words"],
+                    "processed_clips": progress["processed_clips"],
+                    "error_clips": progress["error_clips"],
                     "recovery_count": int(raw_current.get("recovery_count", 0) or 0) + 1,
                     "label": f"{raw_current.get('label', 'Recovered audio job')} (resumed after restart)",
                     "scope": raw_current.get("scope", "custom"),
@@ -718,10 +780,11 @@ def _restore_audio_queue_state():
                 }
                 restored_jobs.insert(0, resumed_job)
                 _append_audio_log_locked(
-                    f"[RECOVER] Restored interrupted job from disk with {len(pending_indices)} pending chunk(s)"
+                    f"[RECOVER] Restored interrupted job from disk with {len(progress['pending_indices'])} pending chunk(s)"
                 )
 
         audio_queue[:] = restored_jobs
+        _seed_audio_metrics_from_jobs_locked(*restored_jobs)
         if restored_jobs:
             _refresh_audio_process_state_locked(persist=True)
             audio_queue_condition.notify_all()
@@ -1141,7 +1204,22 @@ async def upload_file(file: UploadFile = File(...)):
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
-    return {"filename": file.filename, "path": file_path}
+    source_type = "text"
+    chapter_count = None
+    try:
+        source_document = load_source_document(file_path)
+        source_type = source_document.get("type", "text")
+        if source_type == "epub":
+            chapter_count = len(source_document.get("chapters", []))
+    except Exception as e:
+        logger.warning("Source inspection failed for '%s': %s", file.filename, e)
+
+    return {
+        "filename": file.filename,
+        "path": file_path,
+        "source_type": source_type,
+        "chapter_count": chapter_count,
+    }
 
 @app.post("/api/generate_script")
 async def generate_script(background_tasks: BackgroundTasks):
@@ -1318,7 +1396,7 @@ async def get_audiobook():
 
 @app.get("/api/chunks")
 async def get_chunks():
-    chunks = project_manager.load_chunks()
+    chunks = project_manager.reconcile_chunk_audio_states()
     return chunks
 
 class ChunkRestoreRequest(BaseModel):

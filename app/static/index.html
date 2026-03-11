@@ -323,8 +323,8 @@
                 </div>
                 <div class="card-body">
                     <div class="mb-4">
-                        <label class="form-label">Select Book/Novel (Text File)</label>
-                        <input type="file" class="form-control" id="file-upload" accept=".txt,.md">
+                        <label class="form-label">Select Book/Novel (Text or EPUB)</label>
+                        <input type="file" class="form-control" id="file-upload" accept=".txt,.md,.epub">
                         <div id="upload-status" class="mt-2"></div>
                     </div>
 
@@ -1283,7 +1283,10 @@
             statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Loading file...</span>';
             try {
                 const res = await API.upload(fileInput.files[0]);
-                statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>Loaded: ${res.filename}</span>`;
+                const chapterSuffix = res.source_type === 'epub' && Number.isInteger(res.chapter_count)
+                    ? ` (${res.chapter_count} chapter${res.chapter_count === 1 ? '' : 's'} detected)`
+                    : '';
+                statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>Loaded: ${res.filename}${chapterSuffix}</span>`;
             } catch (e) {
                 statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>Failed to load file: ${e.message}</span>`;
             }
@@ -1297,7 +1300,7 @@
             const hasLoadedFile = statusEl.innerHTML.includes('text-success');
 
             if (!hasLoadedFile && fileInput.files.length === 0) {
-                statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>Please select a text file first using the file picker above.</span>';
+                statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>Please select a text or EPUB file first using the file picker above.</span>';
                 return;
             }
 
@@ -2157,8 +2160,12 @@
             if (!select || !summary) return;
 
             const options = buildEditorChapterOptions(chunks);
+            const firstRealChapter = options.find(option => option.id !== WHOLE_PROJECT_CHAPTER_ID);
+            if (selectedEditorChapter === WHOLE_PROJECT_CHAPTER_ID && firstRealChapter) {
+                selectedEditorChapter = firstRealChapter.id;
+            }
             if (!options.some(option => option.id === selectedEditorChapter)) {
-                selectedEditorChapter = WHOLE_PROJECT_CHAPTER_ID;
+                selectedEditorChapter = firstRealChapter ? firstRealChapter.id : WHOLE_PROJECT_CHAPTER_ID;
             }
 
             select.innerHTML = options.map(option => `

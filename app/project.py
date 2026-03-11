@@ -429,6 +429,63 @@ class ProjectManager:
 
         return []
 
+    def reconcile_chunk_audio_states(self):
+        """Repair stale error states when a stored clip is actually valid.
+
+        This is intended for editor/UI refreshes after interrupted or large
+        generations, where a chunk may still be marked as error even though its
+        audio file exists and now passes the duration sanity check.
+        """
+        if not os.path.exists(self.chunks_path):
+            return self.load_chunks()
+
+        with self._chunks_lock:
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            dictionary_entries = self.load_dictionary_entries()
+            changed = False
+
+            for chunk in chunks:
+                if chunk.get("status") != "error":
+                    continue
+
+                audio_path = chunk.get("audio_path")
+                if not audio_path:
+                    continue
+
+                full_audio_path = os.path.join(self.root_dir, audio_path)
+                if not os.path.exists(full_audio_path):
+                    continue
+
+                try:
+                    transformed_text, _ = apply_dictionary_to_text(
+                        chunk.get("text", ""),
+                        dictionary_entries,
+                    )
+                    validation = validate_audio_clip(
+                        text=transformed_text,
+                        actual_duration_sec=get_audio_duration_seconds(full_audio_path),
+                        file_size_bytes=os.path.getsize(full_audio_path),
+                    ).to_dict()
+                except Exception as e:
+                    print(f"Warning: failed to revalidate chunk {chunk.get('id')}: {e}")
+                    continue
+
+                if validation["is_valid"]:
+                    chunk["status"] = "done"
+                    chunk["audio_validation"] = validation
+                    chunk["auto_regen_count"] = 0
+                    changed = True
+                elif chunk.get("audio_validation") != validation:
+                    chunk["audio_validation"] = validation
+                    changed = True
+
+            if changed:
+                self._atomic_json_write(chunks, self.chunks_path)
+
+            return chunks
+
     def load_script_document(self):
         if not os.path.exists(self.script_path):
             return {"entries": [], "dictionary": []}

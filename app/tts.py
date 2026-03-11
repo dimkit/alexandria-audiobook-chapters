@@ -3,11 +3,15 @@ import io
 import os
 import re
 import json
+import base64
+from urllib.parse import urlparse
+import urllib.parse
 import threading
 import shutil
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
+import httpx
 
 DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
@@ -54,6 +58,7 @@ class TTSEngine:
         tts_config = config.get("tts", {})
         self._mode = tts_config.get("mode", "external")
         self._url = tts_config.get("url", "http://127.0.0.1:7860")
+        self._api_key = tts_config.get("api_key") or config.get("llm", {}).get("api_key", "")
         self._device = tts_config.get("device", "auto")
         self._compile_codec_enabled = tts_config.get("compile_codec", False)
 
@@ -69,6 +74,11 @@ class TTSEngine:
 
         # Lazy-loaded backends (guarded by _model_lock to prevent concurrent loads)
         self._model_lock = threading.Lock()
+        self._custom_inference_lock = threading.Lock()
+        self._clone_prompt_lock = threading.Lock()
+        self._clone_inference_lock = threading.Lock()
+        self._design_inference_lock = threading.Lock()
+        self._lora_inference_lock = threading.Lock()
         self._local_custom_model = None
         self._local_clone_model = None
         self._local_design_model = None
@@ -76,6 +86,8 @@ class TTSEngine:
         self._warmup_needed = True  # cleared after first batch warmup
         self._lora_adapter_path = None  # track which adapter is currently loaded
         self._gradio_client = None
+        self._external_backend = None
+        self._external_http_base = None
 
         # Clone prompt cache: speaker_name -> (ref_audio_path, reusable voice_clone_prompt)
         self._clone_prompt_cache = {}
@@ -85,6 +97,55 @@ class TTSEngine:
     @property
     def mode(self):
         return self._mode
+
+    @staticmethod
+    def _normalize_external_url(url):
+        normalized = (url or "").strip()
+        if not normalized:
+            return "http://127.0.0.1:7860"
+
+        # urlparse("localhost:42003") treats "localhost" as a scheme, which
+        # breaks bare host:port inputs commonly entered in the UI.
+        if "://" not in normalized:
+            normalized = f"http://{normalized}"
+
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError(f"Unsupported external TTS URL scheme: {parsed.scheme}")
+
+        return normalized.rstrip("/")
+
+    @classmethod
+    def _external_url_candidates(cls, url):
+        base = cls._normalize_external_url(url)
+        candidates = [base]
+        seen = {base}
+
+        def add_candidate(candidate):
+            normalized = candidate.rstrip("/")
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(normalized)
+
+        # Follow root redirect once to support Gradio apps mounted below "/".
+        try:
+            response = httpx.get(
+                f"{base}/",
+                follow_redirects=True,
+                timeout=5.0,
+            )
+            final_url = str(response.url).rstrip("/")
+            add_candidate(final_url)
+        except Exception:
+            pass
+
+        # Common mount points seen in proxied/self-hosted Gradio deployments.
+        parsed = urllib.parse.urlsplit(base)
+        if parsed.path in {"", "/"}:
+            for suffix in ("/gradio", "/gradio/", "/gradio_api", "/gradio_api/"):
+                add_candidate(urllib.parse.urlunsplit(parsed._replace(path=suffix, query="", fragment="")))
+
+        return candidates
 
     @staticmethod
     def _concat_audio(wav):
@@ -512,16 +573,96 @@ class TTSEngine:
             return model
 
     def _init_external(self):
-        """Create Gradio client on demand."""
+        """Initialize external backend on demand."""
+        if self._external_backend == "qwen_mlx_http":
+            return self._external_http_base
         if self._gradio_client is not None:
+            self._external_backend = "gradio"
             return self._gradio_client
 
         from gradio_client import Client
 
-        print(f"Connecting to TTS server at {self._url}...")
-        self._gradio_client = Client(self._url)
-        print("Connected to external TTS server.")
-        return self._gradio_client
+        http_base = self._detect_external_http_api()
+        if http_base is not None:
+            self._external_backend = "qwen_mlx_http"
+            self._external_http_base = http_base
+            print(f"Connected to external TTS HTTP API at {http_base}.")
+            return http_base
+
+        last_error = None
+        for url in self._external_url_candidates(self._url):
+            try:
+                print(f"Connecting to TTS server at {url}...")
+                self._gradio_client = Client(url)
+                self._external_backend = "gradio"
+                print("Connected to external TTS server.")
+                return self._gradio_client
+            except Exception as e:
+                last_error = e
+                self._gradio_client = None
+                print(f"External TTS probe failed for {url}: {e}")
+
+        raise ValueError(
+            f"Could not connect to external TTS server starting from '{self._url}'. "
+            f"Tried: {', '.join(self._external_url_candidates(self._url))}"
+        ) from last_error
+
+    def _detect_external_http_api(self):
+        base = self._normalize_external_url(self._url)
+        try:
+            response = httpx.get(
+                urllib.parse.urljoin(f"{base}/", "openapi.json"),
+                timeout=5.0,
+                follow_redirects=True,
+            )
+            if not response.is_success:
+                return None
+            spec = response.json()
+        except Exception:
+            return None
+
+        paths = spec.get("paths", {})
+        if "/api/v1/custom-voice/generate" in paths and "/api/v1/base/clone" in paths:
+            return base
+        return None
+
+    def _external_headers(self):
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["X-API-Key"] = self._api_key
+        return headers
+
+    def _external_http_post(self, path, payload):
+        base = self._init_external()
+        if self._external_backend != "qwen_mlx_http":
+            raise RuntimeError("External backend is not HTTP API mode")
+
+        response = httpx.post(
+            urllib.parse.urljoin(f"{base}/", path.lstrip("/")),
+            headers=self._external_headers(),
+            json=payload,
+            timeout=120.0,
+            follow_redirects=True,
+        )
+        if not response.is_success:
+            detail = response.text.strip()
+            try:
+                detail_json = response.json()
+                detail = detail_json.get("detail") or detail
+            except Exception:
+                pass
+            raise ValueError(f"External HTTP API request failed ({response.status_code}): {detail}")
+        return response.json()
+
+    @staticmethod
+    def _write_base64_audio(audio_b64, output_path):
+        if not audio_b64:
+            raise ValueError("External HTTP API returned empty audio payload")
+        audio_bytes = base64.b64decode(audio_b64)
+        with open(output_path, "wb") as f:
+            f.write(audio_bytes)
+        if os.path.getsize(output_path) == 0:
+            raise ValueError("External HTTP API returned an empty audio file")
 
     # ── Clone prompt cache (local mode) ──────────────────────────
 
@@ -553,22 +694,28 @@ class TTSEngine:
                 return cached_prompt
             print(f"Voice changed for '{speaker}', rebuilding clone prompt...")
 
-        model = self._init_local_clone()
+        with self._clone_prompt_lock:
+            if speaker in self._clone_prompt_cache:
+                cached_path, cached_prompt = self._clone_prompt_cache[speaker]
+                if cached_path == ref_audio_path:
+                    return cached_prompt
 
-        # Load reference audio as numpy array
-        audio_array, sample_rate = sf.read(ref_audio_path)
-        # Ensure mono
-        if audio_array.ndim > 1:
-            audio_array = audio_array.mean(axis=1)
+            model = self._init_local_clone()
 
-        print(f"Creating clone prompt for '{speaker}'...")
-        prompt = model.create_voice_clone_prompt(
-            ref_audio=(audio_array, sample_rate),
-            ref_text=ref_text,
-        )
-        self._clone_prompt_cache[speaker] = (ref_audio_path, prompt)
-        print(f"Clone prompt cached for '{speaker}'.")
-        return prompt
+            # Load reference audio as numpy array
+            audio_array, sample_rate = sf.read(ref_audio_path)
+            # Ensure mono
+            if audio_array.ndim > 1:
+                audio_array = audio_array.mean(axis=1)
+
+            print(f"Creating clone prompt for '{speaker}'...")
+            prompt = model.create_voice_clone_prompt(
+                ref_audio=(audio_array, sample_rate),
+                ref_text=ref_text,
+            )
+            self._clone_prompt_cache[speaker] = (ref_audio_path, prompt)
+            print(f"Clone prompt cached for '{speaker}'.")
+            return prompt
 
     # ── Core generation methods ──────────────────────────────────
 
@@ -635,13 +782,14 @@ class TTSEngine:
             torch.manual_seed(seed)
 
         t_start = time.time()
-        wavs, sr = model.generate_voice_design(
-            text=sample_text,
-            instruct=description,
-            language=lang,
-            non_streaming_mode=True,
-            max_new_tokens=2048,
-        )
+        with self._design_inference_lock:
+            wavs, sr = model.generate_voice_design(
+                text=sample_text,
+                instruct=description,
+                language=lang,
+                non_streaming_mode=True,
+                max_new_tokens=2048,
+            )
         gen_time = time.time() - t_start
 
         if wavs is None or len(wavs) == 0:
@@ -667,6 +815,9 @@ class TTSEngine:
         The voice_data 'description' field provides the base voice identity,
         and the per-line instruct_text is appended for delivery/emotion direction.
         """
+        if self._mode != "local":
+            return self._external_generate_design(text, instruct_text, voice_data, output_path)
+
         import shutil
 
         base_desc = (voice_data.get("description") or "").strip()
@@ -777,13 +928,14 @@ class TTSEngine:
                 gen_extra["instruct_ids"] = model._tokenize_texts([instruct_formatted])
 
             t_start = time.time()
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                voice_clone_prompt=prompt,
-                non_streaming_mode=True,
-                max_new_tokens=2048,
-                **gen_extra,
-            )
+            with self._lora_inference_lock:
+                wavs, sr = model.generate_voice_clone(
+                    text=text,
+                    voice_clone_prompt=prompt,
+                    non_streaming_mode=True,
+                    max_new_tokens=2048,
+                    **gen_extra,
+                )
             gen_time = time.time() - t_start
 
             if wavs is None or len(wavs) == 0:
@@ -962,14 +1114,15 @@ class TTSEngine:
                 torch.manual_seed(seed)
 
             t_start = time.time()
-            wavs, sr = model.generate_custom_voice(
-                text=text,
-                language=self._language,
-                speaker=voice,
-                instruct=instruct,
-                non_streaming_mode=True,
-                max_new_tokens=2048,
-            )
+            with self._custom_inference_lock:
+                wavs, sr = model.generate_custom_voice(
+                    text=text,
+                    language=self._language,
+                    speaker=voice,
+                    instruct=instruct,
+                    non_streaming_mode=True,
+                    max_new_tokens=2048,
+                )
             gen_time = time.time() - t_start
 
             if wavs is None or len(wavs) == 0:
@@ -1011,12 +1164,13 @@ class TTSEngine:
                 torch.manual_seed(seed)
 
             t_start = time.time()
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                voice_clone_prompt=prompt,
-                non_streaming_mode=True,
-                max_new_tokens=2048,
-            )
+            with self._clone_inference_lock:
+                wavs, sr = model.generate_voice_clone(
+                    text=text,
+                    voice_clone_prompt=prompt,
+                    non_streaming_mode=True,
+                    max_new_tokens=2048,
+                )
             gen_time = time.time() - t_start
 
             if wavs is None or len(wavs) == 0:
@@ -1475,9 +1629,20 @@ class TTSEngine:
 
             print(f"TTS [external] generating with instruct='{instruct}' for text='{text[:50]}...'")
 
-            client = self._init_external()
+            backend = self._init_external()
+            if self._external_backend == "qwen_mlx_http":
+                result = self._external_http_post("/api/v1/custom-voice/generate", {
+                    "text": text,
+                    "language": self._language,
+                    "speaker": voice,
+                    "instruct": instruct,
+                    "speed": 1.0,
+                    "response_format": "base64",
+                })
+                self._write_base64_audio(result.get("audio"), output_path)
+                return True
 
-            result = client.predict(
+            result = backend.predict(
                 text=text,
                 language=self._language,
                 speaker=voice,
@@ -1501,6 +1666,38 @@ class TTSEngine:
 
         except Exception as e:
             print(f"Error generating custom voice for '{speaker}': {e}")
+            return False
+
+    def _external_generate_design(self, text, instruct_text, voice_data, output_path):
+        """Generate voice-design audio via external server."""
+        try:
+            base_desc = (voice_data.get("description") or "").strip()
+            instruct = (instruct_text or "").strip()
+
+            if base_desc and instruct:
+                description = f"{base_desc}, {instruct}"
+            elif base_desc:
+                description = base_desc
+            elif instruct:
+                description = instruct
+            else:
+                description = "A clear, natural speaking voice"
+
+            self._init_external()
+            if self._external_backend == "qwen_mlx_http":
+                result = self._external_http_post("/api/v1/voice-design/generate", {
+                    "text": text,
+                    "language": self._language,
+                    "instruct": description,
+                    "speed": 1.0,
+                    "response_format": "base64",
+                })
+                self._write_base64_audio(result.get("audio"), output_path)
+                return True
+
+            raise ValueError("Voice design is only supported with the MLX HTTP external API")
+        except Exception as e:
+            print(f"Error generating design voice: {e}")
             return False
 
     def _external_generate_clone(self, text, speaker, voice_config, output_path):
@@ -1530,9 +1727,24 @@ class TTSEngine:
                 print(f"Warning: Reference audio not found for '{speaker}': {ref_audio}")
                 return False
 
-            client = self._init_external()
+            backend = self._init_external()
 
-            result = client.predict(
+            if self._external_backend == "qwen_mlx_http":
+                with open(ref_audio, "rb") as f:
+                    ref_audio_b64 = base64.b64encode(f.read()).decode("ascii")
+                result = self._external_http_post("/api/v1/base/clone", {
+                    "text": text,
+                    "language": self._language,
+                    "ref_audio_base64": ref_audio_b64,
+                    "ref_text": ref_text or None,
+                    "x_vector_only_mode": not bool(ref_text),
+                    "speed": 1.0,
+                    "response_format": "base64",
+                })
+                self._write_base64_audio(result.get("audio"), output_path)
+                return True
+
+            result = backend.predict(
                 handle_file(ref_audio),
                 ref_text,
                 text,

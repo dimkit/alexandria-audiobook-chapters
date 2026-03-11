@@ -1,0 +1,76 @@
+import json
+import os
+import tempfile
+import unittest
+
+import numpy as np
+import soundfile as sf
+
+from project import ProjectManager
+
+
+class ReconcileChunkAudioStatesTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root_dir = self.temp_dir.name
+        os.makedirs(os.path.join(self.root_dir, "voicelines"), exist_ok=True)
+        os.makedirs(os.path.join(self.root_dir, "app"), exist_ok=True)
+
+        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
+            json.dump({"entries": [], "dictionary": []}, f)
+
+        self.manager = ProjectManager(self.root_dir)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write_wav(self, relative_path, duration_seconds):
+        full_path = os.path.join(self.root_dir, relative_path)
+        sample_rate = 24000
+        samples = np.zeros(int(sample_rate * duration_seconds), dtype=np.float32)
+        sf.write(full_path, samples, sample_rate)
+        return full_path
+
+    def test_reconciles_error_chunk_with_valid_audio(self):
+        self._write_wav("voicelines/clip.wav", duration_seconds=3.0)
+        chunks = [{
+            "id": 0,
+            "speaker": "Narrator",
+            "text": "One two three four five six.",
+            "instruct": "",
+            "status": "error",
+            "audio_path": "voicelines/clip.wav",
+            "audio_validation": {"is_valid": False, "error": "stale"},
+            "auto_regen_count": 1,
+        }]
+        self.manager.save_chunks(chunks)
+
+        reconciled = self.manager.reconcile_chunk_audio_states()
+
+        self.assertEqual(reconciled[0]["status"], "done")
+        self.assertTrue(reconciled[0]["audio_validation"]["is_valid"])
+        self.assertIsNone(reconciled[0]["audio_validation"]["error"])
+        self.assertEqual(reconciled[0]["auto_regen_count"], 0)
+
+    def test_does_not_promote_pending_chunk_with_old_audio(self):
+        self._write_wav("voicelines/clip.wav", duration_seconds=3.0)
+        chunks = [{
+            "id": 0,
+            "speaker": "Narrator",
+            "text": "One two three four five six.",
+            "instruct": "",
+            "status": "pending",
+            "audio_path": "voicelines/clip.wav",
+            "audio_validation": None,
+            "auto_regen_count": 0,
+        }]
+        self.manager.save_chunks(chunks)
+
+        reconciled = self.manager.reconcile_chunk_audio_states()
+
+        self.assertEqual(reconciled[0]["status"], "pending")
+        self.assertIsNone(reconciled[0]["audio_validation"])
+
+
+if __name__ == "__main__":
+    unittest.main()
