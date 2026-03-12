@@ -4,6 +4,7 @@ import gc
 import json
 import shutil
 import logging
+import asyncio
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -24,6 +25,7 @@ from project import ProjectManager
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT, load_default_prompts
 from review_prompts import load_review_prompts
 from attribution_prompts import load_attribution_prompts
+from voice_prompt import load_voice_prompt
 from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
 from script_store import apply_dictionary_to_text, clean_dictionary_entries, load_script_document, save_script_document
 from source_document import load_source_document
@@ -79,6 +81,60 @@ def _load_project_dictionary_entries():
 
 def _apply_project_dictionary(text):
     return apply_dictionary_to_text(text, _load_project_dictionary_entries())[0]
+
+
+def _extract_first_json_object(text):
+    depth = 0
+    start = None
+    in_string = False
+    escaped = False
+
+    for index, char in enumerate(text or ""):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth == 0:
+                continue
+            depth -= 1
+            if depth == 0 and start is not None:
+                return text[start:index + 1]
+    return None
+
+
+def _extract_voice_field(text):
+    candidate = (text or "").strip()
+    if not candidate:
+        return ""
+
+    direct_match = re.search(r'"voice"\s*:\s*"([^"]+)"', candidate, re.IGNORECASE | re.DOTALL)
+    if direct_match:
+        return direct_match.group(1).strip()
+
+    json_blob = _extract_first_json_object(candidate)
+    if not json_blob:
+        return ""
+
+    try:
+        payload = json.loads(json_blob)
+    except json.JSONDecodeError:
+        return ""
+
+    voice = payload.get("voice")
+    return voice.strip() if isinstance(voice, str) else ""
 
 
 def _any_project_task_running():
@@ -179,6 +235,7 @@ class PromptConfig(BaseModel):
     review_user_prompt: Optional[str] = None
     attribution_system_prompt: Optional[str] = None
     attribution_user_prompt: Optional[str] = None
+    voice_prompt: Optional[str] = None
 
 class AppConfig(BaseModel):
     llm: LLMConfig
@@ -205,6 +262,14 @@ class ChunkUpdate(BaseModel):
     instruct: Optional[str] = None
     speaker: Optional[str] = None
 
+class ChunkDecomposeRequest(BaseModel):
+    chapter: Optional[str] = None
+    max_words: int = 25
+
+class ChunkMergeOrphansRequest(BaseModel):
+    chapter: Optional[str] = None
+    min_words: int = 10
+
 class BatchGenerateRequest(BaseModel):
     indices: List[int]
     label: Optional[str] = None
@@ -225,6 +290,10 @@ class VoiceDesignGenerateRequest(BaseModel):
     description: str
     sample_text: Optional[str] = None
     force: bool = False
+
+
+class VoiceDescriptionSuggestRequest(BaseModel):
+    speaker: str
 
 class VoiceDesignPreviewRequest(BaseModel):
     description: str
@@ -1428,6 +1497,7 @@ async def read_favicon():
 
 @app.get("/api/config")
 async def get_config():
+    config_changed = False
     default_config = {
         "llm": {
             "base_url": "http://localhost:11434/v1",
@@ -1442,7 +1512,8 @@ async def get_config():
         },
         "prompts": {
             "system_prompt": "",
-            "user_prompt": ""
+            "user_prompt": "",
+            "voice_prompt": ""
         }
     }
 
@@ -1460,6 +1531,10 @@ async def get_config():
             attr_sys, attr_usr = load_attribution_prompts()
             default_config["prompts"]["attribution_system_prompt"] = attr_sys
             default_config["prompts"]["attribution_user_prompt"] = attr_usr
+        except RuntimeError:
+            pass
+        try:
+            default_config["prompts"]["voice_prompt"] = load_voice_prompt()
         except RuntimeError:
             pass
         config = default_config
@@ -1483,21 +1558,30 @@ async def get_config():
             prompts["attribution_user_prompt"] = attr_usr
         except RuntimeError:
             pass
+        try:
+            prompts["voice_prompt"] = load_voice_prompt()
+        except RuntimeError:
+            pass
         config["prompts"] = prompts
+        config_changed = True
     else:
         if not config["prompts"].get("system_prompt") or not config["prompts"].get("user_prompt"):
             sys_prompt, usr_prompt = load_default_prompts()
             if not config["prompts"].get("system_prompt"):
                 config["prompts"]["system_prompt"] = sys_prompt
+                config_changed = True
             if not config["prompts"].get("user_prompt"):
                 config["prompts"]["user_prompt"] = usr_prompt
+                config_changed = True
         if not config["prompts"].get("review_system_prompt") or not config["prompts"].get("review_user_prompt"):
             try:
                 rev_sys, rev_usr = load_review_prompts()
                 if not config["prompts"].get("review_system_prompt"):
                     config["prompts"]["review_system_prompt"] = rev_sys
+                    config_changed = True
                 if not config["prompts"].get("review_user_prompt"):
                     config["prompts"]["review_user_prompt"] = rev_usr
+                    config_changed = True
             except RuntimeError:
                 pass  # review_prompts.txt missing or malformed — leave fields empty
         if not config["prompts"].get("attribution_system_prompt") or not config["prompts"].get("attribution_user_prompt"):
@@ -1505,8 +1589,16 @@ async def get_config():
                 attr_sys, attr_usr = load_attribution_prompts()
                 if not config["prompts"].get("attribution_system_prompt"):
                     config["prompts"]["attribution_system_prompt"] = attr_sys
+                    config_changed = True
                 if not config["prompts"].get("attribution_user_prompt"):
                     config["prompts"]["attribution_user_prompt"] = attr_usr
+                    config_changed = True
+            except RuntimeError:
+                pass
+        if not config["prompts"].get("voice_prompt"):
+            try:
+                config["prompts"]["voice_prompt"] = load_voice_prompt()
+                config_changed = True
             except RuntimeError:
                 pass
 
@@ -1521,6 +1613,10 @@ async def get_config():
                 config["current_file"] = os.path.basename(input_path)
         except (json.JSONDecodeError, ValueError):
             pass
+
+    if config_changed:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
 
     return config
 
@@ -1543,12 +1639,38 @@ async def get_default_prompts():
         result["attribution_user_prompt"] = attribution_usr
     except RuntimeError:
         pass
+    try:
+        result["voice_prompt"] = load_voice_prompt()
+    except RuntimeError:
+        pass
     return result
 
 @app.post("/api/config")
 async def save_config(config: AppConfig):
+    payload = config.model_dump()
+
+    existing_config = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                existing_config = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            existing_config = {}
+
+    prompts = payload.get("prompts") or {}
+    existing_prompts = existing_config.get("prompts") or {}
+    if prompts.get("voice_prompt") is None:
+        if existing_prompts.get("voice_prompt") is not None:
+            prompts["voice_prompt"] = existing_prompts.get("voice_prompt")
+        else:
+            try:
+                prompts["voice_prompt"] = load_voice_prompt()
+            except RuntimeError:
+                pass
+    payload["prompts"] = prompts
+
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config.model_dump(), f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
     # Reset engine so it picks up new TTS settings on next use
     project_manager.engine = None
     return {"status": "saved"}
@@ -1832,6 +1954,58 @@ async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
     return {"status": "saved"}
 
 
+@app.post("/api/voices/suggest_description")
+async def suggest_voice_description(request: VoiceDescriptionSuggestRequest):
+    speaker = (request.speaker or "").strip()
+    if not speaker:
+        raise HTTPException(status_code=400, detail="Speaker is required")
+
+    config = await get_config()
+    prompts = config.get("prompts", {})
+    prompt_template = (prompts.get("voice_prompt") or "").strip()
+    if not prompt_template:
+        try:
+            prompt_template = load_voice_prompt()
+        except RuntimeError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        prompt_payload = project_manager.build_voice_suggestion_prompt(speaker, prompt_template)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    llm_config = config.get("llm", {})
+    try:
+        def run_request():
+            client = OpenAI(
+                base_url=llm_config.get("base_url", "http://localhost:11434/v1"),
+                api_key=llm_config.get("api_key", "local"),
+                timeout=float(llm_config.get("timeout", 600)),
+            )
+            return client.chat.completions.create(
+                model=llm_config.get("model_name", "local-model"),
+                messages=[{"role": "user", "content": prompt_payload["prompt"]}],
+            )
+
+        response = await asyncio.to_thread(run_request)
+    except Exception as e:
+        logger.error(f"Voice description suggestion failed for {speaker}: {e}")
+        raise HTTPException(status_code=500, detail=f"Voice suggestion request failed: {e}")
+
+    content = response.choices[0].message.content if response.choices else ""
+    voice = _extract_voice_field(content)
+    if not voice:
+        raise HTTPException(status_code=500, detail="Model response did not include a valid JSON voice field")
+
+    return {
+        "status": "ok",
+        "speaker": speaker,
+        "voice": voice,
+        "matched_paragraphs": len(prompt_payload["paragraphs"]),
+        "context_chars": prompt_payload["context_chars"],
+    }
+
+
 @app.post("/api/voices/design_generate")
 async def generate_voice_design_clone(request: VoiceDesignGenerateRequest):
     speaker = (request.speaker or "").strip()
@@ -1839,26 +2013,28 @@ async def generate_voice_design_clone(request: VoiceDesignGenerateRequest):
         raise HTTPException(status_code=400, detail="Speaker is required")
 
     try:
-        result = project_manager.materialize_design_voice(
+        result = await asyncio.to_thread(
+            project_manager.materialize_design_voice,
             speaker=speaker,
             description=request.description,
             sample_text=request.sample_text,
             force=bool(request.force),
         )
-        return {
-            "status": "ok",
-            "speaker": speaker,
-            "voice_id": result["voice_id"],
-            "name": result["display_name"],
-            "filename": result["filename"],
-            "audio_url": f"/{result['ref_audio']}?t={int(time.time())}",
-            "ref_audio": result["ref_audio"],
-            "ref_text": result["ref_text"],
-            "generated_ref_text": result["generated_ref_text"],
-        }
     except Exception as e:
         logger.error(f"Voice design clone generation failed for {speaker}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "status": "ok",
+        "speaker": speaker,
+        "voice_id": result["voice_id"],
+        "name": result["display_name"],
+        "filename": result["filename"],
+        "audio_url": f"/{result['ref_audio']}?t={int(time.time())}",
+        "ref_audio": result["ref_audio"],
+        "ref_text": result["ref_text"],
+        "generated_ref_text": result["generated_ref_text"],
+    }
 
 @app.get("/api/audiobook")
 async def get_audiobook():
@@ -1884,6 +2060,34 @@ async def restore_chunk(request: ChunkRestoreRequest):
     if chunks is None:
         raise HTTPException(status_code=400, detail="Failed to restore chunk")
     return {"status": "ok", "total": len(chunks)}
+
+@app.post("/api/chunks/decompose_long_segments")
+async def decompose_long_segments(request: ChunkDecomposeRequest):
+    running_task = _any_project_task_running()
+    if running_task:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot decompose segments while {running_task} work is running",
+        )
+
+    chapter = (request.chapter or "").strip() or None
+    max_words = max(int(request.max_words or 25), 1)
+    result = project_manager.decompose_long_segments(chapter=chapter, max_words=max_words)
+    return {"status": "ok", **result}
+
+@app.post("/api/chunks/merge_orphans")
+async def merge_orphans(request: ChunkMergeOrphansRequest):
+    running_task = _any_project_task_running()
+    if running_task:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot merge orphan segments while {running_task} work is running",
+        )
+
+    chapter = (request.chapter or "").strip() or None
+    min_words = max(int(request.min_words or 10), 1)
+    result = project_manager.merge_orphan_segments(chapter=chapter, min_words=min_words)
+    return {"status": "ok", **result}
 
 @app.post("/api/chunks/{index}")
 async def update_chunk(index: int, update: ChunkUpdate):
@@ -2226,7 +2430,8 @@ async def voice_design_preview(request: VoiceDesignPreviewRequest):
         raise HTTPException(status_code=500, detail="Failed to initialize TTS engine")
 
     try:
-        wav_path, sr = engine.generate_voice_design(
+        wav_path, sr = await asyncio.to_thread(
+            engine.generate_voice_design,
             description=request.description,
             sample_text=_apply_project_dictionary(request.sample_text),
             language=request.language,

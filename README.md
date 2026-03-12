@@ -31,6 +31,7 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
 - **Custom Voices** - 9 pre-trained voices with instruct-based emotion/tone control
 - **Voice Cloning** - Clone any voice from a 5-15 second reference audio sample
 - **Voice Designer** - Create new voices from text descriptions (e.g. "A warm, deep male voice with a calm and steady tone")
+- **Voice Prompt Suggestion** - Ask the configured LLM to infer a character's base voice description from source paragraphs mentioning that character
 - **LoRA Voice Training** - Fine-tune the Base model on custom voice datasets to create persistent voice identities with instruct-following
 - **Built-in LoRA Presets** - Pre-trained voice adapters included out of the box, ready to assign to characters
 - **Dataset Builder** - Interactive tool for creating LoRA training datasets with per-sample text, emotion, and audio preview
@@ -185,6 +186,7 @@ Configure your LLM connection and TTS engine. At minimum you need:
 Each character detected in the script gets a voice card. For each speaker:
 - Choose a voice type: Custom Voice (easiest), Clone Voice, LoRA Voice, or Voice Design
 - For Custom Voice, pick from 9 presets (Ryan, Serena, Aiden, etc.) and optionally set a character style (e.g., "Heavy Scottish accent")
+- For Voice Design, use **Suggest** to generate a base voice description from the uploaded story, or **Create Outstanding Voices** to fill missing descriptions and generate reusable design voices in sequence
 - Changes save automatically — see [Voice Types](https://github.com/Finrandojin/alexandria-audiobook/wiki/Voice-Types) for guidance on each type
 
 **Step 4 — Editor**
@@ -227,6 +229,7 @@ Configure connections to your LLM and TTS engine.
 - **LLM Sampling Parameters** - Temperature, Top P, Top K, Min P, and Presence Penalty
 - **Banned Tokens** - Comma-separated list of tokens to ban from LLM output (useful for disabling thinking mode on models like GLM4, DeepSeek-R1, etc.)
 - **Prompt Customization** - System and user prompts used for script generation. Defaults are loaded from `default_prompts.txt` and can be customized per-session in the UI. Click "Reset to Defaults" to reload the file-based defaults (picks up edits without restarting the app)
+- **Voice Suggestion Prompt** - Controls how the LLM converts source excerpts for a named character into a single JSON `voice` description. The default is loaded from `voice_prompt.txt`
 
 ### Script Tab
 Upload a text file and generate the annotated script. The LLM converts your book into a structured JSON format with:

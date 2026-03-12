@@ -8,6 +8,7 @@ from xml.etree import ElementTree as ET
 
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_PARAGRAPH_BREAK_RE = re.compile(r"\n\s*\n+")
 _TOC_TITLE_RE = re.compile(r"^(table\s+of\s+contents|contents|toc)\W*$", re.IGNORECASE)
 
 
@@ -17,6 +18,15 @@ def _normalize_text(text):
 
 def _count_words(text):
     return len(re.findall(r"\b\w+\b", text or "", re.UNICODE))
+
+
+def split_text_into_paragraphs(text):
+    paragraphs = []
+    for part in _PARAGRAPH_BREAK_RE.split(text or ""):
+        normalized = _normalize_text(part)
+        if normalized:
+            paragraphs.append(normalized)
+    return paragraphs
 
 
 def _looks_like_toc_title(value):
@@ -231,3 +241,14 @@ def load_source_document(path):
     if extension == ".epub":
         return _extract_epub_chapters(path)
     return _load_text_document(path)
+
+
+def iter_document_paragraphs(source_document):
+    """Yield source paragraphs in story order."""
+    for chapter in source_document.get("chapters", []):
+        chapter_title = chapter.get("title")
+        for paragraph in split_text_into_paragraphs(chapter.get("text") or ""):
+            yield {
+                "chapter": chapter_title,
+                "text": paragraph,
+            }

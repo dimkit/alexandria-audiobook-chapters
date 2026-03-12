@@ -3,7 +3,7 @@ import tempfile
 import unittest
 import zipfile
 
-from source_document import load_source_document
+from source_document import iter_document_paragraphs, load_source_document, split_text_into_paragraphs
 
 
 def _write_test_epub(path, toc_heading="Table of Contents"):
@@ -81,6 +81,29 @@ class SourceDocumentEpubTests(unittest.TestCase):
 
             self.assertEqual(len(source["chapters"]), 1)
             self.assertEqual(source["chapters"][0]["title"], "Chapter One")
+
+    def test_split_text_into_paragraphs_discards_blank_sections(self):
+        paragraphs = split_text_into_paragraphs("First block.\n\n  \nSecond block.\n\nThird block.")
+        self.assertEqual(paragraphs, ["First block.", "Second block.", "Third block."])
+
+    def test_iter_document_paragraphs_preserves_chapter_order(self):
+        document = {
+            "chapters": [
+                {"title": "One", "text": "Alpha.\n\nBeta."},
+                {"title": "Two", "text": "Gamma."},
+            ]
+        }
+
+        paragraphs = list(iter_document_paragraphs(document))
+
+        self.assertEqual(
+            paragraphs,
+            [
+                {"chapter": "One", "text": "Alpha."},
+                {"chapter": "One", "text": "Beta."},
+                {"chapter": "Two", "text": "Gamma."},
+            ],
+        )
 
 
 if __name__ == "__main__":

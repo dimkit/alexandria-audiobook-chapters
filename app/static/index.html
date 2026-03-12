@@ -321,6 +321,13 @@
                                 <textarea class="form-control font-monospace" id="attribution-user-prompt" rows="6" style="font-size: 0.85em;"></textarea>
                                 <div class="form-text">Use <code>{chapter}</code>, <code>{left_context}</code>, <code>{missing_text}</code>, and <code>{right_context}</code>.</div>
                             </div>
+                            <hr>
+                            <h6 class="mb-3">Voice Design Suggestion Prompt</h6>
+                            <div class="mb-3">
+                                <label class="form-label">Voice Suggestion Prompt</label>
+                                <textarea class="form-control font-monospace" id="voice-prompt" rows="8" style="font-size: 0.85em;"></textarea>
+                                <div class="form-text">Appended after source excerpts when suggesting a base voice description. Use <code>{character_name}</code> to insert the current speaker name.</div>
+                            </div>
                             <button type="button" class="btn btn-outline-secondary btn-sm mb-3" onclick="resetPrompts()">
                                 <i class="fas fa-undo me-1"></i>Reset to Defaults
                             </button>
@@ -406,7 +413,7 @@
                     <h4 class="m-0"><span class="step-indicator step-active">3</span>Voice Configuration</h4>
                     <div class="d-flex align-items-center gap-2">
                         <button id="generate-outstanding-voices-btn" class="btn btn-sm btn-outline-primary" onclick="generateOutstandingVoices()">
-                            Generate Outstanding Voices
+                            Create Outstanding Voices
                         </button>
                         <span id="voice-save-status" class="text-muted small"></span>
                     </div>
@@ -876,6 +883,14 @@
                              </tbody>
                          </table>
                      </div>
+                     <div class="d-flex justify-content-end gap-2 mt-3">
+                         <button class="btn btn-outline-primary btn-sm" id="btn-merge-orphans" onclick="mergeOrphans()">
+                             <i class="fas fa-compress-alt me-1"></i>Merge Orphans
+                         </button>
+                         <button class="btn btn-outline-secondary btn-sm" id="btn-decompose-long-segments" onclick="decomposeLongSegments()">
+                             <i class="fas fa-cut me-1"></i>Decompose Long Segments
+                         </button>
+                     </div>
                 </div>
             </div>
         </div>
@@ -1166,6 +1181,9 @@
                     if (config.prompts.attribution_user_prompt) {
                         document.getElementById('attribution-user-prompt').value = config.prompts.attribution_user_prompt;
                     }
+                    if (config.prompts.voice_prompt) {
+                        document.getElementById('voice-prompt').value = config.prompts.voice_prompt;
+                    }
                 }
 
                 // If review/attribution prompts are still empty, fetch defaults
@@ -1173,7 +1191,8 @@
                     !document.getElementById('review-system-prompt').value ||
                     !document.getElementById('review-user-prompt').value ||
                     !document.getElementById('attribution-system-prompt').value ||
-                    !document.getElementById('attribution-user-prompt').value
+                    !document.getElementById('attribution-user-prompt').value ||
+                    !document.getElementById('voice-prompt').value
                 ) {
                     try {
                         const defaults = await API.get('/api/default_prompts');
@@ -1188,6 +1207,9 @@
                         }
                         if (!document.getElementById('attribution-user-prompt').value && defaults.attribution_user_prompt) {
                             document.getElementById('attribution-user-prompt').value = defaults.attribution_user_prompt;
+                        }
+                        if (!document.getElementById('voice-prompt').value && defaults.voice_prompt) {
+                            document.getElementById('voice-prompt').value = defaults.voice_prompt;
                         }
                     } catch (e) {
                         console.warn("Could not fetch default review/attribution prompts", e);
@@ -1253,6 +1275,9 @@
                 if (defaults.attribution_user_prompt) {
                     document.getElementById('attribution-user-prompt').value = defaults.attribution_user_prompt;
                 }
+                if (defaults.voice_prompt) {
+                    document.getElementById('voice-prompt').value = defaults.voice_prompt;
+                }
             } catch (e) {
                 console.error("Failed to fetch default prompts", e);
                 showToast("Failed to load default prompts from server.", 'error');
@@ -1315,7 +1340,8 @@
                     review_system_prompt: document.getElementById('review-system-prompt').value,
                     review_user_prompt: document.getElementById('review-user-prompt').value,
                     attribution_system_prompt: document.getElementById('attribution-system-prompt').value,
-                    attribution_user_prompt: document.getElementById('attribution-user-prompt').value
+                    attribution_user_prompt: document.getElementById('attribution-user-prompt').value,
+                    voice_prompt: document.getElementById('voice-prompt').value
                 },
                 generation: {
                     chunk_size: chunkSize,
@@ -1506,6 +1532,11 @@
             });
         }
 
+        function getVoiceCardByName(name) {
+            return Array.from(document.querySelectorAll('.voice-card'))
+                .find(card => normalizeVoiceName(card.dataset.voice) === normalizeVoiceName(name));
+        }
+
         function createVoiceCard(voice, index) {
             const config = voice.config || {};
             const voiceType = config.type || 'design';
@@ -1647,6 +1678,9 @@
                                 <div class="design-opts" style="display: ${voiceType === 'design' ? 'block' : 'none'}">
                                     <div class="input-group mb-2">
                                         <input type="text" class="form-control design-description" placeholder="Base voice description (e.g. Young strong soldier)" value="${config.description || ''}">
+                                        <button class="btn btn-sm btn-outline-secondary design-suggest-btn" onclick="suggestVoiceDescription(this)">
+                                            Suggest
+                                        </button>
                                         <button class="btn btn-sm ${designLoaded ? 'btn-warning' : 'btn-outline-primary'} design-generate-btn" onclick="generateVoiceDesignClone(this)">
                                             ${designLoaded ? 'Retry' : 'Generate'}
                                         </button>
@@ -1813,6 +1847,40 @@
             }, 800);
         }
 
+        window._sharedPreviewAudio = null;
+
+        function stopSharedPreviewAudio() {
+            if (!window._sharedPreviewAudio) return;
+            try {
+                window._sharedPreviewAudio.pause();
+                window._sharedPreviewAudio.removeAttribute('src');
+                window._sharedPreviewAudio.load();
+            } catch (e) {
+                console.warn('Could not stop preview audio cleanly', e);
+            }
+        }
+
+        async function playSharedPreviewAudio(url) {
+            if (!url) return;
+            if (!window._sharedPreviewAudio) {
+                window._sharedPreviewAudio = new Audio();
+                window._sharedPreviewAudio.preload = 'auto';
+            }
+
+            stopSharedPreviewAudio();
+
+            const audio = window._sharedPreviewAudio;
+            audio.src = url;
+            audio.currentTime = 0;
+            audio.load();
+            await audio.play();
+        }
+
+        function isPreviewAbortError(error) {
+            if (!error) return false;
+            return error.name === 'AbortError' || error.name === 'NotAllowedError' || String(error.message || '').toLowerCase().includes('aborted');
+        }
+
         // Auto-save on any change inside the voices list
         document.getElementById('voices-list').addEventListener('change', (event) => {
             if (event.target.classList.contains('voice-alias-input')) {
@@ -1854,7 +1922,6 @@
             const speaker = card.closest('.voice-card')?.dataset.voice;
             const description = card.querySelector('.design-description').value.trim();
             const sampleTextInput = card.querySelector('.design-sample-text');
-            const sampleText = sampleTextInput.value.trim();
             const loaded = Boolean((card.querySelector('.design-ref-audio')?.value || '').trim());
 
             if (!description) {
@@ -1865,12 +1932,23 @@
             btn.disabled = true;
             btn.textContent = loaded ? 'Retrying...' : 'Generating...';
             try {
+                let sampleText = sampleTextInput.value.trim();
                 if (!sampleText) {
-                    await loadVoices();
-                } else {
-                    await saveVoicesNow();
+                    sampleText = card.closest('.voice-card')?.dataset.suggestedSample || '';
+                    if (!sampleText) {
+                        const voices = await API.get('/api/voices');
+                        const voiceEntry = voices.find(v => normalizeVoiceName(v.name) === normalizeVoiceName(speaker));
+                        sampleText = (voiceEntry?.suggested_sample_text || '').trim();
+                    }
+                    if (!sampleText) {
+                        showToast(`No sample text available for ${speaker}.`, 'warning');
+                        return;
+                    }
+                    sampleTextInput.value = sampleText;
                 }
-                const refreshedVoiceCard = Array.from(document.querySelectorAll('.voice-card')).find(el => el.dataset.voice === speaker);
+                await saveVoicesNow();
+
+                const refreshedVoiceCard = getVoiceCardByName(speaker);
                 const refreshedCard = refreshedVoiceCard?.querySelector('.card-body');
                 const activeCard = refreshedCard || card;
                 const freshSampleInput = activeCard.querySelector('.design-sample-text');
@@ -1898,42 +1976,106 @@
             }
         };
 
+        window.suggestVoiceDescription = async (btn) => {
+            const card = btn.closest('.card-body');
+            const voiceCard = btn.closest('.voice-card');
+            const speaker = voiceCard?.dataset.voice;
+            const descriptionInput = card.querySelector('.design-description');
+
+            if (!speaker || !descriptionInput) {
+                return '';
+            }
+
+            btn.disabled = true;
+            const originalText = btn.textContent;
+            btn.textContent = 'Thinking...';
+
+            try {
+                const result = await API.post('/api/voices/suggest_description', { speaker });
+                descriptionInput.value = result.voice || '';
+                debouncedSaveVoices();
+                showToast(`Suggested voice prompt for ${speaker}.`, 'success');
+                return descriptionInput.value.trim();
+            } catch (e) {
+                showToast(`Voice prompt suggestion failed: ${e.message}`, 'error');
+                throw e;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+            }
+        };
+
         window.playVoiceDesignClone = (btn) => {
             const card = btn.closest('.card-body');
             const refAudio = card.querySelector('.design-ref-audio')?.value;
             if (!refAudio) return;
-            const audio = new Audio(`/${refAudio}?t=${Date.now()}`);
-            audio.play();
+            playSharedPreviewAudio(`/${refAudio}?t=${Date.now()}`).catch((e) => {
+                if (isPreviewAbortError(e)) return;
+                showToast(`Preview playback failed: ${e.message}`, 'error');
+            });
         };
 
         window.generateOutstandingVoices = async () => {
             const bulkBtn = document.getElementById('generate-outstanding-voices-btn');
-            const voiceCards = Array.from(document.querySelectorAll('.voice-card'));
-            const eligibleButtons = voiceCards
+            const eligibleSpeakers = Array.from(document.querySelectorAll('.voice-card'))
+                .filter(card => !card.classList.contains('alias-active'))
                 .filter(card => card.querySelector('.voice-type:checked')?.value === 'design')
-                .map(card => ({
-                    card,
-                    description: (card.querySelector('.design-description')?.value || '').trim(),
-                    sampleText: (card.querySelector('.design-sample-text')?.value || '').trim(),
-                    refAudio: (card.querySelector('.design-ref-audio')?.value || '').trim(),
-                    button: card.querySelector('.design-generate-btn'),
-                }))
-                .filter(item => item.button && item.description && item.sampleText && !item.refAudio);
+                .map(card => card.dataset.voice)
+                .filter(Boolean);
 
-            if (eligibleButtons.length === 0) {
-                showToast('No outstanding design voices to generate.', 'info');
+            if (eligibleSpeakers.length === 0) {
+                showToast('No voice-design rows are available to create.', 'info');
                 return;
             }
 
             bulkBtn.disabled = true;
             const originalText = bulkBtn.textContent;
             try {
-                for (let i = 0; i < eligibleButtons.length; i += 1) {
-                    const item = eligibleButtons[i];
-                    bulkBtn.textContent = `Generating ${i + 1}/${eligibleButtons.length}...`;
-                    await window.generateVoiceDesignClone(item.button);
+                let generatedCount = 0;
+                for (let i = 0; i < eligibleSpeakers.length; i += 1) {
+                    const speaker = eligibleSpeakers[i];
+                    const voiceCard = getVoiceCardByName(speaker);
+                    if (!voiceCard || voiceCard.classList.contains('alias-active')) {
+                        continue;
+                    }
+
+                    const card = voiceCard.querySelector('.card-body');
+                    const suggestButton = card?.querySelector('.design-suggest-btn');
+                    const generateButton = card?.querySelector('.design-generate-btn');
+                    const descriptionInput = card.querySelector('.design-description');
+                    const sampleInput = card.querySelector('.design-sample-text');
+                    const refAudioInput = card.querySelector('.design-ref-audio');
+                    const hasAudio = Boolean((refAudioInput?.value || '').trim());
+
+                    if (hasAudio) {
+                        continue;
+                    }
+
+                    if (!descriptionInput?.value.trim() && suggestButton) {
+                        bulkBtn.textContent = `Suggesting ${i + 1}/${eligibleSpeakers.length}...`;
+                        await window.suggestVoiceDescription(suggestButton);
+                    }
+
+                    if (sampleInput && !sampleInput.value.trim()) {
+                        sampleInput.value = voiceCard.dataset.suggestedSample || '';
+                        if (sampleInput.value.trim()) {
+                            debouncedSaveVoices();
+                        }
+                    }
+
+                    if (!descriptionInput?.value.trim() || !generateButton) {
+                        continue;
+                    }
+
+                    bulkBtn.textContent = `Generating ${i + 1}/${eligibleSpeakers.length}...`;
+                    await window.generateVoiceDesignClone(generateButton);
+                    generatedCount += 1;
                 }
-                showToast(`Generated ${eligibleButtons.length} outstanding voice${eligibleButtons.length === 1 ? '' : 's'}.`, 'success');
+                if (generatedCount === 0) {
+                    showToast('No outstanding voices needed generation.', 'info');
+                } else {
+                    showToast(`Created ${generatedCount} outstanding voice${generatedCount === 1 ? '' : 's'}.`, 'success');
+                }
             } finally {
                 bulkBtn.disabled = false;
                 bulkBtn.textContent = originalText;
@@ -2645,6 +2787,104 @@
             }
         };
 
+        window.decomposeLongSegments = async () => {
+            const button = document.getElementById('btn-decompose-long-segments');
+            const chapterOnly = isChapterOnlyEnabled();
+            const chapter = chapterOnly && selectedEditorChapter !== WHOLE_PROJECT_CHAPTER_ID
+                ? selectedEditorChapter
+                : null;
+            const scopeLabel = chapter ? `chapter "${chapter}"` : (chapterOnly ? 'the whole project' : 'the entire book');
+
+            try {
+                if (button) {
+                    button.disabled = true;
+                    button.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Decomposing...';
+                }
+
+                const result = await API.post('/api/chunks/decompose_long_segments', {
+                    chapter,
+                    max_words: 25,
+                });
+                await loadChunks(true);
+
+                if (result.changed > 0) {
+                    showToast(`Decomposed ${result.changed} long segment${result.changed === 1 ? '' : 's'} in ${scopeLabel}.`, 'success');
+                } else {
+                    showToast(`No unsynthesized segments over 25 words were found in ${scopeLabel}.`, 'warning');
+                }
+            } catch (e) {
+                showToast('Failed to decompose long segments: ' + e.message, 'error');
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.innerHTML = '<i class="fas fa-cut me-1"></i>Decompose Long Segments';
+                }
+            }
+        };
+
+        window.mergeOrphans = async () => {
+            const button = document.getElementById('btn-merge-orphans');
+            const chapterOnly = isChapterOnlyEnabled();
+            const chapter = chapterOnly && selectedEditorChapter !== WHOLE_PROJECT_CHAPTER_ID
+                ? selectedEditorChapter
+                : null;
+            const scopeLabel = chapter ? `chapter "${chapter}"` : (chapterOnly ? 'the whole project' : 'the entire book');
+
+            try {
+                if (button) {
+                    button.disabled = true;
+                    button.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Merging...';
+                }
+
+                const result = await API.post('/api/chunks/merge_orphans', {
+                    chapter,
+                    min_words: 10,
+                });
+                await loadChunks(true);
+
+                if (result.changed > 0) {
+                    showToast(`Merged ${result.changed} orphan segment pair${result.changed === 1 ? '' : 's'} in ${scopeLabel}.`, 'success');
+                } else {
+                    showToast(`No orphan segments under 10 words could be merged in ${scopeLabel}.`, 'warning');
+                }
+            } catch (e) {
+                showToast('Failed to merge orphan segments: ' + e.message, 'error');
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.innerHTML = '<i class="fas fa-compress-alt me-1"></i>Merge Orphans';
+                }
+            }
+        };
+
+        async function autoPrepareSegmentsBeforeRender() {
+            const chapterOnly = isChapterOnlyEnabled();
+            const chapter = chapterOnly && selectedEditorChapter !== WHOLE_PROJECT_CHAPTER_ID
+                ? selectedEditorChapter
+                : null;
+            const scopeLabel = chapter ? `chapter "${chapter}"` : (chapterOnly ? 'the whole project' : 'the entire book');
+            const mergeResult = await API.post('/api/chunks/merge_orphans', {
+                chapter,
+                min_words: 10,
+            });
+            const decomposeResult = await API.post('/api/chunks/decompose_long_segments', {
+                chapter,
+                max_words: 25,
+            });
+
+            if (mergeResult.changed > 0 || decomposeResult.changed > 0) {
+                await loadChunks(true);
+            }
+
+            if (mergeResult.changed > 0) {
+                showToast(`Merged ${mergeResult.changed} orphan segment pair${mergeResult.changed === 1 ? '' : 's'} before rendering ${scopeLabel}.`, 'success');
+            }
+
+            if (decomposeResult.changed > 0) {
+                showToast(`Decomposed ${decomposeResult.changed} long segment${decomposeResult.changed === 1 ? '' : 's'} before rendering ${scopeLabel}.`, 'success');
+            }
+        }
+
         let _lastDeleted = null;
         let _undoTimer = null;
 
@@ -2918,6 +3158,9 @@
 
         window.renderAll = async (regenerateAll = false) => {
             try {
+                if (!regenerateAll) {
+                    await autoPrepareSegmentsBeforeRender();
+                }
                 const chunks = await API.get('/api/chunks');
                 const targetChunks = getActionTargetChunks(chunks);
                 const toProcess = (regenerateAll ? targetChunks : targetChunks.filter(c => c.status !== 'done'))
@@ -2951,6 +3194,9 @@
 
         window.renderBatchFast = async (regenerateAll = false) => {
             try {
+                if (!regenerateAll) {
+                    await autoPrepareSegmentsBeforeRender();
+                }
                 const chunks = await API.get('/api/chunks');
                 const targetChunks = getActionTargetChunks(chunks);
                 const toProcess = (regenerateAll ? targetChunks : targetChunks.filter(c => c.status !== 'done'))
@@ -3388,8 +3634,10 @@
         };
 
         window.playDesignedVoice = (filename) => {
-            const audio = new Audio(`/designed_voices/${filename}?t=${Date.now()}`);
-            audio.play();
+            playSharedPreviewAudio(`/designed_voices/${filename}?t=${Date.now()}`).catch((e) => {
+                if (isPreviewAbortError(e)) return;
+                showToast(`Preview playback failed: ${e.message}`, 'error');
+            });
         };
 
         window.deleteDesignedVoice = async (voiceId) => {
@@ -3491,8 +3739,10 @@
             const card = btn.closest('.card-body');
             const refAudio = card.querySelector('.ref-audio').value;
             if (refAudio) {
-                const audio = new Audio(`/${refAudio}?t=${Date.now()}`);
-                audio.play();
+                playSharedPreviewAudio(`/${refAudio}?t=${Date.now()}`).catch((e) => {
+                    if (isPreviewAbortError(e)) return;
+                    showToast(`Preview playback failed: ${e.message}`, 'error');
+                });
             }
         };
 
@@ -3748,8 +3998,7 @@
 
             try {
                 const result = await API.post(`/api/lora/preview/${encodeURIComponent(adapterId)}`, {});
-                const audio = new Audio(`${result.audio_url}?t=${Date.now()}`);
-                audio.play();
+                await playSharedPreviewAudio(`${result.audio_url}?t=${Date.now()}`);
                 // Update button now that preview is cached
                 btn.title = 'Play preview';
                 btn.classList.replace('btn-outline-secondary', 'btn-outline-success');

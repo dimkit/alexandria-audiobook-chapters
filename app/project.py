@@ -21,6 +21,7 @@ from script_store import (
     apply_dictionary_to_text,
     load_script_document,
 )
+from source_document import load_source_document, iter_document_paragraphs
 
 MAX_CHUNK_CHARS = 500
 MAX_AUTO_REGENERATE_BAD_CLIP_ATTEMPTS = 1
@@ -152,10 +153,113 @@ class ProjectManager:
                 pass
         return "Project"
 
+    def _load_state(self):
+        state_path = os.path.join(self.root_dir, "state.json")
+        if not os.path.exists(state_path):
+            return {}
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError, OSError):
+            return {}
+
+    def _load_generation_settings(self):
+        config = {}
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            except (json.JSONDecodeError, ValueError):
+                config = {}
+        return config.get("generation", {})
+
+    def load_source_document(self):
+        input_path = (self._load_state().get("input_file_path") or "").strip()
+        if not input_path or not os.path.exists(input_path):
+            raise ValueError("No uploaded source document found")
+        return load_source_document(input_path)
+
     @staticmethod
     def _split_text_sentences(text):
         parts = re.split(r'(?<=[.!?])\s+', (text or "").strip())
         return [part.strip() for part in parts if part.strip()]
+
+    @staticmethod
+    def _count_words(text):
+        return len(re.findall(r"\b\w+\b", text or ""))
+
+    @classmethod
+    def _split_long_chunk_text(cls, text):
+        sentences = cls._split_text_sentences(text)
+        if len(sentences) < 2:
+            return None
+
+        sentence_word_counts = [cls._count_words(sentence) for sentence in sentences]
+        total_words = sum(sentence_word_counts)
+        if total_words <= 1:
+            return None
+
+        best_split_index = None
+        best_diff = None
+        left_words = 0
+
+        for index in range(1, len(sentences)):
+            left_words += sentence_word_counts[index - 1]
+            right_words = total_words - left_words
+            if left_words <= 0 or right_words <= 0:
+                continue
+            diff = abs(left_words - right_words)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_split_index = index
+
+        if best_split_index is None:
+            return None
+
+        left_text = " ".join(sentences[:best_split_index]).strip()
+        right_text = " ".join(sentences[best_split_index:]).strip()
+        if not left_text or not right_text:
+            return None
+        return left_text, right_text
+
+    @classmethod
+    def _speakers_match(cls, left, right):
+        left_name = cls._normalize_speaker_name(left)
+        right_name = cls._normalize_speaker_name(right)
+        return bool(left_name) and left_name == right_name
+
+    @staticmethod
+    def _chunk_in_scope(chunk, chapter=None):
+        if not chapter:
+            return True
+        return (chunk.get("chapter") or "").strip() == chapter
+
+    @staticmethod
+    def _join_chunk_text(*parts):
+        return " ".join(part.strip() for part in parts if (part or "").strip()).strip()
+
+    def _merge_adjacent_chunks(self, first_chunk, second_chunk):
+        merged = copy.deepcopy(first_chunk)
+        merged["text"] = self._join_chunk_text(first_chunk.get("text", ""), second_chunk.get("text", ""))
+        merged["instruct"] = (first_chunk.get("instruct") or "").strip() or (second_chunk.get("instruct") or "").strip()
+        if not (merged.get("chapter") or "").strip():
+            second_chapter = (second_chunk.get("chapter") or "").strip()
+            if second_chapter:
+                merged["chapter"] = second_chapter
+        merged["status"] = "pending"
+        merged["audio_path"] = None
+        merged["audio_validation"] = None
+        merged["auto_regen_count"] = 0
+        merged.pop("generation_token", None)
+        return merged
+
+    @staticmethod
+    def _paragraph_mentions_speaker(paragraph_text, speaker):
+        normalized_paragraph = re.sub(r"\s+", " ", paragraph_text or "").casefold()
+        normalized_speaker = re.sub(r"\s+", " ", speaker or "").strip().casefold()
+        if not normalized_paragraph or not normalized_speaker:
+            return False
+        return normalized_speaker in normalized_paragraph
 
     def suggest_design_sample_text(self, speaker, chunks=None):
         chunks = chunks if chunks is not None else self.load_chunks()
@@ -199,6 +303,53 @@ class ProjectManager:
                 break
 
         return " ".join(selected).strip()
+
+    def collect_voice_suggestion_context(self, speaker, target_chars=None):
+        source_document = self.load_source_document()
+        generation_settings = self._load_generation_settings()
+        chunk_size = int(generation_settings.get("chunk_size") or 3000)
+        target_chars = max(int(target_chars or (chunk_size * 2)), 1)
+
+        selected = []
+        total_chars = 0
+
+        for paragraph in iter_document_paragraphs(source_document):
+            if not self._paragraph_mentions_speaker(paragraph["text"], speaker):
+                continue
+            selected.append(paragraph)
+            total_chars += len(paragraph["text"])
+            if total_chars >= target_chars:
+                break
+
+        return {
+            "speaker": speaker,
+            "target_chars": target_chars,
+            "context_chars": total_chars,
+            "paragraphs": selected,
+        }
+
+    def build_voice_suggestion_prompt(self, speaker, prompt_template):
+        context = self.collect_voice_suggestion_context(speaker)
+        paragraphs = context["paragraphs"]
+
+        if paragraphs:
+            context_blocks = []
+            for item in paragraphs:
+                chapter = (item.get("chapter") or "").strip()
+                text = item["text"]
+                context_blocks.append(f"[{chapter}] {text}" if chapter else text)
+            context_prefix = (
+                f'Source paragraphs mentioning "{speaker}":\n\n' +
+                "\n\n".join(context_blocks)
+            )
+        else:
+            context_prefix = f'No source paragraphs mentioning "{speaker}" were found in the uploaded story.'
+
+        rendered_prompt = (prompt_template or "").replace("{character_name}", speaker)
+        return {
+            **context,
+            "prompt": f"{context_prefix}\n\n{rendered_prompt}".strip(),
+        }
 
     def _upsert_clone_manifest_entry(self, entry):
         manifest_path = os.path.join(self.root_dir, "clone_voices", "manifest.json")
@@ -773,6 +924,170 @@ class ProjectManager:
 
             self._atomic_json_write(chunks, self.chunks_path)
             return chunks
+
+    def decompose_long_segments(self, chapter=None, max_words=25):
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return {
+                    "changed": 0,
+                    "total_chunks": 0,
+                    "processed_scope": 0,
+                    "chapter": chapter,
+                    "max_words": max_words,
+                }
+
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            changed = 0
+
+            while True:
+                changed_this_pass = False
+                index = 0
+
+                while index < len(chunks):
+                    chunk = chunks[index]
+                    chunk_chapter = (chunk.get("chapter") or "").strip()
+                    text = (chunk.get("text") or "").strip()
+
+                    if chapter and chunk_chapter != chapter:
+                        index += 1
+                        continue
+
+                    if chunk.get("audio_path"):
+                        index += 1
+                        continue
+
+                    if self._count_words(text) <= max_words:
+                        index += 1
+                        continue
+
+                    split_text = self._split_long_chunk_text(text)
+                    if not split_text:
+                        index += 1
+                        continue
+
+                    left_text, right_text = split_text
+                    base_chunk = copy.deepcopy(chunk)
+
+                    left_chunk = copy.deepcopy(base_chunk)
+                    left_chunk["text"] = left_text
+                    left_chunk["status"] = "pending"
+                    left_chunk["audio_path"] = None
+                    left_chunk["audio_validation"] = None
+                    left_chunk["auto_regen_count"] = 0
+                    left_chunk.pop("generation_token", None)
+
+                    right_chunk = copy.deepcopy(base_chunk)
+                    right_chunk["text"] = right_text
+                    right_chunk["status"] = "pending"
+                    right_chunk["audio_path"] = None
+                    right_chunk["audio_validation"] = None
+                    right_chunk["auto_regen_count"] = 0
+                    right_chunk.pop("generation_token", None)
+
+                    chunks[index:index + 1] = [left_chunk, right_chunk]
+                    changed += 1
+                    changed_this_pass = True
+                    index += 2
+
+                if not changed_this_pass:
+                    break
+
+            for i, chunk in enumerate(chunks):
+                chunk["id"] = i
+
+            if changed:
+                self._atomic_json_write(chunks, self.chunks_path)
+
+            processed_scope = 0
+            for chunk in chunks:
+                if chapter and (chunk.get("chapter") or "").strip() != chapter:
+                    continue
+                processed_scope += 1
+
+            return {
+                "changed": changed,
+                "total_chunks": len(chunks),
+                "processed_scope": processed_scope,
+                "chapter": chapter,
+                "max_words": max_words,
+            }
+
+    def merge_orphan_segments(self, chapter=None, min_words=10):
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return {
+                    "changed": 0,
+                    "total_chunks": 0,
+                    "processed_scope": 0,
+                    "chapter": chapter,
+                    "min_words": min_words,
+                }
+
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            changed = 0
+            index = 0
+
+            while index < len(chunks):
+                chunk = chunks[index]
+                if not self._chunk_in_scope(chunk, chapter):
+                    index += 1
+                    continue
+
+                while self._count_words((chunks[index].get("text") or "").strip()) < min_words:
+                    current_chunk = chunks[index]
+                    prev_index = index - 1
+                    next_index = index + 1
+
+                    can_merge_prev = (
+                        prev_index >= 0
+                        and self._chunk_in_scope(chunks[prev_index], chapter)
+                        and self._speakers_match(chunks[prev_index].get("speaker"), current_chunk.get("speaker"))
+                    )
+                    can_merge_next = (
+                        next_index < len(chunks)
+                        and self._chunk_in_scope(chunks[next_index], chapter)
+                        and self._speakers_match(chunks[next_index].get("speaker"), current_chunk.get("speaker"))
+                    )
+
+                    if can_merge_prev:
+                        chunks[prev_index] = self._merge_adjacent_chunks(chunks[prev_index], current_chunk)
+                        del chunks[index]
+                        index = prev_index
+                        changed += 1
+                        continue
+
+                    if can_merge_next:
+                        chunks[index] = self._merge_adjacent_chunks(current_chunk, chunks[next_index])
+                        del chunks[next_index]
+                        changed += 1
+                        continue
+
+                    break
+
+                index += 1
+
+            for i, chunk in enumerate(chunks):
+                chunk["id"] = i
+
+            if changed:
+                self._atomic_json_write(chunks, self.chunks_path)
+
+            processed_scope = 0
+            for chunk in chunks:
+                if self._chunk_in_scope(chunk, chapter):
+                    processed_scope += 1
+
+            return {
+                "changed": changed,
+                "total_chunks": len(chunks),
+                "processed_scope": processed_scope,
+                "chapter": chapter,
+                "min_words": min_words,
+            }
 
     def update_chunk(self, index, data):
         chunks = self.load_chunks()

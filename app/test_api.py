@@ -162,6 +162,9 @@ def test_save_config_roundtrip():
     if original.get("prompts", {}).get("attribution_system_prompt"):
         if not readback_prompts.get("attribution_system_prompt"):
             raise TestFailure("Config round-trip failed: attribution_system_prompt dropped")
+    if original.get("prompts", {}).get("voice_prompt"):
+        if not readback_prompts.get("voice_prompt"):
+            raise TestFailure("Config round-trip failed: voice_prompt dropped")
 
     # Restore original
     restore = {
@@ -261,6 +264,7 @@ def test_get_default_prompts():
     assert_key(data, "review_user_prompt")
     assert_key(data, "attribution_system_prompt")
     assert_key(data, "attribution_user_prompt")
+    assert_key(data, "voice_prompt")
     if not data["review_system_prompt"]:
         raise TestFailure("review_system_prompt is empty")
     if not data["review_user_prompt"]:
@@ -269,6 +273,36 @@ def test_get_default_prompts():
         raise TestFailure("attribution_system_prompt is empty")
     if not data["attribution_user_prompt"]:
         raise TestFailure("attribution_user_prompt is empty")
+    if not data["voice_prompt"]:
+        raise TestFailure("voice_prompt is empty")
+
+
+def test_get_config_persists_missing_voice_prompt_default():
+    config_path = "config.json"
+    with open(config_path, "r", encoding="utf-8") as f:
+        original_raw = f.read()
+    original = json.loads(original_raw)
+
+    modified = json.loads(original_raw)
+    prompts = modified.setdefault("prompts", {})
+    prompts.pop("voice_prompt", None)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(modified, f, indent=2, ensure_ascii=False)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        data = r.json()
+        if not data.get("prompts", {}).get("voice_prompt"):
+            raise TestFailure("GET /api/config did not return voice_prompt")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            persisted = json.load(f)
+        if not persisted.get("prompts", {}).get("voice_prompt"):
+            raise TestFailure("GET /api/config did not persist backfilled voice_prompt")
+    finally:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(original_raw)
 
 
 # ── Section 3: Upload ───────────────────────────────────────
@@ -967,6 +1001,7 @@ def run_all_tests():
     run_test("save_review_prompts_roundtrip", test_save_review_prompts_roundtrip)
     run_test("save_attribution_prompts_roundtrip", test_save_attribution_prompts_roundtrip)
     run_test("get_default_prompts", test_get_default_prompts)
+    run_test("get_config_persists_missing_voice_prompt_default", test_get_config_persists_missing_voice_prompt_default)
 
     section("Upload")
     run_test("upload_file", test_upload_file)
