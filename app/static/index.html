@@ -22,6 +22,10 @@
             --app-table-hover: rgba(13, 110, 253, 0.08);
             --app-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
             --app-divider: rgba(15, 23, 42, 0.08);
+            --proofread-pass-bg: rgba(25, 135, 84, 0.14);
+            --proofread-fail-rgb: 150, 20, 20;
+            --proofread-mismatch-bg: rgba(110, 12, 18, 0.92);
+            --proofread-mismatch-text: #fff4f4;
         }
         body[data-theme="dark"] {
             --app-bg: #0f1723;
@@ -38,6 +42,10 @@
             --app-table-hover: rgba(96, 165, 250, 0.12);
             --app-shadow: 0 18px 48px rgba(2, 6, 23, 0.4);
             --app-divider: rgba(148, 163, 184, 0.14);
+            --proofread-pass-bg: rgba(22, 163, 74, 0.22);
+            --proofread-fail-rgb: 190, 38, 38;
+            --proofread-mismatch-bg: rgba(127, 29, 29, 0.94);
+            --proofread-mismatch-text: #fff1f2;
         }
         body {
             background-color: var(--app-bg);
@@ -194,6 +202,19 @@
         }
         .editor-stat-action:hover {
             background-color: var(--app-table-hover);
+        }
+        #proofread-table-body tr[data-proofread-id] > * {
+            background-color: var(--proofread-row-bg, var(--app-card-bg)) !important;
+            color: var(--proofread-row-text, var(--app-text)) !important;
+            transition: background-color 0.15s ease, color 0.15s ease;
+        }
+        #proofread-table-body tr[data-proofread-id]:hover > * {
+            background-color: color-mix(in srgb, var(--proofread-row-bg, var(--app-card-bg)) 88%, var(--app-table-hover)) !important;
+        }
+        #proofread-table-body tr[data-proofread-id] .text-muted,
+        #proofread-table-body tr[data-proofread-id] .form-text,
+        #proofread-table-body tr[data-proofread-id] small.text-muted {
+            color: color-mix(in srgb, var(--proofread-row-text, var(--app-text)) 62%, transparent) !important;
         }
         /* Editor row expand/collapse */
         .chunk-expand-btn {
@@ -1072,6 +1093,9 @@
                          <button class="btn btn-outline-success btn-sm" id="btn-repair-lost-audio" onclick="repairLostAudio()">
                              <i class="fas fa-link me-1"></i>Lost Audio Repair
                          </button>
+                         <button class="btn btn-outline-secondary btn-sm" id="btn-repair-rejected-audio" onclick="repairRejectedAudio()">
+                             <i class="fas fa-recycle me-1"></i>Recover Rejected Audio
+                         </button>
                          <button class="btn btn-outline-danger btn-sm" id="btn-repair-legacy-project" onclick="repairLegacyProject()">
                              <i class="fas fa-wrench me-1"></i>Repair Legacy Project
                          </button>
@@ -1097,13 +1121,16 @@
                     <div class="d-flex flex-wrap gap-2 align-items-center">
                         <div class="input-group input-group-sm" style="width: 220px;">
                             <span class="input-group-text">Certainty</span>
-                            <input type="number" id="proofread-threshold" class="form-control" min="0" max="1" step="0.01" value="1.0" onchange="saveProofreadThreshold()">
+                            <input type="number" id="proofread-threshold" class="form-control" min="0" max="1" step="0.01" value="1.0" oninput="previewProofreadThreshold()" onchange="saveProofreadThreshold()">
                         </div>
                         <button class="btn btn-primary btn-sm" id="btn-proofread-sequence" onclick="startProofreadSequence()">
                             <i class="fas fa-spell-check me-1"></i>Proofread Sequence
                         </button>
                         <button class="btn btn-outline-primary btn-sm" id="btn-proofread-book" onclick="startProofreadEntireBook()">
                             <i class="fas fa-book-open me-1"></i>Proofread Entire Book
+                        </button>
+                        <button class="btn btn-outline-secondary btn-sm" id="btn-proofread-discard-selection" onclick="discardProofreadSelection()">
+                            <i class="fas fa-eraser me-1"></i>Discard Selection
                         </button>
                         <button class="btn btn-outline-danger btn-sm" id="btn-proofread-clear-local" onclick="clearProofreadFailuresLocal()">
                             <i class="fas fa-trash me-1"></i>Clear Local Failures
@@ -3130,22 +3157,25 @@
             const proofread = chunk?.proofread || null;
             if (!proofread || !proofread.checked) return '';
             if (proofread.speaker_match === false || proofread.auto_failed_reason === 'speaker_mismatch') {
-                return 'background-color: rgba(90, 0, 0, 0.82); color: #fff;';
+                return '--proofread-row-bg: var(--proofread-mismatch-bg); --proofread-row-text: var(--proofread-mismatch-text);';
             }
             const score = Number(proofread.score);
             if (!Number.isFinite(score)) return '';
             if (score >= threshold) {
-                return 'background-color: rgba(25, 135, 84, 0.10);';
+                return '--proofread-row-bg: var(--proofread-pass-bg);';
             }
             const ratio = threshold > 0 ? Math.max(0, Math.min(1, 1 - (score / threshold))) : 1;
-            const alpha = 0.08 + (ratio * 0.58);
-            return `background-color: rgba(140, 0, 0, ${alpha.toFixed(3)});`;
+            const alpha = 0.12 + (ratio * 0.62);
+            return `--proofread-row-bg: rgba(var(--proofread-fail-rgb), ${alpha.toFixed(3)});`;
         }
 
         function getProofreadBadge(chunk, threshold) {
             const proofread = chunk?.proofread || null;
             if (!proofread || !proofread.checked) {
                 return '<span class="badge bg-secondary">Not checked</span>';
+            }
+            if (proofread.manual_validated) {
+                return '<span class="badge bg-primary">Validated</span>';
             }
             if (proofread.speaker_match === false) {
                 return '<span class="badge bg-danger">Speaker mismatch</span>';
@@ -3166,6 +3196,18 @@
             return Boolean(proofread && proofread.checked && !proofread.passed);
         }
 
+        function getProofreadGenerateButtonHtml(chunk, chunkRef) {
+            if (!shouldShowProofreadRegenerate(chunk)) return '';
+            const hasAudio = Boolean((chunk?.audio_path || '').trim());
+            const label = hasAudio ? 'Regenerate' : 'Generate';
+            const icon = hasAudio ? 'fa-redo' : 'fa-play';
+            return `<button class="btn btn-sm btn-outline-danger mt-2" onclick='regenerateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas ${icon} me-1"></i>${label}</button>`;
+        }
+
+        function shouldShowProofreadValidate(chunk) {
+            return Boolean((chunk?.audio_path || '').trim());
+        }
+
         function getProofreadFingerprint(chunk, threshold) {
             const proofread = chunk?.proofread || {};
             return [
@@ -3182,6 +3224,8 @@
                 proofread.expected_duration_sec ?? '',
                 proofread.auto_failed_reason || '',
                 proofread.speaker_match ? 1 : 0,
+                proofread.manual_validated ? 1 : 0,
+                proofread.validated_at ?? '',
             ].join('|');
         }
 
@@ -3198,11 +3242,15 @@
             const detail = proofread.error
                 ? `<div class="small ${Number(proofread.score) >= threshold ? 'text-muted' : 'text-danger'} mt-1">${escapeHtml(proofread.error)}</div>`
                 : '';
+            const manualValidationDetail = proofread.manual_validated
+                ? '<div class="small text-primary mt-1">Manually validated by user.</div>'
+                : '';
             const durationDetail = proofread.actual_duration_sec != null
                 ? `<div class="small text-muted mt-1">Duration ${proofread.actual_duration_sec}s vs expected ${proofread.expected_duration_sec || 0}s</div>`
                 : '';
-            const regenButton = shouldShowProofreadRegenerate(chunk)
-                ? `<button class="btn btn-sm btn-outline-danger mt-2" onclick='regenerateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-redo me-1"></i>Generate/Regenerate</button>`
+            const regenButton = getProofreadGenerateButtonHtml(chunk, chunkRef);
+            const validateButton = shouldShowProofreadValidate(chunk)
+                ? `<button class="btn btn-sm btn-outline-primary mt-2 ms-2" onclick='validateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-check me-1"></i>Validate</button>`
                 : '';
 
             row.style.cssText = getProofreadRowStyle(chunk, threshold);
@@ -3215,6 +3263,7 @@
                     ${getProofreadBadge(chunk, threshold)}
                     <div class="small mt-1">Score: ${score}</div>
                     ${detail}
+                    ${manualValidationDetail}
                 `;
             }
             if (transcriptCell) {
@@ -3224,7 +3273,7 @@
                 const audioHtml = chunk.audio_path
                     ? `<audio controls src="/${chunk.audio_path}" style="width: 210px; height: 30px;"></audio>`
                     : '<span class="text-muted small">No audio</span>';
-                audioCell.innerHTML = `${audioHtml}<div>${regenButton}</div>`;
+                audioCell.innerHTML = `${audioHtml}<div>${regenButton}${validateButton}</div>`;
             }
             row.dataset.proofreadFingerprint = getProofreadFingerprint(chunk, threshold);
             return true;
@@ -3251,14 +3300,18 @@
                 const detail = proofread.error
                     ? `<div class="small ${Number(proofread.score) >= threshold ? 'text-muted' : 'text-danger'} mt-1">${escapeHtml(proofread.error)}</div>`
                     : '';
+                const manualValidationDetail = proofread.manual_validated
+                    ? '<div class="small text-primary mt-1">Manually validated by user.</div>'
+                    : '';
                 const durationDetail = proofread.actual_duration_sec != null
                     ? `<div class="small text-muted mt-1">Duration ${proofread.actual_duration_sec}s vs expected ${proofread.expected_duration_sec || 0}s</div>`
                     : '';
                 const audioHtml = chunk.audio_path
                     ? `<audio controls src="/${chunk.audio_path}?t=${Date.now()}" style="width: 210px; height: 30px;"></audio>`
                     : '<span class="text-muted small">No audio</span>';
-                const regenButton = shouldShowProofreadRegenerate(chunk)
-                    ? `<button class="btn btn-sm btn-outline-danger mt-2" onclick='regenerateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-redo me-1"></i>Generate/Regenerate</button>`
+                const regenButton = getProofreadGenerateButtonHtml(chunk, chunkRef);
+                const validateButton = shouldShowProofreadValidate(chunk)
+                    ? `<button class="btn btn-sm btn-outline-primary mt-2 ms-2" onclick='validateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-check me-1"></i>Validate</button>`
                     : '';
                 return `
                     <tr data-proofread-id="${escapeHtml(chunkRef)}" data-proofread-fingerprint="${escapeHtml(getProofreadFingerprint(chunk, threshold))}" style="${getProofreadRowStyle(chunk, threshold)}">
@@ -3271,12 +3324,13 @@
                             ${getProofreadBadge(chunk, threshold)}
                             <div class="small mt-1">Score: ${score}</div>
                             ${detail}
+                            ${manualValidationDetail}
                         </td>
                         <td>
                             <div>${transcript}</div>
                             ${durationDetail}
                         </td>
-                        <td>${audioHtml}<div>${regenButton}</div></td>
+                        <td>${audioHtml}<div>${regenButton}${validateButton}</div></td>
                     </tr>
                 `;
             }).join('');
@@ -3285,8 +3339,16 @@
 
         function renderProofreadTaskStatus(status) {
             const progress = status?.progress || {};
+            const progressCompleted = Number.isFinite(Number(progress.processed))
+                ? Number(progress.processed)
+                : (Number.isFinite(Number(progress.transcribed)) ? Number(progress.transcribed) : 0);
+            const progressTotal = Number.isFinite(Number(progress.pending_total))
+                ? Number(progress.pending_total)
+                : (Number.isFinite(Number(progress.transcribe_total))
+                    ? Number(progress.transcribe_total)
+                    : (Number.isFinite(Number(progress.pending_clips)) ? Number(progress.pending_clips) : 0));
             document.getElementById('proofread-phase').textContent = progress.phase || (status?.running ? 'proofreading' : 'Idle');
-            document.getElementById('proofread-progress').textContent = `${progress.processed || 0} / ${progress.pending_total || progress.pending_clips || 0}`;
+            document.getElementById('proofread-progress').textContent = `${formatNumber(progressCompleted)} / ${formatNumber(progressTotal)}`;
             document.getElementById('proofread-eta').textContent = formatDuration(progress.eta_seconds);
             document.getElementById('proofread-elapsed').textContent = formatDuration(progress.elapsed_seconds || 0);
             document.getElementById('proofread-passed').textContent = formatNumber(progress.passed || 0);
@@ -3307,6 +3369,7 @@
             const running = !!status?.running;
             document.getElementById('btn-proofread-sequence').disabled = running;
             document.getElementById('btn-proofread-book').disabled = running;
+            document.getElementById('btn-proofread-discard-selection').disabled = running;
         }
 
         window.changeProofreadChapter = async (chapterId) => {
@@ -3328,6 +3391,11 @@
             } catch (e) {
                 showToast('Failed to save proofread certainty: ' + e.message, 'error');
             }
+        };
+
+        window.previewProofreadThreshold = () => {
+            getProofreadThreshold();
+            renderProofreadTable(cachedChunks);
         };
 
         async function startProofreadRun(chapter) {
@@ -3359,6 +3427,22 @@
             }
         };
 
+        window.discardProofreadSelection = async () => {
+            try {
+                const result = await API.post('/api/proofread/discard_selection', {
+                    chapter: selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID ? null : selectedProofreadChapter,
+                });
+                await loadChunks(false);
+                showToast(
+                    `Discarded ${result.discarded || 0} proofread result(s). Preserved ${result.preserved_transcripts || 0} transcript cache(s).`,
+                    'success',
+                    4000
+                );
+            } catch (e) {
+                showToast('Failed to discard proofread selection: ' + e.message, 'error');
+            }
+        };
+
         window.regenerateProofreadChunk = async (chunkRef) => {
             try {
                 await API.post(`/api/chunks/${encodeURIComponent(chunkRef)}/regenerate`, {});
@@ -3367,6 +3451,18 @@
                 ensureAudioQueuePolling();
             } catch (e) {
                 showToast('Failed to regenerate clip: ' + e.message, 'error');
+            }
+        };
+
+        window.validateProofreadChunk = async (chunkRef) => {
+            try {
+                await API.post(`/api/proofread/${encodeURIComponent(chunkRef)}/validate`, {
+                    threshold: getProofreadThreshold(),
+                });
+                showToast('Clip marked as manually validated.', 'success', 3000);
+                await loadChunks(false);
+            } catch (e) {
+                showToast('Failed to validate clip: ' + e.message, 'error');
             }
         };
 
@@ -3410,24 +3506,23 @@
 
             const allChunks = Array.isArray(chunks) ? chunks : [];
             const nonEmptyChunks = allChunks.filter(chunk => (chunk.text || '').trim());
+            const completed = nonEmptyChunks.filter(chunk => chunk.status === 'done').length;
+            const total = nonEmptyChunks.length;
+            const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
             const currentJob = audioState?.current_job || null;
             const hasActiveAudioWork = Boolean(audioState?.running) && currentJob && (currentJob.total_chunks || 0) > 0;
 
             if (hasActiveAudioWork) {
-                const processed = Number(currentJob.processed_clips) || 0;
-                const total = Number(currentJob.total_chunks) || 0;
-                const percentage = total > 0 ? Math.max(0, Math.min(100, Math.round((processed / total) * 100))) : 0;
                 progressBar.style.width = `${percentage}%`;
                 progressBar.classList.add('progress-bar-animated', 'progress-bar-striped', 'bg-warning');
                 progressBar.classList.remove('bg-success');
-                progressBar.innerText = `${percentage}% (${processed}/${total})`;
-                progressBar.title = currentJob.label || 'Rendering audio';
+                progressBar.innerText = `${percentage}% (${completed}/${total})`;
+                const processed = Number(currentJob.processed_clips) || 0;
+                const jobTotal = Number(currentJob.total_chunks) || 0;
+                progressBar.title = `${currentJob.label || 'Rendering audio'} • current job ${processed}/${jobTotal}`;
                 return;
             }
 
-            const completed = nonEmptyChunks.filter(chunk => chunk.status === 'done').length;
-            const total = nonEmptyChunks.length;
-            const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
             progressBar.style.width = `${percentage}%`;
             progressBar.classList.remove('progress-bar-animated', 'bg-warning');
             progressBar.classList.add('progress-bar-striped', 'bg-success');
@@ -3624,15 +3719,7 @@
                 }
                 const visibleChunks = getVisibleChunks(chunks);
 
-                // Update Full Progress Bar
-                const completed = chunks.filter(c => c.status === 'done').length;
-                const total = chunks.length;
-                const percentage = total > 0 ? Math.round((completed / total) * 100) : 0;
-                const progressBar = document.getElementById('full-progress-bar');
-                if (progressBar) {
-                    progressBar.style.width = `${percentage}%`;
-                    progressBar.innerText = `${percentage}% (${completed}/${total})`;
-                }
+                renderEditorProgressBar(chunks, latestAudioState);
 
                 // Skip redraw if playing audio (unless forced)
                 if (!forceFullRedraw && (isPlayingSequence || isAudioPlaying())) {
@@ -3898,6 +3985,33 @@
                 if (button) {
                     button.disabled = false;
                     button.innerHTML = '<i class="fas fa-link me-1"></i>Lost Audio Repair';
+                }
+            }
+        };
+
+        window.repairRejectedAudio = async () => {
+            const button = document.getElementById('btn-repair-rejected-audio');
+            const confirmed = await showConfirm(
+                'Recover audio only from the rejected folder using the current Proofread certainty threshold? This will not reset the active timeline.'
+            );
+            if (!confirmed) return;
+
+            try {
+                if (button) {
+                    button.disabled = true;
+                    button.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Recovering...';
+                }
+
+                await API.post('/api/chunks/repair_lost_audio', { use_asr: true, rejected_only: true });
+                await pollLogs('repair', 'script-logs');
+                await loadChunks(true);
+                showToast('Rejected audio recovery finished.', 'success', 6000);
+            } catch (e) {
+                showToast('Failed to recover rejected audio: ' + e.message, 'error');
+            } finally {
+                if (button) {
+                    button.disabled = false;
+                    button.innerHTML = '<i class="fas fa-recycle me-1"></i>Recover Rejected Audio';
                 }
             }
         };
@@ -4492,6 +4606,10 @@
                 if (status.running) {
                     loadChunks(false).catch(err => console.error('Failed to refresh proofread rows', err));
                 }
+            } else if (taskName === 'repair') {
+                if (status.running) {
+                    loadChunks(false).catch(err => console.error('Failed to refresh chunks during repair', err));
+                }
             }
             if ('value' in el && el.tagName === 'TEXTAREA') {
                 el.value = logs.join('\n');
@@ -4532,6 +4650,8 @@
                 }
             } else if (taskName === 'proofread') {
                 loadChunks(false).catch(err => console.error('Failed to refresh chunks after proofreading', err));
+            } else if (taskName === 'repair') {
+                loadChunks(false).catch(err => console.error('Failed to refresh chunks after repair', err));
             }
         }
 

@@ -297,6 +297,7 @@ class ChunkRepairLegacyRequest(BaseModel):
 
 class LostAudioRepairRequest(BaseModel):
     use_asr: bool = True
+    rejected_only: bool = False
 
 class ProofreadRequest(BaseModel):
     chapter: Optional[str] = None
@@ -305,6 +306,12 @@ class ProofreadRequest(BaseModel):
 class ProofreadClearFailuresRequest(BaseModel):
     chapter: Optional[str] = None
     threshold: float = 1.0
+
+class ProofreadValidateRequest(BaseModel):
+    threshold: float = 1.0
+
+class ProofreadDiscardSelectionRequest(BaseModel):
+    chapter: Optional[str] = None
 
 class ASRTranscribeRequest(BaseModel):
     audio_path: str
@@ -2082,13 +2089,14 @@ def run_lost_audio_repair_task(run_id: str, use_asr: bool):
         log(f"Starting lost audio repair (ASR {'enabled' if use_asr else 'disabled'})...")
         result = project_manager.repair_lost_audio_links(use_asr=use_asr, progress_callback=on_progress)
         log(
-            f"Preserved {result.get('preserved', 0)} existing clip(s). "
-            f"Relinked {result.get('relinked', 0)} directly and {result.get('asr_relinked', 0)} via ASR."
+            f"Relinked {result.get('relinked', 0)} clip(s) from exact transcript matches. "
+            f"Processed {result.get('total_candidates', 0)} candidate file(s) and "
+            f"recovered {result.get('discarded_retry_relinked', 0)} rejected clip(s)."
         )
         log(
-            f"{result.get('invalid_candidates', 0)} candidate(s) still failed validation, "
-            f"{result.get('unmatched_files', 0)} still mismatched speaker, "
-            f"{result.get('total_candidates', 0)} total candidate file(s) scanned."
+            f"Discarded {result.get('unmatched_files', 0)} unmatched clip(s), "
+            f"{result.get('invalid_candidates', 0)} ambiguous clip(s), and "
+            f"{result.get('duplicate_matches', 0)} duplicate-target clip(s)."
         )
         for error in result.get("asr_errors", []) or []:
             log(f"ASR note: {error}")
@@ -2587,6 +2595,7 @@ async def reset_project():
         VOICES_PATH,
         VOICE_CONFIG_PATH,
         CHUNKS_PATH,
+        project_manager.transcription_cache_path,
         AUDIOBOOK_PATH,
         M4B_PATH,
         AUDIO_QUEUE_STATE_PATH,
@@ -2629,6 +2638,9 @@ async def reset_project():
         process_state["audio"]["merge_running"] = False
         process_state["audio"]["metrics"] = _new_audio_metrics()
         process_state["audio"]["heartbeat"] = _new_audio_heartbeat_state()
+
+    with project_manager._transcription_cache_lock:
+        project_manager._transcription_cache = None
 
     for task_name in ("script", "voices", "proofread", "review", "sanity", "repair", "audacity_export", "m4b_export"):
         process_state[task_name]["logs"] = []
@@ -3173,7 +3185,14 @@ async def repair_lost_audio(request: LostAudioRepairRequest, background_tasks: B
     run_id = _start_task_run("repair")
     background_tasks.add_task(
         run_process,
-        [sys.executable, "-u", "lost_audio_repair_runner.py", ROOT_DIR, "1" if bool(request.use_asr) else "0"],
+        [
+            sys.executable,
+            "-u",
+            "lost_audio_repair_runner.py",
+            ROOT_DIR,
+            "1" if bool(request.use_asr) else "0",
+            "1" if bool(request.rejected_only) else "0",
+        ],
         "repair",
         run_id,
     )
@@ -3214,6 +3233,31 @@ async def clear_proofread_failures(request: ProofreadClearFailuresRequest):
         threshold=threshold,
     )
     return {"status": "ok", **result}
+
+@app.post("/api/proofread/discard_selection")
+async def discard_proofread_selection(request: ProofreadDiscardSelectionRequest):
+    running_task = _any_project_task_running()
+    if running_task:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot discard proofread selection while {running_task} work is running",
+        )
+
+    result = project_manager.discard_proofread_selection(
+        chapter=(request.chapter or "").strip() or None,
+    )
+    return {"status": "ok", **result}
+
+@app.post("/api/proofread/{index}/validate")
+async def validate_proofread_clip(index: str, request: ProofreadValidateRequest):
+    threshold = max(0.0, min(float(request.threshold or 0.0), 1.0))
+    try:
+        chunk = project_manager.manually_validate_proofread_clip(index, threshold=threshold)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if chunk is None:
+        raise HTTPException(status_code=404, detail="Invalid chunk id")
+    return {"status": "ok", "chunk": chunk}
 
 @app.post("/api/render_prep_state")
 async def set_render_prep_state(request: RenderPrepStateRequest):

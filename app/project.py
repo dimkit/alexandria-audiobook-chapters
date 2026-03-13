@@ -31,6 +31,8 @@ from script_store import (
 from source_document import load_source_document, iter_document_paragraphs
 
 MAX_CHUNK_CHARS = 500
+PROOFREAD_DURATION_OUTLIER_SECONDS = 10.0
+PROOFREAD_BATCH_COMMIT_SIZE = 25
 CHAPTER_HEADING_RE = re.compile(
     r'^(chapter|part|book|volume|prologue|epilogue|introduction|conclusion|act|section)\b',
     re.IGNORECASE,
@@ -127,6 +129,7 @@ class ProjectManager:
         self.voicelines_dir = os.path.join(root_dir, "voicelines")
         self.voice_config_path = os.path.join(root_dir, "voice_config.json")
         self.config_path = os.path.join(root_dir, "app", "config.json")
+        self.transcription_cache_path = os.path.join(root_dir, "transcription_cache.json")
 
         # Ensure voicelines dir exists
         os.makedirs(self.voicelines_dir, exist_ok=True)
@@ -134,6 +137,8 @@ class ProjectManager:
         self.engine = None
         self.asr_engine = None
         self._chunks_lock = threading.Lock()  # Thread-safe file writes
+        self._transcription_cache_lock = threading.Lock()
+        self._transcription_cache = None
 
     def _load_voice_config(self):
         if os.path.exists(self.voice_config_path):
@@ -156,6 +161,106 @@ class ProjectManager:
             except (json.JSONDecodeError, ValueError):
                 return {}
         return {}
+
+    def _load_transcription_cache_locked(self):
+        if self._transcription_cache is not None:
+            return self._transcription_cache
+
+        cache = {}
+        if os.path.exists(self.transcription_cache_path):
+            try:
+                with open(self.transcription_cache_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                entries = payload.get("entries", []) if isinstance(payload, dict) else payload
+                for entry in entries or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    key = str(entry.get("key") or "").strip()
+                    if not key:
+                        continue
+                    cache[key] = dict(entry)
+            except (json.JSONDecodeError, ValueError, OSError):
+                cache = {}
+
+        self._transcription_cache = cache
+        return self._transcription_cache
+
+    def _save_transcription_cache_locked(self):
+        entries = list((self._transcription_cache or {}).values())
+        self._atomic_json_write({"entries": entries}, self.transcription_cache_path)
+
+    @staticmethod
+    def _transcription_cache_key(filename, size_bytes):
+        return f"{filename}|{int(size_bytes)}"
+
+    def _lookup_cached_transcription(self, relative_audio_path):
+        full_path = os.path.join(self.root_dir, relative_audio_path)
+        if not os.path.exists(full_path):
+            return None
+
+        filename = os.path.basename(relative_audio_path)
+        size_bytes = os.path.getsize(full_path)
+        key = self._transcription_cache_key(filename, size_bytes)
+        with self._transcription_cache_lock:
+            cache = self._load_transcription_cache_locked()
+            entry = cache.get(key)
+            if not entry:
+                return None
+            return {
+                "text": entry.get("text", ""),
+                "normalized_text": entry.get("normalized_text", ""),
+                "cached": True,
+                "filename": filename,
+                "size_bytes": size_bytes,
+            }
+
+    def _store_cached_transcription(self, relative_audio_path, result):
+        full_path = os.path.join(self.root_dir, relative_audio_path)
+        if not os.path.exists(full_path):
+            return
+
+        filename = os.path.basename(relative_audio_path)
+        size_bytes = os.path.getsize(full_path)
+        entry = {
+            "key": self._transcription_cache_key(filename, size_bytes),
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "text": result.get("text", ""),
+            "normalized_text": result.get("normalized_text") or self._normalize_asr_text(result.get("text", "")),
+            "updated_at": time.time(),
+        }
+        with self._transcription_cache_lock:
+            cache = self._load_transcription_cache_locked()
+            cache[entry["key"]] = entry
+            self._save_transcription_cache_locked()
+
+    def _copy_cached_transcription_key(self, source_relative_audio_path, target_relative_audio_path):
+        source_full_path = os.path.join(self.root_dir, source_relative_audio_path)
+        target_full_path = os.path.join(self.root_dir, target_relative_audio_path)
+        if not os.path.exists(target_full_path):
+            return
+
+        source_filename = os.path.basename(source_relative_audio_path)
+        target_size_bytes = os.path.getsize(target_full_path)
+        source_size_bytes = os.path.getsize(source_full_path) if os.path.exists(source_full_path) else target_size_bytes
+        source_key = self._transcription_cache_key(source_filename, source_size_bytes)
+
+        target_filename = os.path.basename(target_relative_audio_path)
+        target_key = self._transcription_cache_key(target_filename, target_size_bytes)
+
+        with self._transcription_cache_lock:
+            cache = self._load_transcription_cache_locked()
+            entry = cache.get(source_key)
+            if not entry:
+                return
+            cache[target_key] = {
+                **dict(entry),
+                "key": target_key,
+                "filename": target_filename,
+                "size_bytes": target_size_bytes,
+                "updated_at": time.time(),
+            }
+            self._save_transcription_cache_locked()
 
     def _current_script_title(self):
         state_path = os.path.join(self.root_dir, "state.json")
@@ -899,7 +1004,7 @@ class ProjectManager:
                 "auto_failed_reason": "speaker_mismatch",
             }
 
-        if duration_delta_sec > 5.0:
+        if duration_delta_sec > PROOFREAD_DURATION_OUTLIER_SECONDS:
             return base | {
                 "score": 0.0,
                 "passed": False,
@@ -924,6 +1029,119 @@ class ProjectManager:
         chunks[index]["proofread"] = proofread_result
         self._atomic_json_write(chunks, self.chunks_path)
         return chunks[index]["proofread"]
+
+    def _commit_proofread_results_batch_locked(self, chunks, pending_results):
+        if not pending_results:
+            return 0
+        for index, proofread_result in pending_results.items():
+            chunks[index]["proofread"] = proofread_result
+        self._atomic_json_write(chunks, self.chunks_path)
+        return len(pending_results)
+
+    @staticmethod
+    def _discarded_proofread_state(existing_proofread, current_audio_path):
+        proofread = dict(existing_proofread or {})
+        transcript_text = (proofread.get("transcript_text") or "").strip()
+        cached_audio_path = (proofread.get("audio_path") or "").strip()
+        current_audio_path = (current_audio_path or "").strip()
+        if transcript_text and cached_audio_path and cached_audio_path == current_audio_path:
+            kept = {
+                "checked": False,
+                "audio_path": current_audio_path,
+                "transcript_text": transcript_text,
+            }
+            normalized_transcript = (proofread.get("normalized_transcript") or "").strip()
+            if normalized_transcript:
+                kept["normalized_transcript"] = normalized_transcript
+            return kept
+        return None
+
+    def manually_validate_proofread_clip(self, chunk_ref, threshold=1.0):
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return None
+
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            index = self.resolve_chunk_index(chunk_ref, chunks)
+            if index is None or not (0 <= index < len(chunks)):
+                return None
+
+            chunk = chunks[index]
+            audio_path = (chunk.get("audio_path") or "").strip()
+            if not audio_path:
+                raise ValueError("Cannot validate a clip with no audio.")
+
+            full_audio_path = os.path.join(self.root_dir, audio_path)
+            if not os.path.exists(full_audio_path):
+                raise ValueError("Cannot validate a clip whose audio file is missing.")
+
+            existing = dict(chunk.get("proofread") or {})
+            validated = {
+                **existing,
+                "checked": True,
+                "checked_at": time.time(),
+                "threshold": float(threshold),
+                "audio_path": audio_path,
+                "score": 1.0,
+                "passed": True,
+                "error": None,
+                "manual_validated": True,
+                "validated_at": time.time(),
+            }
+            if "speaker_match" not in validated:
+                validated["speaker_match"] = True
+            if "transcript_text" not in validated:
+                validated["transcript_text"] = ""
+
+            chunk["proofread"] = validated
+            self._atomic_json_write(chunks, self.chunks_path)
+            return chunk
+
+    def discard_proofread_selection(self, chapter=None):
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return {
+                    "discarded": 0,
+                    "preserved_transcripts": 0,
+                    "cleared_transcripts": 0,
+                    "chapter": chapter,
+                }
+
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            discarded = 0
+            preserved_transcripts = 0
+            cleared_transcripts = 0
+
+            for chunk in chunks:
+                if not self._chunk_in_scope(chunk, chapter):
+                    continue
+
+                existing_proofread = chunk.get("proofread")
+                if not existing_proofread:
+                    continue
+
+                replacement = self._discarded_proofread_state(existing_proofread, chunk.get("audio_path"))
+                if replacement:
+                    chunk["proofread"] = replacement
+                    preserved_transcripts += 1
+                else:
+                    chunk.pop("proofread", None)
+                    cleared_transcripts += 1
+                discarded += 1
+
+            if discarded:
+                self._atomic_json_write(chunks, self.chunks_path)
+
+            return {
+                "discarded": discarded,
+                "preserved_transcripts": preserved_transcripts,
+                "cleared_transcripts": cleared_transcripts,
+                "chapter": chapter,
+            }
 
     @staticmethod
     def _normalize_asr_text(text):
@@ -954,9 +1172,15 @@ class ProjectManager:
         return (token_score * 0.5) + (seq_score * 0.35) + (length_ratio * 0.15)
 
     def transcribe_audio_path(self, relative_audio_path):
+        cached = self._lookup_cached_transcription(relative_audio_path)
+        if cached is not None:
+            return cached
+
         full_path = os.path.join(self.root_dir, relative_audio_path)
         result = self.get_asr_engine().transcribe_file(full_path)
         result["normalized_text"] = self._normalize_asr_text(result.get("text"))
+        result["cached"] = False
+        self._store_cached_transcription(relative_audio_path, result)
         return result
 
     def transcribe_audio_paths_bulk(self, relative_audio_paths, progress_callback=None):
@@ -1125,6 +1349,175 @@ class ProjectManager:
             "legacy_index": (int(identifier) - 1) if identifier.isdigit() else None,
         }
 
+    def _discarded_voicelines_dir(self):
+        return os.path.join(self.voicelines_dir, "discarded")
+
+    def _collect_repair_candidates_from_dir_locked(self, directory_path, relative_prefix):
+        candidates = []
+        scanned_files = 0
+        if not os.path.isdir(directory_path):
+            return candidates, scanned_files
+
+        for entry in os.listdir(directory_path):
+            full_path = os.path.join(directory_path, entry)
+            if not os.path.isfile(full_path):
+                continue
+            scanned_files += 1
+            candidates.append({
+                "relative_path": f"{relative_prefix}/{entry}",
+                "parsed": self._parse_chunk_audio_candidate_name(entry),
+                "mtime": os.path.getmtime(full_path),
+            })
+
+        candidates.sort(
+            key=lambda item: (
+                -int(item["mtime"]),
+                -int((item["parsed"] or {}).get("retry") or 0),
+                item["relative_path"],
+            )
+        )
+        return candidates, scanned_files
+
+    def _move_candidate_to_discarded_locked(self, source_relative_path):
+        normalized_source = str(source_relative_path or "").replace("\\", "/").strip("/")
+        source_full_path = os.path.join(self.root_dir, normalized_source)
+        if not os.path.exists(source_full_path):
+            return None
+
+        discarded_dir = self._discarded_voicelines_dir()
+        os.makedirs(discarded_dir, exist_ok=True)
+
+        filename = os.path.basename(normalized_source)
+        stem, ext = os.path.splitext(filename)
+        candidate_filename = filename
+        candidate_full_path = os.path.join(discarded_dir, candidate_filename)
+        counter = 1
+        while os.path.exists(candidate_full_path):
+            candidate_filename = f"{stem}_{counter}{ext}"
+            candidate_full_path = os.path.join(discarded_dir, candidate_filename)
+            counter += 1
+
+        os.replace(source_full_path, candidate_full_path)
+        return f"voicelines/discarded/{candidate_filename}"
+
+    def _build_lost_audio_repair_text_index(self, chunks, dictionary_entries, voice_config):
+        index = defaultdict(lambda: defaultdict(list))
+        for chunk_index, chunk in enumerate(chunks):
+            transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
+            normalized_text = self._normalize_asr_text(transformed_text)
+            if not normalized_text:
+                continue
+            for speaker_slug in self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config):
+                index[speaker_slug][normalized_text].append(chunk_index)
+        return index
+
+    def _build_speaker_word_frequency_cache(self, chunks, dictionary_entries, voice_config):
+        frequency_cache = defaultdict(Counter)
+        for chunk in chunks:
+            transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
+            normalized_text = self._normalize_asr_text(transformed_text)
+            if not normalized_text:
+                continue
+            words = normalized_text.split()
+            if not words:
+                continue
+            for speaker_slug in self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config):
+                frequency_cache[speaker_slug].update(words)
+        return frequency_cache
+
+    @staticmethod
+    def _drop_low_frequency_transcript_words(text, frequency_counter, drop_count=2):
+        normalized_text = ProjectManager._normalize_asr_text(text)
+        words = normalized_text.split()
+        if not words:
+            return normalized_text, tuple()
+
+        ranked = sorted(
+            enumerate(words),
+            key=lambda item: (
+                int(frequency_counter.get(item[1], 0)),
+                item[0],
+            ),
+        )
+        drop_indices = {index for index, _ in ranked[:max(int(drop_count or 0), 0)]}
+        dropped_words = tuple(words[index] for index in sorted(drop_indices))
+        trimmed_words = [word for index, word in enumerate(words) if index not in drop_indices]
+        return " ".join(trimmed_words).strip(), dropped_words
+
+    @staticmethod
+    def _remove_selected_words(text, words_to_remove):
+        normalized_text = ProjectManager._normalize_asr_text(text)
+        if not normalized_text or not words_to_remove:
+            return normalized_text
+
+        remaining = list(normalized_text.split())
+        for word in words_to_remove:
+            try:
+                remaining.remove(word)
+            except ValueError:
+                continue
+        return " ".join(remaining).strip()
+
+    def _best_discarded_repair_match(
+        self,
+        speaker_slug,
+        transcript_text,
+        chunks,
+        dictionary_entries,
+        voice_config,
+        claimed_indices,
+        threshold,
+        speaker_word_frequency_cache=None,
+    ):
+        if not speaker_slug or not transcript_text:
+            return None
+
+        speaker_word_frequency_cache = speaker_word_frequency_cache or {}
+        speaker_frequency = speaker_word_frequency_cache.get(speaker_slug) or Counter()
+        reduced_transcript_text, dropped_words = self._drop_low_frequency_transcript_words(
+            transcript_text,
+            speaker_frequency,
+            drop_count=2,
+        )
+        scored = []
+        for index, chunk in enumerate(chunks):
+            if index in claimed_indices:
+                continue
+            allowed_speaker_slugs = self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config)
+            if speaker_slug not in allowed_speaker_slugs:
+                continue
+            transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
+            metrics = self._proofread_similarity_metrics(transformed_text, transcript_text)
+            reduced_metrics = None
+            if dropped_words and reduced_transcript_text:
+                reduced_expected_text = self._remove_selected_words(transformed_text, dropped_words)
+                if reduced_expected_text:
+                    reduced_metrics = self._proofread_similarity_metrics(reduced_expected_text, reduced_transcript_text)
+                    if float(reduced_metrics.get("score", 0.0) or 0.0) > float(metrics.get("score", 0.0) or 0.0):
+                        metrics = dict(reduced_metrics)
+                        metrics["reduced_transcript_match"] = True
+                        metrics["dropped_low_frequency_words"] = list(dropped_words)
+            score = float(metrics.get("score", 0.0) or 0.0)
+            if score <= 0:
+                continue
+            scored.append((score, index, metrics))
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_score, best_index, best_metrics = scored[0]
+        if best_score < float(threshold):
+            return None
+        if len(scored) > 1 and abs(scored[1][0] - best_score) < 1e-6:
+            return None
+
+        return {
+            "index": best_index,
+            "score": best_score,
+            "metrics": best_metrics,
+        }
+
     def _candidate_nearby_chunk_indices(self, candidate, chunks, claimed_indices, window_size):
         parsed = candidate["parsed"]
         if parsed["is_uid"]:
@@ -1278,18 +1671,14 @@ class ProjectManager:
             "transcript_text": transcript.get("text", ""),
         }
 
-    def repair_lost_audio_links(self, use_asr=True, progress_callback=None):
-        """Relink on-disk clip files back to chunks after chunk-state loss.
+    def repair_lost_audio_links(self, use_asr=True, progress_callback=None, rejected_only=False):
+        """Rebuild all chunk audio links from exact speaker+transcript matches only.
 
-        The first pass is conservative:
-        - preserve existing valid links
-        - relink UID-based filenames to matching chunk UIDs
-        - relink legacy index-based filenames to the chunk currently at that index
-        - require speaker slug match and audio validation before marking done
-
-        When use_asr=True, a second pass uses local transcription plus nearby
-        chunk search to recover clips whose filenames or durations no longer
-        match their true chunk cleanly.
+        This emergency repair intentionally ignores all existing chunk
+        assignments and clip identifiers. Every clip under voicelines/ is treated
+        as untrusted until its transcript matches exactly one chunk for the same
+        speaker (allowing configured aliases). Anything else is moved into
+        voicelines/discarded/ so later repairs do not retry it.
         """
         def emit_progress(payload):
             if progress_callback:
@@ -1313,6 +1702,7 @@ class ProjectManager:
 
             repair_started_at = time.time()
             dictionary_entries = self.load_dictionary_entries()
+            voice_config = self._load_voice_config()
             changed = False
             immediate_commits = 0
             relinked = 0
@@ -1320,378 +1710,331 @@ class ProjectManager:
             invalid_candidates = 0
             unmatched_files = 0
             asr_relinked = 0
+            discarded_retry_relinked = 0
             asr_errors = []
             examples = []
-            transcript_cache = {}
+            duplicate_matches = 0
             claimed_indices = set()
-            claimed_audio_paths = set()
 
-            uid_candidates = {}
-            legacy_candidates = {}
-            scanned_files = 0
+            if not use_asr:
+                emit_progress({
+                    "phase": "scan",
+                    "message": "Lost audio repair requires local ASR. Continuing with ASR enabled.",
+                    "elapsed_seconds": round(time.time() - repair_started_at, 2),
+                })
 
-            for entry in os.listdir(self.voicelines_dir):
-                full_path = os.path.join(self.voicelines_dir, entry)
-                if not os.path.isfile(full_path):
-                    continue
-                scanned_files += 1
-                parsed = self._parse_chunk_audio_candidate_name(entry)
-                if not parsed:
-                    continue
-                relative_path = f"voicelines/{entry}"
-                candidate = {
-                    "relative_path": relative_path,
-                    "parsed": parsed,
-                    "mtime": os.path.getmtime(full_path),
+            text_index = self._build_lost_audio_repair_text_index(chunks, dictionary_entries, voice_config)
+
+            if rejected_only:
+                claimed_indices = {
+                    index for index, chunk in enumerate(chunks)
+                    if (chunk.get("audio_path") or "").strip()
                 }
-                if parsed["is_uid"]:
-                    existing = uid_candidates.get(parsed["identifier"])
-                    if existing is None or (candidate["parsed"]["retry"], candidate["mtime"]) > (existing["parsed"]["retry"], existing["mtime"]):
-                        uid_candidates[parsed["identifier"]] = candidate
-                else:
-                    existing = legacy_candidates.get(parsed["legacy_index"])
-                    if existing is None or (candidate["parsed"]["retry"], candidate["mtime"]) > (existing["parsed"]["retry"], existing["mtime"]):
-                        legacy_candidates[parsed["legacy_index"]] = candidate
+                candidates = []
+                scanned_files = 0
+            else:
+                for chunk in chunks:
+                    chunk["audio_path"] = None
+                    chunk["audio_validation"] = None
+                    chunk["status"] = "pending"
+                    chunk["auto_regen_count"] = 0
+                    chunk.pop("generation_token", None)
+                    self._clear_proofread_state(chunk)
+                self._atomic_json_write(chunks, self.chunks_path)
+                changed = True
 
-            total_candidates = len(uid_candidates) + len(legacy_candidates)
+                candidates, scanned_files = self._collect_repair_candidates_from_dir_locked(
+                    self.voicelines_dir,
+                    "voicelines",
+                )
+
+            total_candidates = len(candidates)
             total_chunks = len(chunks)
+            discarded_candidates = []
+            discarded_scanned_files = 0
+            proofread_threshold = float((self._load_app_config().get("proofread") or {}).get("certainty_threshold", 1.0) or 1.0)
+            speaker_word_frequency_cache = self._build_speaker_word_frequency_cache(
+                chunks,
+                dictionary_entries,
+                voice_config,
+            )
+            if rejected_only or total_candidates == 0:
+                discarded_candidates, discarded_scanned_files = self._collect_repair_candidates_from_dir_locked(
+                    self._discarded_voicelines_dir(),
+                    "voicelines/discarded",
+                )
             emit_progress({
                 "phase": "scan",
                 "message": (
-                    f"Scanned {scanned_files} clip file(s). "
-                    f"Found {total_candidates} repair candidate(s) for {total_chunks} chunk(s)."
+                    (
+                        f"Scanned {scanned_files} clip file(s). Reset {total_chunks} chunk assignment(s). "
+                        f"Found {total_candidates} candidate clip(s) for full-project transcript matching."
+                        if not rejected_only else
+                        f"Rejected-only repair scanned {discarded_scanned_files} rejected clip(s) at certainty {proofread_threshold:.2f}."
+                    )
+                    + (
+                        f" Falling back to {discarded_scanned_files} rejected clip(s) at certainty {proofread_threshold:.2f}."
+                        if (not rejected_only) and total_candidates == 0 and discarded_candidates else ""
+                    )
                 ),
                 "scanned_files": scanned_files,
                 "total_candidates": total_candidates,
                 "total_chunks": total_chunks,
+                "discarded_candidates": len(discarded_candidates),
                 "elapsed_seconds": round(time.time() - repair_started_at, 2),
             })
 
-            direct_pass_started_at = time.time()
-            for index, chunk in enumerate(chunks):
-                existing_path = chunk.get("audio_path")
-                if existing_path and os.path.exists(os.path.join(self.root_dir, existing_path)):
-                    validation = self._validate_audio_path_for_chunk(chunk, existing_path, dictionary_entries)
-                    if validation and validation.get("is_valid"):
-                        if chunk.get("status") != "done" or chunk.get("audio_validation") != validation:
-                            chunk["status"] = "done"
-                            chunk["audio_validation"] = validation
-                            chunk["auto_regen_count"] = 0
-                            chunk.pop("generation_token", None)
-                            changed = True
-                        preserved += 1
-                        claimed_indices.add(index)
-                        claimed_audio_paths.add(existing_path)
-                        if preserved <= 3 or preserved % 250 == 0:
-                            emit_progress({
-                                "phase": "direct",
-                                "message": (
-                                    f"Direct repair pass: checked {index + 1}/{total_chunks} chunks, "
-                                    f"preserved {preserved}, relinked {relinked}, "
-                                    f"invalid {invalid_candidates}, mismatched {unmatched_files}."
-                                ),
-                                "checked_chunks": index + 1,
-                                "total_chunks": total_chunks,
-                                "preserved": preserved,
-                                "relinked": relinked,
-                                "invalid_candidates": invalid_candidates,
-                                "unmatched_files": unmatched_files,
-                                "elapsed_seconds": round(time.time() - direct_pass_started_at, 2),
-                            })
-                        continue
-
-                speaker_slug = sanitize_filename(chunk.get("speaker") or "") or "speaker"
-                candidate = uid_candidates.get(str(chunk.get("uid") or "").strip())
-                if candidate is None:
-                    candidate = legacy_candidates.get(index)
-
-                if candidate is None:
-                    if (index + 1) % 250 == 0:
-                        emit_progress({
-                            "phase": "direct",
+            transcribe_paths = [candidate["relative_path"] for candidate in candidates]
+            if (rejected_only or not transcribe_paths) and discarded_candidates:
+                transcribe_paths = [candidate["relative_path"] for candidate in discarded_candidates]
+            transcript_cache = {}
+            asr_started_at = time.time()
+            if transcribe_paths:
+                try:
+                    transcript_cache = self.transcribe_audio_paths_bulk(
+                        transcribe_paths,
+                        progress_callback=lambda completed, total, path: emit_progress({
+                            "phase": "asr_transcribe",
                             "message": (
-                                f"Direct repair pass: checked {index + 1}/{total_chunks} chunks, "
-                                f"preserved {preserved}, relinked {relinked}, "
-                                f"invalid {invalid_candidates}, mismatched {unmatched_files}."
+                                f"Transcribed {completed}/{total} repair clip(s) in parallel. "
+                                f"Latest: {path}"
                             ),
-                            "checked_chunks": index + 1,
-                            "total_chunks": total_chunks,
-                            "preserved": preserved,
-                            "relinked": relinked,
-                            "invalid_candidates": invalid_candidates,
-                            "unmatched_files": unmatched_files,
-                            "elapsed_seconds": round(time.time() - direct_pass_started_at, 2),
-                        })
-                    continue
-
-                if candidate["parsed"]["speaker_slug"] != speaker_slug:
-                    unmatched_files += 1
-                    if unmatched_files <= 3 or (index + 1) % 250 == 0:
-                        emit_progress({
-                            "phase": "direct",
-                            "message": (
-                                f"Direct repair pass: checked {index + 1}/{total_chunks} chunks, "
-                                f"preserved {preserved}, relinked {relinked}, "
-                                f"invalid {invalid_candidates}, mismatched {unmatched_files}."
-                            ),
-                            "checked_chunks": index + 1,
-                            "total_chunks": total_chunks,
-                            "preserved": preserved,
-                            "relinked": relinked,
-                            "invalid_candidates": invalid_candidates,
-                            "unmatched_files": unmatched_files,
-                            "elapsed_seconds": round(time.time() - direct_pass_started_at, 2),
-                        })
-                    continue
-
-                validation = self._validate_audio_path_for_chunk(chunk, candidate["relative_path"], dictionary_entries)
-                if not validation or not validation.get("is_valid"):
-                    invalid_candidates += 1
-                    if invalid_candidates <= 3 or (index + 1) % 250 == 0:
-                        emit_progress({
-                            "phase": "direct",
-                            "message": (
-                                f"Direct repair pass: checked {index + 1}/{total_chunks} chunks, "
-                                f"preserved {preserved}, relinked {relinked}, "
-                                f"invalid {invalid_candidates}, mismatched {unmatched_files}."
-                            ),
-                            "checked_chunks": index + 1,
-                            "total_chunks": total_chunks,
-                            "preserved": preserved,
-                            "relinked": relinked,
-                            "invalid_candidates": invalid_candidates,
-                            "unmatched_files": unmatched_files,
-                            "elapsed_seconds": round(time.time() - direct_pass_started_at, 2),
-                        })
-                    continue
-
-                original_candidate_path = candidate["relative_path"]
-                committed_audio_path = self._commit_repaired_chunk_locked(
-                    chunks,
-                    index,
-                    original_candidate_path,
-                    validation,
-                )
-                changed = True
-                immediate_commits += 1
-                relinked += 1
-                claimed_indices.add(index)
-                claimed_audio_paths.add(original_candidate_path)
-                claimed_audio_paths.add(committed_audio_path)
-                if relinked <= 3 or relinked % 100 == 0 or (index + 1) % 250 == 0:
+                            "asr_transcribed": completed,
+                            "asr_transcribe_total": total,
+                            "elapsed_seconds": round(time.time() - asr_started_at, 2),
+                        }),
+                    )
+                except LocalASRUnavailableError as e:
+                    asr_errors.append(str(e))
                     emit_progress({
-                        "phase": "direct",
-                        "message": (
-                            f"Direct repair pass: checked {index + 1}/{total_chunks} chunks, "
-                            f"preserved {preserved}, relinked {relinked}, "
-                            f"invalid {invalid_candidates}, mismatched {unmatched_files}."
-                        ),
-                        "checked_chunks": index + 1,
-                        "total_chunks": total_chunks,
+                        "phase": "asr",
+                        "message": f"ASR unavailable: {e}",
+                        "asr_errors": list(asr_errors),
+                        "elapsed_seconds": round(time.time() - asr_started_at, 2),
+                    })
+                    return {
+                        "relinked": relinked,
                         "preserved": preserved,
+                        "invalid_candidates": invalid_candidates,
+                        "unmatched_files": unmatched_files,
+                        "total_candidates": total_candidates,
+                        "asr_relinked": asr_relinked,
+                        "asr_enabled": True,
+                        "asr_errors": asr_errors[:10],
+                        "examples": examples,
+                    }
+
+            for candidate_index, candidate in enumerate(candidates, start=1):
+                relative_path = candidate["relative_path"]
+                parsed = candidate["parsed"]
+                speaker_slug = ((parsed or {}).get("speaker_slug") or "").strip().lower()
+
+                if not speaker_slug:
+                    invalid_candidates += 1
+                    discarded_path = self._move_candidate_to_discarded_locked(relative_path)
+                    if discarded_path:
+                        emit_progress({
+                            "phase": "matching",
+                            "message": f"Discarded unparseable clip {relative_path}.",
+                            "processed_candidates": candidate_index,
+                            "total_candidates": total_candidates,
+                            "invalid_candidates": invalid_candidates,
+                            "elapsed_seconds": round(time.time() - repair_started_at, 2),
+                        })
+                    continue
+
+                transcript = transcript_cache.get(relative_path) or {}
+                normalized_transcript = transcript.get("normalized_text") or self._normalize_asr_text(transcript.get("text"))
+                if not normalized_transcript:
+                    unmatched_files += 1
+                    self._move_candidate_to_discarded_locked(relative_path)
+                    continue
+
+                matching_indices = list(text_index.get(speaker_slug, {}).get(normalized_transcript, []))
+                if not matching_indices:
+                    unmatched_files += 1
+                    self._move_candidate_to_discarded_locked(relative_path)
+                elif len(matching_indices) > 1:
+                    invalid_candidates += 1
+                    self._move_candidate_to_discarded_locked(relative_path)
+                else:
+                    target_index = matching_indices[0]
+                    if target_index in claimed_indices:
+                        duplicate_matches += 1
+                        self._move_candidate_to_discarded_locked(relative_path)
+                    else:
+                        chunk = chunks[target_index]
+                        validation = self._validate_audio_path_for_chunk(chunk, relative_path, dictionary_entries) or {}
+                        validation = dict(validation)
+                        validation["matched_via_asr"] = True
+                        validation["repair_exact_transcript_match"] = True
+                        validation["transcript_text"] = transcript.get("text", "")
+                        validation["normalized_transcript"] = normalized_transcript
+                        committed_audio_path = self._commit_repaired_chunk_locked(
+                            chunks,
+                            target_index,
+                            relative_path,
+                            validation,
+                        )
+                        changed = True
+                        immediate_commits += 1
+                        relinked += 1
+                        asr_relinked += 1
+                        claimed_indices.add(target_index)
+                        if len(examples) < 50:
+                            examples.append({
+                                "index": target_index,
+                                "speaker": chunk.get("speaker"),
+                                "audio_path": committed_audio_path,
+                                "repair_mode": "exact_transcript",
+                            })
+
+                if candidate_index <= 3 or candidate_index % 25 == 0 or candidate_index == total_candidates:
+                    elapsed = time.time() - repair_started_at
+                    rate = candidate_index / elapsed if elapsed > 0 else 0.0
+                    remaining = max(total_candidates - candidate_index, 0)
+                    eta = (remaining / rate) if rate > 0 else None
+                    emit_progress({
+                        "phase": "matching",
+                        "message": (
+                            f"Matched {candidate_index}/{total_candidates} clip(s). "
+                            f"Linked {relinked}, discarded unmatched {unmatched_files}, "
+                            f"discarded ambiguous {invalid_candidates}, duplicate targets {duplicate_matches}. "
+                            + (f"ETA {int(eta)}s." if eta is not None else "")
+                        ).strip(),
+                        "processed_candidates": candidate_index,
+                        "total_candidates": total_candidates,
                         "relinked": relinked,
                         "invalid_candidates": invalid_candidates,
                         "unmatched_files": unmatched_files,
-                        "elapsed_seconds": round(time.time() - direct_pass_started_at, 2),
-                    })
-                if len(examples) < 25:
-                    examples.append({
-                        "index": index,
-                        "speaker": chunk.get("speaker"),
-                        "audio_path": committed_audio_path,
-                        "repair_mode": "direct",
+                        "duplicate_matches": duplicate_matches,
+                        "eta_seconds": None if eta is None else round(eta, 1),
+                        "elapsed_seconds": round(elapsed, 2),
                     })
 
-            if use_asr:
-                asr_candidates = sorted(
-                    list(uid_candidates.values()) + list(legacy_candidates.values()),
-                    key=lambda item: (item["parsed"]["is_uid"], item["parsed"].get("legacy_index", -1), item["relative_path"]),
-                )
-                asr_started_at = time.time()
+            if (rejected_only or total_candidates == 0) and discarded_candidates:
                 emit_progress({
-                    "phase": "asr",
-                    "message": f"Starting ASR repair pass across {len(asr_candidates)} candidate clip(s).",
-                    "asr_candidates_total": len(asr_candidates),
-                    "elapsed_seconds": round(time.time() - asr_started_at, 2),
+                    "phase": "discarded_retry",
+                    "message": (
+                        (
+                            f"No active clips remained in voicelines/. Re-grading {len(discarded_candidates)} rejected clip(s) "
+                            f"using certainty {proofread_threshold:.2f}."
+                            if not rejected_only else
+                            f"Re-grading {len(discarded_candidates)} rejected clip(s) using certainty {proofread_threshold:.2f}."
+                        )
+                    ),
+                    "discarded_candidates": len(discarded_candidates),
+                    "threshold": proofread_threshold,
+                    "elapsed_seconds": round(time.time() - repair_started_at, 2),
                 })
-                transcribe_paths = [
-                    candidate["relative_path"]
-                    for candidate in asr_candidates
-                    if candidate["relative_path"] not in claimed_audio_paths
-                ]
-                if transcribe_paths:
-                    try:
-                        transcript_cache.update(
-                            self.transcribe_audio_paths_bulk(
-                                transcribe_paths,
-                                progress_callback=lambda completed, total, path: emit_progress({
-                                    "phase": "asr_transcribe",
-                                    "message": (
-                                        f"Transcribed {completed}/{total} ASR repair clip(s) in parallel. "
-                                        f"Latest: {path}"
-                                    ),
-                                    "asr_transcribed": completed,
-                                    "asr_transcribe_total": total,
-                                    "elapsed_seconds": round(time.time() - asr_started_at, 2),
-                                }),
-                            )
-                        )
-                    except LocalASRUnavailableError as e:
-                        asr_errors.append(str(e))
-                        emit_progress({
-                            "phase": "asr",
-                            "message": f"ASR unavailable: {e}",
-                            "asr_errors": list(asr_errors),
-                            "elapsed_seconds": round(time.time() - asr_started_at, 2),
-                        })
-                        return {
-                            "relinked": relinked,
-                            "preserved": preserved,
-                            "invalid_candidates": invalid_candidates,
-                            "unmatched_files": unmatched_files,
-                            "total_candidates": total_candidates,
-                            "asr_relinked": asr_relinked,
-                            "asr_enabled": bool(use_asr),
-                            "asr_errors": asr_errors[:10],
-                            "examples": examples,
-                        }
-                for asr_index, candidate in enumerate(asr_candidates, start=1):
-                    if candidate["relative_path"] in claimed_audio_paths:
-                        if asr_index % 100 == 0:
-                            elapsed = time.time() - asr_started_at
-                            rate = asr_index / elapsed if elapsed > 0 else 0.0
-                            remaining = max(len(asr_candidates) - asr_index, 0)
-                            eta = (remaining / rate) if rate > 0 else None
-                            emit_progress({
-                                "phase": "asr",
-                                "message": (
-                                    f"ASR repair pass: checked {asr_index}/{len(asr_candidates)} candidate(s), "
-                                    f"relinked {asr_relinked} via ASR, "
-                                    f"ETA {int(eta)}s." if eta is not None else
-                                    f"ASR repair pass: checked {asr_index}/{len(asr_candidates)} candidate(s), "
-                                    f"relinked {asr_relinked} via ASR."
-                                ),
-                                "asr_checked": asr_index,
-                                "asr_candidates_total": len(asr_candidates),
-                                "asr_relinked": asr_relinked,
-                                "eta_seconds": None if eta is None else round(eta, 1),
-                                "elapsed_seconds": round(elapsed, 2),
-                            })
-                        continue
-                    try:
-                        match = self._find_asr_repair_match(
-                            candidate,
-                            chunks,
-                            claimed_indices,
-                            dictionary_entries,
-                            transcript_cache,
-                        )
-                    except LocalASRUnavailableError as e:
-                        asr_errors.append(str(e))
-                        emit_progress({
-                            "phase": "asr",
-                            "message": f"ASR unavailable: {e}",
-                            "asr_errors": list(asr_errors),
-                            "elapsed_seconds": round(time.time() - asr_started_at, 2),
-                        })
-                        break
-                    except Exception as e:
-                        asr_errors.append(f"{candidate['relative_path']}: {e}")
-                        if len(asr_errors) <= 5:
-                            emit_progress({
-                                "phase": "asr",
-                                "message": f"ASR skipped {candidate['relative_path']}: {e}",
-                                "asr_errors": list(asr_errors),
-                                "elapsed_seconds": round(time.time() - asr_started_at, 2),
-                            })
+                for discarded_index, candidate in enumerate(discarded_candidates, start=1):
+                    relative_path = candidate["relative_path"]
+                    parsed = candidate["parsed"]
+                    speaker_slug = ((parsed or {}).get("speaker_slug") or "").strip().lower()
+                    transcript = transcript_cache.get(relative_path) or {}
+                    transcript_text = (transcript.get("text") or "").strip()
+                    if not speaker_slug or not transcript_text:
                         continue
 
+                    match = self._best_discarded_repair_match(
+                        speaker_slug,
+                        transcript_text,
+                        chunks,
+                        dictionary_entries,
+                        voice_config,
+                        claimed_indices,
+                        proofread_threshold,
+                        speaker_word_frequency_cache=speaker_word_frequency_cache,
+                    )
                     if not match:
-                        if asr_index % 25 == 0:
-                            elapsed = time.time() - asr_started_at
-                            rate = asr_index / elapsed if elapsed > 0 else 0.0
-                            remaining = max(len(asr_candidates) - asr_index, 0)
+                        if discarded_index <= 3 or discarded_index % 25 == 0 or discarded_index == len(discarded_candidates):
+                            elapsed = time.time() - repair_started_at
+                            rate = discarded_index / elapsed if elapsed > 0 else 0.0
+                            remaining = max(len(discarded_candidates) - discarded_index, 0)
                             eta = (remaining / rate) if rate > 0 else None
                             emit_progress({
-                                "phase": "asr",
+                                "phase": "discarded_retry",
                                 "message": (
-                                    f"ASR repair pass: checked {asr_index}/{len(asr_candidates)} candidate(s), "
-                                    f"relinked {asr_relinked} via ASR, "
-                                    f"ETA {int(eta)}s." if eta is not None else
-                                    f"ASR repair pass: checked {asr_index}/{len(asr_candidates)} candidate(s), "
-                                    f"relinked {asr_relinked} via ASR."
-                                ),
-                                "asr_checked": asr_index,
-                                "asr_candidates_total": len(asr_candidates),
-                                "asr_relinked": asr_relinked,
+                                    f"Re-graded {discarded_index}/{len(discarded_candidates)} rejected clip(s). "
+                                    f"Recovered {discarded_retry_relinked}, left rejected {discarded_index - discarded_retry_relinked}. "
+                                    + (f"ETA {int(eta)}s." if eta is not None else "")
+                                ).strip(),
+                                "discarded_checked": discarded_index,
+                                "discarded_candidates": len(discarded_candidates),
+                                "discarded_retry_relinked": discarded_retry_relinked,
                                 "eta_seconds": None if eta is None else round(eta, 1),
                                 "elapsed_seconds": round(elapsed, 2),
                             })
                         continue
 
                     target_index = match["index"]
-                    if target_index in claimed_indices:
-                        continue
-
                     chunk = chunks[target_index]
-                    original_candidate_path = candidate["relative_path"]
+                    normalized_transcript = transcript.get("normalized_text") or self._normalize_asr_text(transcript_text)
+                    validation = self._validate_audio_path_for_chunk(chunk, relative_path, dictionary_entries) or {}
+                    validation = dict(validation)
+                    validation["matched_via_asr"] = True
+                    validation["repair_certainty_match"] = True
+                    validation["repair_certainty_threshold"] = proofread_threshold
+                    validation["repair_certainty_score"] = round(match["score"], 4)
+                    validation["transcript_text"] = transcript_text
+                    validation["normalized_transcript"] = normalized_transcript
                     committed_audio_path = self._commit_repaired_chunk_locked(
                         chunks,
                         target_index,
-                        original_candidate_path,
-                        match["validation"],
+                        relative_path,
+                        validation,
                     )
                     changed = True
                     immediate_commits += 1
+                    relinked += 1
                     asr_relinked += 1
+                    discarded_retry_relinked += 1
                     claimed_indices.add(target_index)
-                    claimed_audio_paths.add(original_candidate_path)
-                    claimed_audio_paths.add(committed_audio_path)
-                    elapsed = time.time() - asr_started_at
-                    rate = asr_index / elapsed if elapsed > 0 else 0.0
-                    remaining = max(len(asr_candidates) - asr_index, 0)
-                    eta = (remaining / rate) if rate > 0 else None
-                    emit_progress({
-                        "phase": "asr",
-                        "message": (
-                            f"ASR matched chunk {target_index + 1} from {candidate['relative_path']} "
-                            f"(score {match['score']:.2f}). "
-                            f"Progress {asr_index}/{len(asr_candidates)}, relinked {asr_relinked}, "
-                            f"ETA {int(eta)}s." if eta is not None else
-                            f"ASR matched chunk {target_index + 1} from {candidate['relative_path']} "
-                            f"(score {match['score']:.2f}). Progress {asr_index}/{len(asr_candidates)}, "
-                            f"relinked {asr_relinked}."
-                        ),
-                        "asr_checked": asr_index,
-                        "asr_candidates_total": len(asr_candidates),
-                        "asr_relinked": asr_relinked,
-                        "eta_seconds": None if eta is None else round(eta, 1),
-                        "elapsed_seconds": round(elapsed, 2),
-                    })
                     if len(examples) < 50:
                         examples.append({
                             "index": target_index,
                             "speaker": chunk.get("speaker"),
                             "audio_path": committed_audio_path,
-                            "repair_mode": "asr",
-                            "asr_score": round(match["score"], 4),
+                            "repair_mode": "discarded_certainty",
+                            "score": round(match["score"], 4),
                         })
 
-            if changed and immediate_commits == 0:
-                self._atomic_json_write(chunks, self.chunks_path)
+                    if discarded_index <= 3 or discarded_index % 25 == 0 or discarded_index == len(discarded_candidates):
+                        elapsed = time.time() - repair_started_at
+                        rate = discarded_index / elapsed if elapsed > 0 else 0.0
+                        remaining = max(len(discarded_candidates) - discarded_index, 0)
+                        eta = (remaining / rate) if rate > 0 else None
+                        emit_progress({
+                            "phase": "discarded_retry",
+                            "message": (
+                                f"Re-graded {discarded_index}/{len(discarded_candidates)} rejected clip(s). "
+                                f"Recovered {discarded_retry_relinked}, left rejected {discarded_index - discarded_retry_relinked}. "
+                                + (f"ETA {int(eta)}s." if eta is not None else "")
+                            ).strip(),
+                            "discarded_checked": discarded_index,
+                            "discarded_candidates": len(discarded_candidates),
+                            "discarded_retry_relinked": discarded_retry_relinked,
+                            "eta_seconds": None if eta is None else round(eta, 1),
+                            "elapsed_seconds": round(elapsed, 2),
+                        })
 
             emit_progress({
                 "phase": "complete",
                 "message": (
                     f"Lost audio repair complete in {time.time() - repair_started_at:.1f}s. "
-                    f"Preserved {preserved}, relinked {relinked} directly, relinked {asr_relinked} via ASR."
+                    f"Linked {relinked} exact transcript match(es), discarded {unmatched_files} unmatched clip(s), "
+                    f"{invalid_candidates} ambiguous clip(s), {duplicate_matches} duplicate-target clip(s), "
+                    f"and recovered {discarded_retry_relinked} rejected clip(s)."
                 ),
                 "preserved": preserved,
                 "relinked": relinked,
                 "asr_relinked": asr_relinked,
+                "discarded_retry_relinked": discarded_retry_relinked,
                 "invalid_candidates": invalid_candidates,
                 "unmatched_files": unmatched_files,
+                "duplicate_matches": duplicate_matches,
                 "total_candidates": total_candidates,
+                "discarded_candidates": len(discarded_candidates),
                 "elapsed_seconds": round(time.time() - repair_started_at, 2),
             })
             return {
@@ -1699,9 +2042,12 @@ class ProjectManager:
                 "preserved": preserved,
                 "invalid_candidates": invalid_candidates,
                 "unmatched_files": unmatched_files,
+                "duplicate_matches": duplicate_matches,
                 "total_candidates": total_candidates,
+                "discarded_candidates": len(discarded_candidates),
                 "asr_relinked": asr_relinked,
-                "asr_enabled": bool(use_asr),
+                "discarded_retry_relinked": discarded_retry_relinked,
+                "asr_enabled": True,
                 "asr_errors": asr_errors[:10],
                 "examples": examples,
             }
@@ -1741,6 +2087,12 @@ class ProjectManager:
                 if not bool((chunks[index].get("proofread") or {}).get("checked"))
             ]
 
+            processed = 0
+            skipped = len(scoped_indices) - len(pending_indices)
+            auto_failed = 0
+            passed = 0
+            failed = 0
+
             emit_progress({
                 "phase": "scan",
                 "message": (
@@ -1751,14 +2103,14 @@ class ProjectManager:
                 "threshold": float(threshold),
                 "scoped_clips": len(scoped_indices),
                 "pending_clips": len(pending_indices),
+                "processed": processed,
+                "pending_total": len(pending_indices),
+                "passed": passed,
+                "failed": failed,
+                "auto_failed": auto_failed,
+                "skipped": skipped,
                 "elapsed_seconds": round(time.time() - started_at, 2),
             })
-
-            processed = 0
-            skipped = len(scoped_indices) - len(pending_indices)
-            auto_failed = 0
-            passed = 0
-            failed = 0
 
             precomputed_results = {}
             asr_needed = []
@@ -1793,12 +2145,28 @@ class ProjectManager:
                         "auto_failed_reason": "speaker_mismatch",
                     }
                     continue
-                if duration_delta_sec > 5.0:
+                if duration_delta_sec > PROOFREAD_DURATION_OUTLIER_SECONDS:
                     precomputed_results[index] = base | {
                         "score": 0.0,
                         "passed": False,
                         "error": f"Audio duration differs from expected speech length by {duration_delta_sec:.1f}s.",
                         "auto_failed_reason": "duration_outlier",
+                    }
+                    continue
+                cached_transcript_text = ""
+                existing_proofread = chunk.get("proofread") or {}
+                if (existing_proofread.get("audio_path") or "").strip() == audio_path:
+                    cached_transcript_text = (existing_proofread.get("transcript_text") or "").strip()
+                if cached_transcript_text:
+                    metrics = self._proofread_similarity_metrics(expected_text, cached_transcript_text)
+                    score = metrics["score"]
+                    precomputed_results[index] = base | metrics | {
+                        "score": score,
+                        "passed": score >= float(threshold),
+                        "error": None if score >= float(threshold) else "Transcript confidence below threshold.",
+                        "auto_failed_reason": None,
+                        "transcript_text": cached_transcript_text,
+                        "normalized_transcript": self._normalize_asr_text(cached_transcript_text),
                     }
                     continue
                 asr_needed.append((index, expected_text, base))
@@ -1809,9 +2177,29 @@ class ProjectManager:
                     [base["audio_path"] for _, _, base in asr_needed],
                     progress_callback=lambda completed, total, path: emit_progress({
                         "phase": "proofread_transcribe",
-                        "message": f"Transcribed {completed}/{total} proofread clip(s) in parallel. Latest: {path}",
+                        "message": (
+                            f"Transcribed {completed}/{total} proofread clip(s) in parallel. "
+                            f"Latest: {path}"
+                            + (
+                                f" ETA {int((max(total - completed, 0) / (completed / max(time.time() - asr_started_at, 0.001))))}s."
+                                if completed > 0 and total > completed
+                                else ""
+                            )
+                        ).strip(),
                         "transcribed": completed,
                         "transcribe_total": total,
+                        "processed": processed,
+                        "pending_total": len(pending_indices),
+                        "passed": passed,
+                        "failed": failed,
+                        "auto_failed": auto_failed,
+                        "skipped": skipped,
+                        "eta_seconds": (
+                            round(max(total - completed, 0) / (completed / max(time.time() - asr_started_at, 0.001)), 1)
+                            if completed > 0 and total > completed
+                            else 0.0 if total and completed >= total
+                            else None
+                        ),
                         "elapsed_seconds": round(time.time() - asr_started_at, 2),
                     }),
                 )
@@ -1825,11 +2213,13 @@ class ProjectManager:
                         "error": None if score >= float(threshold) else "Transcript confidence below threshold.",
                         "auto_failed_reason": None,
                         "transcript_text": transcript.get("text", ""),
+                        "normalized_transcript": transcript.get("normalized_text") or self._normalize_asr_text(transcript.get("text", "")),
                     }
 
+            pending_write_batch = {}
             for ordinal, index in enumerate(pending_indices, start=1):
                 result = precomputed_results[index]
-                self._commit_proofread_result_locked(chunks, index, result)
+                pending_write_batch[index] = result
                 processed += 1
                 if result.get("auto_failed_reason"):
                     auto_failed += 1
@@ -1837,6 +2227,14 @@ class ProjectManager:
                     passed += 1
                 else:
                     failed += 1
+
+                should_flush_batch = (
+                    len(pending_write_batch) >= PROOFREAD_BATCH_COMMIT_SIZE
+                    or ordinal == len(pending_indices)
+                )
+                if should_flush_batch:
+                    self._commit_proofread_results_batch_locked(chunks, pending_write_batch)
+                    pending_write_batch.clear()
 
                 elapsed = time.time() - started_at
                 rate = processed / elapsed if elapsed > 0 else 0.0
@@ -2701,6 +3099,8 @@ class ProjectManager:
     def _commit_repaired_chunk_locked(self, chunks, index, source_relative_path, validation):
         chunk = chunks[index]
         target_audio_path = self._repair_target_audio_path_locked(chunk, index, source_relative_path)
+        if target_audio_path and target_audio_path != source_relative_path:
+            self._copy_cached_transcription_key(source_relative_path, target_audio_path)
         chunk["audio_path"] = target_audio_path
         chunk["audio_validation"] = validation
         chunk["status"] = "done"
