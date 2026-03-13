@@ -263,6 +263,7 @@ class AppConfig(BaseModel):
     tts: TTSConfig
     prompts: Optional[PromptConfig] = None
     generation: Optional[GenerationConfig] = None
+    proofread: Optional[dict] = None
 
 class VoiceConfigItem(BaseModel):
     type: str = "custom"
@@ -296,6 +297,14 @@ class ChunkRepairLegacyRequest(BaseModel):
 
 class LostAudioRepairRequest(BaseModel):
     use_asr: bool = True
+
+class ProofreadRequest(BaseModel):
+    chapter: Optional[str] = None
+    threshold: float = 1.0
+
+class ProofreadClearFailuresRequest(BaseModel):
+    chapter: Optional[str] = None
+    threshold: float = 1.0
 
 class ASRTranscribeRequest(BaseModel):
     audio_path: str
@@ -423,6 +432,7 @@ PROCESSING_WORKFLOW_STAGE_LABELS = {
 process_state = {
     "script": {"running": False, "logs": []},
     "voices": {"running": False, "logs": []},
+    "proofread": {"running": False, "logs": [], "progress": {}},
     "audio": {
         "running": False,
         "logs": [],
@@ -534,6 +544,7 @@ task_state_lock = threading.RLock()
 task_processes = {}
 processing_workflow_lock = threading.RLock()
 processing_workflow_thread = None
+TASK_PROGRESS_PREFIX = "__TASK_PROGRESS__:"
 
 
 def _task_is_current(task_name: str, run_id: str) -> bool:
@@ -548,6 +559,15 @@ def _append_task_log(task_name: str, run_id: str, message: str) -> bool:
             return False
         state["logs"].append(message)
         _trim_logs(state["logs"])
+        return True
+
+
+def _set_task_progress(task_name: str, run_id: str, progress: dict) -> bool:
+    with task_state_lock:
+        state = process_state.get(task_name)
+        if not state or state.get("run_id") != run_id:
+            return False
+        state["progress"] = dict(progress or {})
         return True
 
 
@@ -577,6 +597,8 @@ def _start_task_run(task_name: str) -> str:
         process_state[task_name]["run_id"] = run_id
         process_state[task_name]["running"] = True
         process_state[task_name]["logs"] = []
+        if "progress" in process_state[task_name]:
+            process_state[task_name]["progress"] = {}
         if previous_running:
             process_state[task_name]["logs"].append(
                 "Restart requested. Using the latest Setup settings and attempting to continue from saved progress."
@@ -596,6 +618,11 @@ def _finish_task_run(task_name: str, run_id: str, process=None):
         if not state or state.get("run_id") != run_id:
             return
         state["running"] = False
+        if "progress" in state:
+            state["progress"] = dict(state.get("progress") or {}) | {
+                "running": False,
+                "completed_at": time.time(),
+            }
         if process is not None and task_processes.get(task_name) is process:
             task_processes.pop(task_name, None)
 
@@ -1038,9 +1065,11 @@ def _reset_runtime_state_after_project_load():
         process_state["processing_workflow"] = _new_processing_workflow_state()
         _persist_processing_workflow_state_locked()
 
-    for task_name in ("script", "voices", "review", "sanity", "repair", "audacity_export", "m4b_export"):
+    for task_name in ("script", "voices", "proofread", "review", "sanity", "repair", "audacity_export", "m4b_export"):
         process_state[task_name]["logs"] = []
         process_state[task_name]["running"] = False
+        if "progress" in process_state[task_name]:
+            process_state[task_name]["progress"] = {}
 
     project_manager.engine = None
     project_manager.recover_interrupted_generating_chunks()
@@ -1743,6 +1772,16 @@ def run_process(command: List[str], task_name: str, run_id: str):
                 break
             log_line = line.strip()
             if log_line:
+                if log_line.startswith(TASK_PROGRESS_PREFIX):
+                    try:
+                        progress = json.loads(log_line[len(TASK_PROGRESS_PREFIX):])
+                        _set_task_progress(task_name, run_id, progress)
+                        message = (progress or {}).get("message")
+                        if message:
+                            _append_task_log(task_name, run_id, str(message))
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        _append_task_log(task_name, run_id, log_line)
+                    continue
                 _append_task_log(task_name, run_id, log_line)
 
         process.wait()
@@ -2304,6 +2343,9 @@ async def get_config():
             "system_prompt": "",
             "user_prompt": "",
             "voice_prompt": ""
+        },
+        "proofread": {
+            "certainty_threshold": 1.0
         }
     }
 
@@ -2393,6 +2435,14 @@ async def get_config():
                 pass
 
     # Include current input file info if available
+    if "proofread" not in config or not isinstance(config.get("proofread"), dict):
+        config["proofread"] = {"certainty_threshold": 1.0}
+        config_changed = True
+    else:
+        if config["proofread"].get("certainty_threshold") is None:
+            config["proofread"]["certainty_threshold"] = 1.0
+            config_changed = True
+
     config["render_prep_complete"] = False
     state_path = os.path.join(ROOT_DIR, "state.json")
     if os.path.exists(state_path):
@@ -2580,9 +2630,11 @@ async def reset_project():
         process_state["audio"]["metrics"] = _new_audio_metrics()
         process_state["audio"]["heartbeat"] = _new_audio_heartbeat_state()
 
-    for task_name in ("script", "voices", "review", "sanity", "repair", "audacity_export", "m4b_export"):
+    for task_name in ("script", "voices", "proofread", "review", "sanity", "repair", "audacity_export", "m4b_export"):
         process_state[task_name]["logs"] = []
         process_state[task_name]["running"] = False
+        if "progress" in process_state[task_name]:
+            process_state[task_name]["progress"] = {}
 
     with processing_workflow_lock:
         process_state["processing_workflow"] = _new_processing_workflow_state()
@@ -3127,6 +3179,42 @@ async def repair_lost_audio(request: LostAudioRepairRequest, background_tasks: B
     )
     return {"status": "started", "run_id": run_id}
 
+@app.post("/api/proofread")
+async def start_proofread(request: ProofreadRequest, background_tasks: BackgroundTasks):
+    running_task = _any_project_task_running()
+    if running_task:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot proofread while {running_task} work is running",
+        )
+
+    run_id = _start_task_run("proofread")
+    chapter_arg = (request.chapter or "").strip() or "__ALL__"
+    threshold = max(0.0, min(float(request.threshold or 0.0), 1.0))
+    background_tasks.add_task(
+        run_process,
+        [sys.executable, "-u", "proofread_runner.py", ROOT_DIR, str(threshold), chapter_arg],
+        "proofread",
+        run_id,
+    )
+    return {"status": "started", "run_id": run_id}
+
+@app.post("/api/proofread/clear_failures")
+async def clear_proofread_failures(request: ProofreadClearFailuresRequest):
+    running_task = _any_project_task_running()
+    if running_task:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot clear proofread failures while {running_task} work is running",
+        )
+
+    threshold = max(0.0, min(float(request.threshold or 0.0), 1.0))
+    result = project_manager.clear_proofread_failures(
+        chapter=(request.chapter or "").strip() or None,
+        threshold=threshold,
+    )
+    return {"status": "ok", **result}
+
 @app.post("/api/render_prep_state")
 async def set_render_prep_state(request: RenderPrepStateRequest):
     complete = project_manager.set_render_prep_complete(bool(request.complete))
@@ -3166,6 +3254,23 @@ async def generate_chunk_endpoint(index: str, background_tasks: BackgroundTasks)
     if resolved_index is None or not (0 <= resolved_index < len(chunks)):
         raise HTTPException(status_code=404, detail="Invalid chunk id")
     if not chunks[resolved_index].get("text", "").strip():
+        raise HTTPException(status_code=400, detail="Cannot generate audio for an empty line")
+
+    def task():
+        project_manager.generate_chunk_audio(resolved_index)
+
+    background_tasks.add_task(task)
+    return {"status": "started"}
+
+@app.post("/api/chunks/{index}/regenerate")
+async def regenerate_chunk_endpoint(index: str, background_tasks: BackgroundTasks):
+    prepared = project_manager.prepare_chunk_for_regeneration(index)
+    if prepared is None:
+        raise HTTPException(status_code=404, detail="Invalid chunk id")
+
+    chunk = prepared["chunk"]
+    resolved_index = prepared["index"]
+    if not chunk.get("text", "").strip():
         raise HTTPException(status_code=400, detail="Cannot generate audio for an empty line")
 
     def task():

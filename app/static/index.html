@@ -231,7 +231,8 @@
                     <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="script">2. Script</a></li>
                     <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="voices">3. Voices</a></li>
                     <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="editor">4. Editor</a></li>
-                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="audio">5. Result</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="proofread">5. Proofread</a></li>
+                    <li class="nav-item"><a class="nav-link nav-pipeline" data-tab="audio">6. Result</a></li>
                     <li class="nav-item ms-3 border-start border-secondary ps-3"><a class="nav-link nav-advanced" data-tab="designer">Designer</a></li>
                     <li class="nav-item"><a class="nav-link nav-advanced" data-tab="dictionary">Dictionary</a></li>
                     <li class="nav-item"><a class="nav-link nav-advanced" data-tab="dataset-builder">Dataset</a></li>
@@ -1088,11 +1089,111 @@
             </div>
         </div>
 
+        <!-- Proofread Tab -->
+        <div id="proofread-tab" class="tab-content" style="display:none;">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h4 class="m-0"><span class="step-indicator step-active">5</span>Proofread</h4>
+                    <div class="d-flex flex-wrap gap-2 align-items-center">
+                        <div class="input-group input-group-sm" style="width: 220px;">
+                            <span class="input-group-text">Certainty</span>
+                            <input type="number" id="proofread-threshold" class="form-control" min="0" max="1" step="0.01" value="1.0" onchange="saveProofreadThreshold()">
+                        </div>
+                        <button class="btn btn-primary btn-sm" id="btn-proofread-sequence" onclick="startProofreadSequence()">
+                            <i class="fas fa-spell-check me-1"></i>Proofread Sequence
+                        </button>
+                        <button class="btn btn-outline-primary btn-sm" id="btn-proofread-book" onclick="startProofreadEntireBook()">
+                            <i class="fas fa-book-open me-1"></i>Proofread Entire Book
+                        </button>
+                        <button class="btn btn-outline-danger btn-sm" id="btn-proofread-clear-local" onclick="clearProofreadFailuresLocal()">
+                            <i class="fas fa-trash me-1"></i>Clear Local Failures
+                        </button>
+                        <button class="btn btn-outline-danger btn-sm" id="btn-proofread-clear-book" onclick="clearProofreadFailuresBook()">
+                            <i class="fas fa-trash-alt me-1"></i>Clear Book Failures
+                        </button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+                        <div class="d-flex align-items-center gap-2">
+                            <label for="proofread-chapter-select" class="form-label mb-0 fw-semibold">Chapter</label>
+                            <select id="proofread-chapter-select" class="form-select form-select-sm" style="min-width: 260px;" oninput="changeProofreadChapter(this.value)" onchange="changeProofreadChapter(this.value)">
+                                <option value="__whole_project__">Whole Project</option>
+                            </select>
+                        </div>
+                        <div class="text-end">
+                            <div id="proofread-chapter-summary" class="text-muted small">Showing all segments.</div>
+                            <div id="proofread-run-summary" class="text-muted small"></div>
+                        </div>
+                    </div>
+
+                    <div id="proofread-status-panel" class="theme-panel border rounded p-3 mb-3">
+                        <div class="row g-3">
+                            <div class="col-md-3 col-sm-6">
+                                <div class="small text-muted">Phase</div>
+                                <div class="fw-semibold" id="proofread-phase">Idle</div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="small text-muted">Progress</div>
+                                <div class="fw-semibold" id="proofread-progress">0 / 0</div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="small text-muted">ETA</div>
+                                <div class="fw-semibold" id="proofread-eta">Waiting for data</div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="small text-muted">Elapsed</div>
+                                <div class="fw-semibold" id="proofread-elapsed">0s</div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="small text-muted">Passed</div>
+                                <div class="fw-semibold" id="proofread-passed">0</div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="small text-muted">Failed</div>
+                                <div class="fw-semibold" id="proofread-failed">0</div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="small text-muted">Auto-failed</div>
+                                <div class="fw-semibold" id="proofread-auto-failed">0</div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="small text-muted">Skipped</div>
+                                <div class="fw-semibold" id="proofread-skipped">0</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="table-responsive">
+                        <table class="table table-bordered table-hover">
+                            <thead>
+                                <tr>
+                                    <th width="7%">Speaker</th>
+                                    <th width="34%">Text</th>
+                                    <th width="10%">Score</th>
+                                    <th width="22%">Transcript</th>
+                                    <th width="27%">Audio / Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="proofread-table-body">
+                                <tr><td colspan="5" class="text-center text-muted">Loading clips...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="mt-3">
+                        <div class="small text-muted mb-1">Proofread Logs</div>
+                        <div id="proofread-logs" class="log-window"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Audio Result Tab -->
         <div id="audio-tab" class="tab-content" style="display:none;">
             <div class="card">
                 <div class="card-header">
-                    <h4><span class="step-indicator step-active">5</span>Final Result</h4>
+                    <h4><span class="step-indicator step-active">6</span>Final Result</h4>
                 </div>
                 <div class="card-body">
                     <div id="audio-merge-progress" class="theme-panel border rounded p-3 mb-3" style="display:none;">
@@ -1511,6 +1612,9 @@
                     document.getElementById('orphaned-text-to-narrator-on-repair').checked =
                         config.generation.orphaned_text_to_narrator_on_repair !== false;
                 }
+                if (config.proofread && config.proofread.certainty_threshold != null) {
+                    document.getElementById('proofread-threshold').value = config.proofread.certainty_threshold;
+                }
 
                 // Show previously loaded file
                 if (config.current_file) {
@@ -1559,6 +1663,7 @@
             document.getElementById('merge-narrators').checked = false;
             document.getElementById('orphaned-text-to-narrator-on-repair').checked = true;
             document.getElementById('auto-regenerate-bad-clip-attempts').value = 3;
+            document.getElementById('proofread-threshold').value = 1.0;
         };
 
         // Toggle chevron on collapse
@@ -1628,6 +1733,9 @@
                         : [],
                     merge_narrators: document.getElementById('merge-narrators').checked,
                     orphaned_text_to_narrator_on_repair: document.getElementById('orphaned-text-to-narrator-on-repair').checked
+                },
+                proofread: {
+                    certainty_threshold: parseFloat(document.getElementById('proofread-threshold').value) || 1.0
                 }
             };
             try {
@@ -2702,8 +2810,11 @@
         let isPlayingSequence = false;
         let cachedChunks = []; // Cache to track changes
         let cachedVisibleChunkIds = [];
+        let cachedProofreadVisibleChunkIds = [];
         let selectedEditorChapter = WHOLE_PROJECT_CHAPTER_ID;
         let editorChapterAutoSelected = false;
+        let selectedProofreadChapter = WHOLE_PROJECT_CHAPTER_ID;
+        let proofreadChapterAutoSelected = false;
         let audioQueuePollTimer = null;
         let latestAudioState = null;
         let renderPrepComplete = false;
@@ -2962,6 +3073,337 @@
             return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unitIndex]}`;
         }
 
+        function getProofreadVisibleChunks(chunks) {
+            if (selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID) {
+                return chunks;
+            }
+            return chunks.filter(chunk => getChunkChapterName(chunk) === selectedProofreadChapter);
+        }
+
+        function syncProofreadChapterState(chunks) {
+            const select = document.getElementById('proofread-chapter-select');
+            const summary = document.getElementById('proofread-chapter-summary');
+            if (!select || !summary) return;
+
+            const options = buildEditorChapterOptions(chunks);
+            const firstRealChapter = options.find(option => option.id !== WHOLE_PROJECT_CHAPTER_ID);
+            if (!proofreadChapterAutoSelected && selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID && firstRealChapter) {
+                selectedProofreadChapter = firstRealChapter.id;
+                proofreadChapterAutoSelected = true;
+            }
+            if (!options.some(option => option.id === selectedProofreadChapter)) {
+                selectedProofreadChapter = firstRealChapter ? firstRealChapter.id : WHOLE_PROJECT_CHAPTER_ID;
+            }
+
+            const optionsHtml = options.map(option => `
+                <option value="${escapeHtml(option.id)}"${option.id === selectedProofreadChapter ? ' selected' : ''}>
+                    ${escapeHtml(option.label)} (${option.count})
+                </option>
+            `).join('');
+            const optionsSignature = JSON.stringify(options.map(option => ({
+                id: option.id,
+                count: option.count,
+                selected: option.id === selectedProofreadChapter,
+            })));
+
+            if (select.dataset.optionsSignature !== optionsSignature) {
+                select.innerHTML = optionsHtml;
+                select.dataset.optionsSignature = optionsSignature;
+            } else if (select.value !== selectedProofreadChapter) {
+                select.value = selectedProofreadChapter;
+            }
+
+            const visibleCount = getProofreadVisibleChunks(chunks).length;
+            const viewLabel = selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID
+                ? `Showing all ${visibleCount} segments.`
+                : `Showing ${visibleCount} segments from ${selectedProofreadChapter}.`;
+            summary.textContent = viewLabel;
+        }
+
+        function getProofreadThreshold() {
+            const input = document.getElementById('proofread-threshold');
+            const value = parseFloat(input?.value || '1');
+            return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1.0;
+        }
+
+        function getProofreadRowStyle(chunk, threshold) {
+            const proofread = chunk?.proofread || null;
+            if (!proofread || !proofread.checked) return '';
+            if (proofread.speaker_match === false || proofread.auto_failed_reason === 'speaker_mismatch') {
+                return 'background-color: rgba(90, 0, 0, 0.82); color: #fff;';
+            }
+            const score = Number(proofread.score);
+            if (!Number.isFinite(score)) return '';
+            if (score >= threshold) {
+                return 'background-color: rgba(25, 135, 84, 0.10);';
+            }
+            const ratio = threshold > 0 ? Math.max(0, Math.min(1, 1 - (score / threshold))) : 1;
+            const alpha = 0.08 + (ratio * 0.58);
+            return `background-color: rgba(140, 0, 0, ${alpha.toFixed(3)});`;
+        }
+
+        function getProofreadBadge(chunk, threshold) {
+            const proofread = chunk?.proofread || null;
+            if (!proofread || !proofread.checked) {
+                return '<span class="badge bg-secondary">Not checked</span>';
+            }
+            if (proofread.speaker_match === false) {
+                return '<span class="badge bg-danger">Speaker mismatch</span>';
+            }
+            if (proofread.auto_failed_reason === 'duration_outlier') {
+                return '<span class="badge bg-danger">Length outlier</span>';
+            }
+            if (Number(proofread.score) >= threshold) {
+                return '<span class="badge bg-success">Passed</span>';
+            }
+            return '<span class="badge bg-warning text-dark">Needs review</span>';
+        }
+
+        function shouldShowProofreadRegenerate(chunk) {
+            const hasAudio = Boolean((chunk?.audio_path || '').trim());
+            if (!hasAudio) return true;
+            const proofread = chunk?.proofread || null;
+            return Boolean(proofread && proofread.checked && !proofread.passed);
+        }
+
+        function getProofreadFingerprint(chunk, threshold) {
+            const proofread = chunk?.proofread || {};
+            return [
+                getChunkRef(chunk),
+                chunk?.audio_path || '',
+                chunk?.status || '',
+                threshold,
+                proofread.checked ? 1 : 0,
+                proofread.score ?? '',
+                proofread.passed ? 1 : 0,
+                proofread.error || '',
+                proofread.transcript_text || '',
+                proofread.actual_duration_sec ?? '',
+                proofread.expected_duration_sec ?? '',
+                proofread.auto_failed_reason || '',
+                proofread.speaker_match ? 1 : 0,
+            ].join('|');
+        }
+
+        function updateProofreadRow(chunk, threshold = getProofreadThreshold()) {
+            const chunkRef = getChunkRef(chunk);
+            const row = document.querySelector(`tr[data-proofread-id="${chunkRef}"]`);
+            if (!row) return false;
+
+            const proofread = chunk.proofread || {};
+            const score = Number.isFinite(Number(proofread.score)) ? Number(proofread.score).toFixed(3) : '—';
+            const transcript = proofread.transcript_text
+                ? escapeHtml(proofread.transcript_text)
+                : '<span class="text-muted small">No transcript captured</span>';
+            const detail = proofread.error
+                ? `<div class="small ${Number(proofread.score) >= threshold ? 'text-muted' : 'text-danger'} mt-1">${escapeHtml(proofread.error)}</div>`
+                : '';
+            const durationDetail = proofread.actual_duration_sec != null
+                ? `<div class="small text-muted mt-1">Duration ${proofread.actual_duration_sec}s vs expected ${proofread.expected_duration_sec || 0}s</div>`
+                : '';
+            const regenButton = shouldShowProofreadRegenerate(chunk)
+                ? `<button class="btn btn-sm btn-outline-danger mt-2" onclick='regenerateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-redo me-1"></i>Generate/Regenerate</button>`
+                : '';
+
+            row.style.cssText = getProofreadRowStyle(chunk, threshold);
+
+            const scoreCell = row.children[2];
+            const transcriptCell = row.children[3];
+            const audioCell = row.children[4];
+            if (scoreCell) {
+                scoreCell.innerHTML = `
+                    ${getProofreadBadge(chunk, threshold)}
+                    <div class="small mt-1">Score: ${score}</div>
+                    ${detail}
+                `;
+            }
+            if (transcriptCell) {
+                transcriptCell.innerHTML = `<div>${transcript}</div>${durationDetail}`;
+            }
+            if (audioCell) {
+                const audioHtml = chunk.audio_path
+                    ? `<audio controls src="/${chunk.audio_path}" style="width: 210px; height: 30px;"></audio>`
+                    : '<span class="text-muted small">No audio</span>';
+                audioCell.innerHTML = `${audioHtml}<div>${regenButton}</div>`;
+            }
+            row.dataset.proofreadFingerprint = getProofreadFingerprint(chunk, threshold);
+            return true;
+        }
+
+        function renderProofreadTable(chunks) {
+            const tbody = document.getElementById('proofread-table-body');
+            if (!tbody) return;
+            const visibleChunks = getProofreadVisibleChunks(chunks);
+            const threshold = getProofreadThreshold();
+
+            if (!visibleChunks.length) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No segments in this chapter yet.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = visibleChunks.map(chunk => {
+                const proofread = chunk.proofread || {};
+                const chunkRef = getChunkRef(chunk);
+                const score = Number.isFinite(Number(proofread.score)) ? Number(proofread.score).toFixed(3) : '—';
+                const transcript = proofread.transcript_text
+                    ? escapeHtml(proofread.transcript_text)
+                    : '<span class="text-muted small">No transcript captured</span>';
+                const detail = proofread.error
+                    ? `<div class="small ${Number(proofread.score) >= threshold ? 'text-muted' : 'text-danger'} mt-1">${escapeHtml(proofread.error)}</div>`
+                    : '';
+                const durationDetail = proofread.actual_duration_sec != null
+                    ? `<div class="small text-muted mt-1">Duration ${proofread.actual_duration_sec}s vs expected ${proofread.expected_duration_sec || 0}s</div>`
+                    : '';
+                const audioHtml = chunk.audio_path
+                    ? `<audio controls src="/${chunk.audio_path}?t=${Date.now()}" style="width: 210px; height: 30px;"></audio>`
+                    : '<span class="text-muted small">No audio</span>';
+                const regenButton = shouldShowProofreadRegenerate(chunk)
+                    ? `<button class="btn btn-sm btn-outline-danger mt-2" onclick='regenerateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-redo me-1"></i>Generate/Regenerate</button>`
+                    : '';
+                return `
+                    <tr data-proofread-id="${escapeHtml(chunkRef)}" data-proofread-fingerprint="${escapeHtml(getProofreadFingerprint(chunk, threshold))}" style="${getProofreadRowStyle(chunk, threshold)}">
+                        <td>${escapeHtml(chunk.speaker || '')}</td>
+                        <td>
+                            <div class="fw-semibold small text-muted mb-1">${escapeHtml(getChunkChapterName(chunk) || 'No chapter')}</div>
+                            <div>${escapeHtml(chunk.text || '')}</div>
+                        </td>
+                        <td>
+                            ${getProofreadBadge(chunk, threshold)}
+                            <div class="small mt-1">Score: ${score}</div>
+                            ${detail}
+                        </td>
+                        <td>
+                            <div>${transcript}</div>
+                            ${durationDetail}
+                        </td>
+                        <td>${audioHtml}<div>${regenButton}</div></td>
+                    </tr>
+                `;
+            }).join('');
+            cachedProofreadVisibleChunkIds = visibleChunks.map(chunk => getChunkRef(chunk));
+        }
+
+        function renderProofreadTaskStatus(status) {
+            const progress = status?.progress || {};
+            document.getElementById('proofread-phase').textContent = progress.phase || (status?.running ? 'proofreading' : 'Idle');
+            document.getElementById('proofread-progress').textContent = `${progress.processed || 0} / ${progress.pending_total || progress.pending_clips || 0}`;
+            document.getElementById('proofread-eta').textContent = formatDuration(progress.eta_seconds);
+            document.getElementById('proofread-elapsed').textContent = formatDuration(progress.elapsed_seconds || 0);
+            document.getElementById('proofread-passed').textContent = formatNumber(progress.passed || 0);
+            document.getElementById('proofread-failed').textContent = formatNumber(progress.failed || 0);
+            document.getElementById('proofread-auto-failed').textContent = formatNumber(progress.auto_failed || 0);
+            document.getElementById('proofread-skipped').textContent = formatNumber(progress.skipped || 0);
+
+            const summary = document.getElementById('proofread-run-summary');
+            const chapterLabel = selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID ? 'the whole project' : selectedProofreadChapter;
+            if (status?.running) {
+                summary.textContent = `Proofreading ${chapterLabel} at certainty ${getProofreadThreshold().toFixed(2)}.`;
+            } else if ((status?.logs || []).length) {
+                summary.textContent = status.logs[status.logs.length - 1] || '';
+            } else {
+                summary.textContent = '';
+            }
+
+            const running = !!status?.running;
+            document.getElementById('btn-proofread-sequence').disabled = running;
+            document.getElementById('btn-proofread-book').disabled = running;
+        }
+
+        window.changeProofreadChapter = async (chapterId) => {
+            selectedProofreadChapter = chapterId || WHOLE_PROJECT_CHAPTER_ID;
+            renderProofreadTable(cachedChunks);
+            syncProofreadChapterState(cachedChunks);
+            renderProofreadTaskStatus(await API.get('/api/status/proofread'));
+        };
+
+        window.saveProofreadThreshold = async () => {
+            const thresholdInput = document.getElementById('proofread-threshold');
+            const threshold = getProofreadThreshold();
+            thresholdInput.value = threshold.toFixed(2).replace(/\.00$/, '.0');
+            try {
+                const config = await API.get('/api/config');
+                config.proofread = { ...(config.proofread || {}), certainty_threshold: threshold };
+                await API.post('/api/config', config);
+                renderProofreadTable(cachedChunks);
+            } catch (e) {
+                showToast('Failed to save proofread certainty: ' + e.message, 'error');
+            }
+        };
+
+        async function startProofreadRun(chapter) {
+            const threshold = getProofreadThreshold();
+            const payload = {
+                threshold,
+                chapter: chapter === WHOLE_PROJECT_CHAPTER_ID ? null : chapter,
+            };
+            await API.post('/api/proofread', payload);
+            await pollLogs('proofread', 'proofread-logs');
+            await loadChunks(false);
+        }
+
+        window.startProofreadSequence = async () => {
+            try {
+                await startProofreadRun(selectedProofreadChapter);
+                showToast('Proofread run finished.', 'success', 4000);
+            } catch (e) {
+                showToast('Proofread failed: ' + e.message, 'error');
+            }
+        };
+
+        window.startProofreadEntireBook = async () => {
+            try {
+                await startProofreadRun(null);
+                showToast('Full-book proofread finished.', 'success', 4000);
+            } catch (e) {
+                showToast('Proofread failed: ' + e.message, 'error');
+            }
+        };
+
+        window.regenerateProofreadChunk = async (chunkRef) => {
+            try {
+                await API.post(`/api/chunks/${encodeURIComponent(chunkRef)}/regenerate`, {});
+                showToast('Regeneration started for the selected clip.', 'success', 3000);
+                await loadChunks(false);
+                ensureAudioQueuePolling();
+            } catch (e) {
+                showToast('Failed to regenerate clip: ' + e.message, 'error');
+            }
+        };
+
+        async function clearProofreadFailures(chapter) {
+            const threshold = getProofreadThreshold();
+            const payload = {
+                threshold,
+                chapter: chapter === WHOLE_PROJECT_CHAPTER_ID ? null : chapter,
+            };
+            const result = await API.post('/api/proofread/clear_failures', payload);
+            if (result.ungraded_with_audio > 0) {
+                showToast('Only graded audio will be deleted. Grade your complete book for a more exhaustive result.', 'warning', 7000);
+            }
+            await loadChunks(false);
+            if (result.cleared > 0) {
+                showToast(`Cleared ${result.cleared} failed clip${result.cleared === 1 ? '' : 's'}.`, 'success', 4000);
+            } else {
+                showToast('No graded failed clips were found in the selected scope.', 'info', 4000);
+            }
+        }
+
+        window.clearProofreadFailuresLocal = async () => {
+            try {
+                await clearProofreadFailures(selectedProofreadChapter);
+            } catch (e) {
+                showToast('Failed to clear local failures: ' + e.message, 'error');
+            }
+        };
+
+        window.clearProofreadFailuresBook = async () => {
+            try {
+                await clearProofreadFailures(null);
+            } catch (e) {
+                showToast('Failed to clear book failures: ' + e.message, 'error');
+            }
+        };
+
         function renderEditorProgressBar(chunks, audioState = latestAudioState) {
             const progressBar = document.getElementById('full-progress-bar');
             if (!progressBar) return;
@@ -3149,12 +3591,37 @@
                     tbody.innerHTML = '<tr><td colspan="6" class="text-center">No chunks found. Please generate script first.</td></tr>';
                     cachedChunks = [];
                     cachedVisibleChunkIds = [];
+                    cachedProofreadVisibleChunkIds = [];
                     syncEditorChapterState([]);
+                    syncProofreadChapterState([]);
+                    renderProofreadTable([]);
                     refreshDictionaryCounts([]);
                     return;
                 }
 
                 syncEditorChapterState(chunks);
+                syncProofreadChapterState(chunks);
+                const proofreadVisibleChunks = getProofreadVisibleChunks(chunks);
+                const canIncrementProofread = !forceFullRedraw &&
+                    cachedProofreadVisibleChunkIds.length === proofreadVisibleChunks.length &&
+                    cachedProofreadVisibleChunkIds.every((id, index) => id === getChunkRef(proofreadVisibleChunks[index])) &&
+                    document.querySelectorAll('#proofread-table-body tr[data-proofread-id]').length === proofreadVisibleChunks.length;
+
+                if (canIncrementProofread) {
+                    const threshold = getProofreadThreshold();
+                    proofreadVisibleChunks.forEach(chunk => {
+                        const chunkRef = getChunkRef(chunk);
+                        const row = document.querySelector(`tr[data-proofread-id="${chunkRef}"]`);
+                        const nextFingerprint = getProofreadFingerprint(chunk, threshold);
+                        const currentFingerprint = row?.dataset?.proofreadFingerprint || '';
+                        if (!row || currentFingerprint !== nextFingerprint) {
+                            updateProofreadRow(chunk, threshold);
+                        }
+                    });
+                    cachedProofreadVisibleChunkIds = proofreadVisibleChunks.map(chunk => getChunkRef(chunk));
+                } else {
+                    renderProofreadTable(chunks);
+                }
                 const visibleChunks = getVisibleChunks(chunks);
 
                 // Update Full Progress Bar
@@ -3957,6 +4424,7 @@
             review: 'script-logs',
             sanity: 'script-logs',
             repair: 'script-logs',
+            proofread: 'proofread-logs',
             audio: 'audio-logs',
             lora_training: 'lora-train-logs',
         };
@@ -4019,6 +4487,11 @@
             const logs = Array.isArray(status.logs) ? status.logs : [];
             if (taskName === 'audio') {
                 renderAudioMergeProgress(status);
+            } else if (taskName === 'proofread') {
+                renderProofreadTaskStatus(status);
+                if (status.running) {
+                    loadChunks(false).catch(err => console.error('Failed to refresh proofread rows', err));
+                }
             }
             if ('value' in el && el.tagName === 'TEXTAREA') {
                 el.value = logs.join('\n');
@@ -4057,6 +4530,8 @@
                 if (document.getElementById('editor-tab').style.display !== 'none') {
                     loadChunks();
                 }
+            } else if (taskName === 'proofread') {
+                loadChunks(false).catch(err => console.error('Failed to refresh chunks after proofreading', err));
             }
         }
 

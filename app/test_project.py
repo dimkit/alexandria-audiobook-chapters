@@ -1362,6 +1362,187 @@ class RepairLostAudioLinksTests(unittest.TestCase):
             self.manager.transcribe_audio_path = original_transcribe
             self.manager._validate_audio_path_for_chunk = original_validate
 
+    def test_proofread_uses_alias_tolerant_speaker_match(self):
+        uid = "0123456789abcdef0123456789abcdef"
+        self._write_wav(f"voicelines/voiceline_{uid}_narrator.wav", 2.0)
+        self.manager._save_voice_config({
+            "Guide": {
+                "alias": "Narrator",
+            },
+            "Narrator": {},
+        })
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": uid,
+                "speaker": "Guide",
+                "text": "The stars aligned in perfect silence.",
+                "instruct": "",
+                "status": "done",
+                "audio_path": f"voicelines/voiceline_{uid}_narrator.wav",
+                "audio_validation": None,
+                "auto_regen_count": 0,
+                "chapter": "Prologue",
+            },
+        ])
+
+        original_transcribe = self.manager.transcribe_audio_path
+        try:
+            self.manager.transcribe_audio_path = lambda relative_path: {
+                "text": "The stars aligned in perfect silence.",
+                "normalized_text": self.manager._normalize_asr_text("The stars aligned in perfect silence."),
+            }
+            result = self.manager.proofread_chunks(chapter="Prologue", threshold=0.9)
+            chunks = self.manager.load_chunks()
+            proofread = chunks[0]["proofread"]
+
+            self.assertEqual(result["processed"], 1)
+            self.assertTrue(proofread["speaker_match"])
+            self.assertGreaterEqual(proofread["score"], 0.9)
+        finally:
+            self.manager.transcribe_audio_path = original_transcribe
+
+    def test_proofread_auto_fails_large_duration_mismatch_without_asr(self):
+        uid = "fedcba9876543210fedcba9876543210"
+        self._write_wav(f"voicelines/voiceline_{uid}_narrator.wav", 0.25)
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": uid,
+                "speaker": "Narrator",
+                "text": "This is a much longer line that should auto fail due to duration mismatch without transcription.",
+                "instruct": "",
+                "status": "done",
+                "audio_path": f"voicelines/voiceline_{uid}_narrator.wav",
+                "audio_validation": None,
+                "auto_regen_count": 0,
+                "chapter": "Prologue",
+            },
+        ])
+
+        original_transcribe = self.manager.transcribe_audio_path
+        try:
+            def should_not_run(relative_path):
+                raise AssertionError("ASR should not run for obvious duration outliers")
+            self.manager.transcribe_audio_path = should_not_run
+            result = self.manager.proofread_chunks(chapter="Prologue", threshold=1.0)
+            chunks = self.manager.load_chunks()
+            proofread = chunks[0]["proofread"]
+
+            self.assertEqual(result["processed"], 1)
+            self.assertEqual(result["auto_failed"], 1)
+            self.assertEqual(proofread["score"], 0.0)
+            self.assertEqual(proofread["auto_failed_reason"], "duration_outlier")
+        finally:
+            self.manager.transcribe_audio_path = original_transcribe
+
+    def test_update_chunk_clears_proofread_state(self):
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "u0",
+                "speaker": "Narrator",
+                "text": "Original line.",
+                "instruct": "",
+                "status": "done",
+                "audio_path": "voicelines/example.wav",
+                "audio_validation": None,
+                "auto_regen_count": 0,
+                "proofread": {
+                    "checked": True,
+                    "score": 1.0,
+                },
+            },
+        ])
+
+        updated = self.manager.update_chunk("u0", {"text": "Updated line."})
+        self.assertNotIn("proofread", updated)
+        reloaded = self.manager.load_chunks()
+        self.assertNotIn("proofread", reloaded[0])
+
+    def test_prepare_chunk_for_regeneration_removes_old_audio_and_clears_state(self):
+        audio_path = "voicelines/voiceline_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_narrator.wav"
+        self._write_wav(audio_path, 1.0)
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "speaker": "Narrator",
+                "text": "Regenerate this line.",
+                "instruct": "",
+                "status": "error",
+                "audio_path": audio_path,
+                "audio_validation": {"error": "bad clip"},
+                "auto_regen_count": 2,
+                "proofread": {"checked": True, "score": 0.1},
+            },
+        ])
+
+        prepared = self.manager.prepare_chunk_for_regeneration("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        self.assertIsNotNone(prepared)
+        self.assertFalse(os.path.exists(os.path.join(self.root_dir, audio_path)))
+
+        reloaded = self.manager.load_chunks()
+        self.assertIsNone(reloaded[0]["audio_path"])
+        self.assertIsNone(reloaded[0]["audio_validation"])
+        self.assertEqual(reloaded[0]["status"], "pending")
+        self.assertNotIn("proofread", reloaded[0])
+
+    def test_clear_proofread_failures_clears_only_failed_graded_audio(self):
+        failed_audio = "voicelines/voiceline_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb_narrator.wav"
+        passed_audio = "voicelines/voiceline_cccccccccccccccccccccccccccccccc_narrator.wav"
+        ungraded_audio = "voicelines/voiceline_dddddddddddddddddddddddddddddddd_narrator.wav"
+        self._write_wav(failed_audio, 1.0)
+        self._write_wav(passed_audio, 1.0)
+        self._write_wav(ungraded_audio, 1.0)
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "speaker": "Narrator",
+                "text": "Failed clip.",
+                "status": "done",
+                "audio_path": failed_audio,
+                "audio_validation": None,
+                "proofread": {"checked": True, "score": 0.2, "passed": False},
+                "chapter": "Chapter One",
+            },
+            {
+                "id": 1,
+                "uid": "cccccccccccccccccccccccccccccccc",
+                "speaker": "Narrator",
+                "text": "Passed clip.",
+                "status": "done",
+                "audio_path": passed_audio,
+                "audio_validation": None,
+                "proofread": {"checked": True, "score": 1.0, "passed": True},
+                "chapter": "Chapter One",
+            },
+            {
+                "id": 2,
+                "uid": "dddddddddddddddddddddddddddddddd",
+                "speaker": "Narrator",
+                "text": "Ungraded clip.",
+                "status": "done",
+                "audio_path": ungraded_audio,
+                "audio_validation": None,
+                "chapter": "Chapter One",
+            },
+        ])
+
+        result = self.manager.clear_proofread_failures(chapter="Chapter One", threshold=1.0)
+        reloaded = self.manager.load_chunks()
+
+        self.assertEqual(result["cleared"], 1)
+        self.assertEqual(result["ungraded_with_audio"], 1)
+        self.assertFalse(os.path.exists(os.path.join(self.root_dir, failed_audio)))
+        self.assertTrue(os.path.exists(os.path.join(self.root_dir, passed_audio)))
+        self.assertTrue(os.path.exists(os.path.join(self.root_dir, ungraded_audio)))
+        self.assertIsNone(reloaded[0]["audio_path"])
+        self.assertNotIn("proofread", reloaded[0])
+        self.assertEqual(reloaded[1]["audio_path"], passed_audio)
+        self.assertEqual(reloaded[2]["audio_path"], ungraded_audio)
+
 
 if __name__ == "__main__":
     unittest.main()

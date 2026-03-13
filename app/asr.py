@@ -15,12 +15,16 @@ class LocalASREngine:
         compute_type: str = "auto",
         language: Optional[str] = "en",
         beam_size: int = 1,
+        cpu_threads: int = 0,
+        num_workers: int = 1,
     ):
         self.model_size = (model_size or "small.en").strip()
         self.device = (device or "auto").strip().lower()
         self.compute_type = (compute_type or "auto").strip().lower()
         self.language = (language or "en").strip() or None
         self.beam_size = max(int(beam_size or 1), 1)
+        self.cpu_threads = max(int(cpu_threads or 0), 0)
+        self.num_workers = max(int(num_workers or 1), 1)
         self._model = None
         self._lock = threading.Lock()
 
@@ -63,6 +67,8 @@ class LocalASREngine:
                 self.model_size,
                 device=resolved_device,
                 compute_type=resolved_compute_type,
+                cpu_threads=self.cpu_threads,
+                num_workers=self.num_workers,
             )
             return self._model
 
@@ -91,4 +97,6 @@ class LocalASREngine:
             "model_size": self.model_size,
             "device": self._resolve_device(),
             "compute_type": self._resolve_compute_type(self._resolve_device()),
+            "cpu_threads": self.cpu_threads,
+            "num_workers": self.num_workers,
         }

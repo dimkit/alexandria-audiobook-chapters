@@ -3,6 +3,7 @@ import json
 import shutil
 import subprocess
 import threading
+import concurrent.futures
 import zipfile
 import io
 import re
@@ -10,7 +11,7 @@ import time
 import copy
 import tempfile
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from tts import (
     TTSEngine,
@@ -20,6 +21,7 @@ from tts import (
     SAME_SPEAKER_PAUSE_MS
 )
 from audio_validation import get_audio_duration_seconds, validate_audio_clip
+from audio_validation import estimate_expected_duration_seconds
 from asr import LocalASREngine, LocalASRUnavailableError
 from pydub import AudioSegment
 from script_store import (
@@ -468,6 +470,7 @@ class ProjectManager:
         merged["audio_validation"] = None
         merged["auto_regen_count"] = 0
         merged.pop("generation_token", None)
+        self._clear_proofread_state(merged)
         return merged
 
     @staticmethod
@@ -774,6 +777,9 @@ class ProjectManager:
         settings.setdefault("repair_window", 12)
         settings.setdefault("confidence_threshold", 0.72)
         settings.setdefault("confidence_margin", 0.08)
+        cpu_count = max(os.cpu_count() or 1, 1)
+        settings.setdefault("parallel_workers", cpu_count)
+        settings.setdefault("cpu_threads", 1)
         return settings
 
     def get_asr_engine(self):
@@ -789,8 +795,135 @@ class ProjectManager:
             compute_type=settings.get("compute_type", "auto"),
             language=settings.get("language", "en"),
             beam_size=settings.get("beam_size", 1),
+            cpu_threads=settings.get("cpu_threads", 1),
+            num_workers=settings.get("parallel_workers", max(os.cpu_count() or 1, 1)),
         )
         return self.asr_engine
+
+    @staticmethod
+    def _clear_proofread_state(chunk):
+        if isinstance(chunk, dict):
+            chunk.pop("proofread", None)
+
+    def _allowed_proofread_speaker_slugs(self, speaker, voice_config=None):
+        voice_config = voice_config if voice_config is not None else self._load_voice_config()
+        allowed = set()
+        raw_speaker = (speaker or "").strip()
+        if raw_speaker:
+            slug = sanitize_filename(raw_speaker) or "speaker"
+            allowed.add(slug)
+
+        resolved = self.resolve_voice_speaker(raw_speaker, voice_config)
+        if resolved:
+            allowed.add(sanitize_filename(resolved) or "speaker")
+
+        return {slug.lower() for slug in allowed if slug}
+
+    @classmethod
+    def _proofread_similarity_metrics(cls, expected_text, transcript_text):
+        normalized_expected = cls._normalize_asr_text(expected_text)
+        normalized_transcript = cls._normalize_asr_text(transcript_text)
+        if not normalized_expected or not normalized_transcript:
+            return {
+                "score": 0.0,
+                "word_precision": 0.0,
+                "word_recall": 0.0,
+                "word_f1": 0.0,
+                "sequence_score": 0.0,
+                "length_ratio": 0.0,
+                "expected_word_count": len(normalized_expected.split()) if normalized_expected else 0,
+                "transcript_word_count": len(normalized_transcript.split()) if normalized_transcript else 0,
+            }
+
+        expected_words = normalized_expected.split()
+        transcript_words = normalized_transcript.split()
+        expected_counter = Counter(expected_words)
+        transcript_counter = Counter(transcript_words)
+        overlap = sum((expected_counter & transcript_counter).values())
+        precision = overlap / max(len(transcript_words), 1)
+        recall = overlap / max(len(expected_words), 1)
+        word_f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        sequence_score = SequenceMatcher(None, normalized_expected, normalized_transcript).ratio()
+        length_ratio = min(len(expected_words), len(transcript_words)) / max(len(expected_words), len(transcript_words), 1)
+
+        score = (word_f1 * 0.6) + (sequence_score * 0.25) + (length_ratio * 0.15)
+        word_delta = abs(len(expected_words) - len(transcript_words))
+        if word_delta >= 2:
+            score *= max(0.0, 1.0 - (word_delta / max(len(expected_words), 1)))
+
+        if normalized_expected == normalized_transcript:
+            score = 1.0
+
+        return {
+            "score": round(max(0.0, min(score, 1.0)), 4),
+            "word_precision": round(precision, 4),
+            "word_recall": round(recall, 4),
+            "word_f1": round(word_f1, 4),
+            "sequence_score": round(sequence_score, 4),
+            "length_ratio": round(length_ratio, 4),
+            "expected_word_count": len(expected_words),
+            "transcript_word_count": len(transcript_words),
+        }
+
+    def _build_chunk_proofread_result(self, chunk, threshold, voice_config, dictionary_entries):
+        audio_path = (chunk.get("audio_path") or "").strip()
+        full_audio_path = os.path.join(self.root_dir, audio_path)
+        expected_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
+        actual_duration_sec = get_audio_duration_seconds(full_audio_path)
+        expected_duration_sec = estimate_expected_duration_seconds(text=expected_text)
+        duration_delta_sec = abs(actual_duration_sec - expected_duration_sec)
+        checked_at = time.time()
+
+        parsed_audio = self._parse_chunk_audio_candidate_name(os.path.basename(audio_path))
+        audio_speaker_slug = (parsed_audio or {}).get("speaker_slug") or ""
+        allowed_speaker_slugs = self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config)
+        speaker_match = bool(audio_speaker_slug) and audio_speaker_slug in allowed_speaker_slugs
+
+        base = {
+            "checked": True,
+            "checked_at": checked_at,
+            "threshold": float(threshold),
+            "audio_path": audio_path,
+            "speaker_match": speaker_match,
+            "expected_duration_sec": round(expected_duration_sec, 3),
+            "actual_duration_sec": round(actual_duration_sec, 3),
+            "duration_delta_sec": round(duration_delta_sec, 3),
+            "transcript_text": "",
+        }
+
+        if not speaker_match:
+            return base | {
+                "score": 0.0,
+                "passed": False,
+                "error": "Audio filename speaker does not match the chunk speaker.",
+                "auto_failed_reason": "speaker_mismatch",
+            }
+
+        if duration_delta_sec > 5.0:
+            return base | {
+                "score": 0.0,
+                "passed": False,
+                "error": (
+                    f"Audio duration differs from expected speech length by {duration_delta_sec:.1f}s."
+                ),
+                "auto_failed_reason": "duration_outlier",
+            }
+
+        transcript = self.transcribe_audio_path(audio_path)
+        metrics = self._proofread_similarity_metrics(expected_text, transcript.get("text", ""))
+        score = metrics["score"]
+        return base | metrics | {
+            "score": score,
+            "passed": score >= float(threshold),
+            "error": None if score >= float(threshold) else "Transcript confidence below threshold.",
+            "auto_failed_reason": None,
+            "transcript_text": transcript.get("text", ""),
+        }
+
+    def _commit_proofread_result_locked(self, chunks, index, proofread_result):
+        chunks[index]["proofread"] = proofread_result
+        self._atomic_json_write(chunks, self.chunks_path)
+        return chunks[index]["proofread"]
 
     @staticmethod
     def _normalize_asr_text(text):
@@ -825,6 +958,34 @@ class ProjectManager:
         result = self.get_asr_engine().transcribe_file(full_path)
         result["normalized_text"] = self._normalize_asr_text(result.get("text"))
         return result
+
+    def transcribe_audio_paths_bulk(self, relative_audio_paths, progress_callback=None):
+        paths = [path for path in relative_audio_paths if path]
+        if not paths:
+            return {}
+
+        engine = self.get_asr_engine()
+        max_workers = max(int(getattr(engine, "num_workers", 1) or 1), 1)
+        results = {}
+
+        def transcribe_one(path):
+            return path, self.transcribe_audio_path(path)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(transcribe_one, path): path
+                for path in paths
+            }
+            completed = 0
+            total = len(futures)
+            for future in concurrent.futures.as_completed(futures):
+                path = futures[future]
+                completed += 1
+                results[path] = future.result()[1]
+                if progress_callback and (completed <= 3 or completed % 25 == 0 or completed == total):
+                    progress_callback(completed, total, path)
+
+        return results
 
     def load_chunks(self):
         if os.path.exists(self.chunks_path):
@@ -1353,6 +1514,47 @@ class ProjectManager:
                     "asr_candidates_total": len(asr_candidates),
                     "elapsed_seconds": round(time.time() - asr_started_at, 2),
                 })
+                transcribe_paths = [
+                    candidate["relative_path"]
+                    for candidate in asr_candidates
+                    if candidate["relative_path"] not in claimed_audio_paths
+                ]
+                if transcribe_paths:
+                    try:
+                        transcript_cache.update(
+                            self.transcribe_audio_paths_bulk(
+                                transcribe_paths,
+                                progress_callback=lambda completed, total, path: emit_progress({
+                                    "phase": "asr_transcribe",
+                                    "message": (
+                                        f"Transcribed {completed}/{total} ASR repair clip(s) in parallel. "
+                                        f"Latest: {path}"
+                                    ),
+                                    "asr_transcribed": completed,
+                                    "asr_transcribe_total": total,
+                                    "elapsed_seconds": round(time.time() - asr_started_at, 2),
+                                }),
+                            )
+                        )
+                    except LocalASRUnavailableError as e:
+                        asr_errors.append(str(e))
+                        emit_progress({
+                            "phase": "asr",
+                            "message": f"ASR unavailable: {e}",
+                            "asr_errors": list(asr_errors),
+                            "elapsed_seconds": round(time.time() - asr_started_at, 2),
+                        })
+                        return {
+                            "relinked": relinked,
+                            "preserved": preserved,
+                            "invalid_candidates": invalid_candidates,
+                            "unmatched_files": unmatched_files,
+                            "total_candidates": total_candidates,
+                            "asr_relinked": asr_relinked,
+                            "asr_enabled": bool(use_asr),
+                            "asr_errors": asr_errors[:10],
+                            "examples": examples,
+                        }
                 for asr_index, candidate in enumerate(asr_candidates, start=1):
                     if candidate["relative_path"] in claimed_audio_paths:
                         if asr_index % 100 == 0:
@@ -1504,6 +1706,252 @@ class ProjectManager:
                 "examples": examples,
             }
 
+    def proofread_chunks(self, chapter=None, threshold=1.0, progress_callback=None):
+        def emit_progress(payload):
+            if progress_callback:
+                progress_callback(payload)
+
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return {
+                    "processed": 0,
+                    "skipped": 0,
+                    "auto_failed": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "chapter": chapter,
+                    "threshold": float(threshold),
+                }
+
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            started_at = time.time()
+            dictionary_entries = self.load_dictionary_entries()
+            voice_config = self._load_voice_config()
+
+            scoped_indices = [
+                index for index, chunk in enumerate(chunks)
+                if self._chunk_in_scope(chunk, chapter)
+                and (chunk.get("audio_path") or "").strip()
+                and os.path.exists(os.path.join(self.root_dir, chunk.get("audio_path")))
+            ]
+            pending_indices = [
+                index for index in scoped_indices
+                if not bool((chunks[index].get("proofread") or {}).get("checked"))
+            ]
+
+            emit_progress({
+                "phase": "scan",
+                "message": (
+                    f"Proofread scan found {len(scoped_indices)} clip(s) in scope, "
+                    f"{len(pending_indices)} still need checking."
+                ),
+                "chapter": chapter,
+                "threshold": float(threshold),
+                "scoped_clips": len(scoped_indices),
+                "pending_clips": len(pending_indices),
+                "elapsed_seconds": round(time.time() - started_at, 2),
+            })
+
+            processed = 0
+            skipped = len(scoped_indices) - len(pending_indices)
+            auto_failed = 0
+            passed = 0
+            failed = 0
+
+            precomputed_results = {}
+            asr_needed = []
+            for index in pending_indices:
+                chunk = chunks[index]
+                audio_path = (chunk.get("audio_path") or "").strip()
+                full_audio_path = os.path.join(self.root_dir, audio_path)
+                expected_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
+                actual_duration_sec = get_audio_duration_seconds(full_audio_path)
+                expected_duration_sec = estimate_expected_duration_seconds(text=expected_text)
+                duration_delta_sec = abs(actual_duration_sec - expected_duration_sec)
+                parsed_audio = self._parse_chunk_audio_candidate_name(os.path.basename(audio_path))
+                audio_speaker_slug = (parsed_audio or {}).get("speaker_slug") or ""
+                allowed_speaker_slugs = self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config)
+                speaker_match = bool(audio_speaker_slug) and audio_speaker_slug in allowed_speaker_slugs
+                base = {
+                    "checked": True,
+                    "checked_at": time.time(),
+                    "threshold": float(threshold),
+                    "audio_path": audio_path,
+                    "speaker_match": speaker_match,
+                    "expected_duration_sec": round(expected_duration_sec, 3),
+                    "actual_duration_sec": round(actual_duration_sec, 3),
+                    "duration_delta_sec": round(duration_delta_sec, 3),
+                    "transcript_text": "",
+                }
+                if not speaker_match:
+                    precomputed_results[index] = base | {
+                        "score": 0.0,
+                        "passed": False,
+                        "error": "Audio filename speaker does not match the chunk speaker.",
+                        "auto_failed_reason": "speaker_mismatch",
+                    }
+                    continue
+                if duration_delta_sec > 5.0:
+                    precomputed_results[index] = base | {
+                        "score": 0.0,
+                        "passed": False,
+                        "error": f"Audio duration differs from expected speech length by {duration_delta_sec:.1f}s.",
+                        "auto_failed_reason": "duration_outlier",
+                    }
+                    continue
+                asr_needed.append((index, expected_text, base))
+
+            if asr_needed:
+                asr_started_at = time.time()
+                transcript_map = self.transcribe_audio_paths_bulk(
+                    [base["audio_path"] for _, _, base in asr_needed],
+                    progress_callback=lambda completed, total, path: emit_progress({
+                        "phase": "proofread_transcribe",
+                        "message": f"Transcribed {completed}/{total} proofread clip(s) in parallel. Latest: {path}",
+                        "transcribed": completed,
+                        "transcribe_total": total,
+                        "elapsed_seconds": round(time.time() - asr_started_at, 2),
+                    }),
+                )
+                for index, expected_text, base in asr_needed:
+                    transcript = transcript_map.get(base["audio_path"], {})
+                    metrics = self._proofread_similarity_metrics(expected_text, transcript.get("text", ""))
+                    score = metrics["score"]
+                    precomputed_results[index] = base | metrics | {
+                        "score": score,
+                        "passed": score >= float(threshold),
+                        "error": None if score >= float(threshold) else "Transcript confidence below threshold.",
+                        "auto_failed_reason": None,
+                        "transcript_text": transcript.get("text", ""),
+                    }
+
+            for ordinal, index in enumerate(pending_indices, start=1):
+                result = precomputed_results[index]
+                self._commit_proofread_result_locked(chunks, index, result)
+                processed += 1
+                if result.get("auto_failed_reason"):
+                    auto_failed += 1
+                if result.get("passed"):
+                    passed += 1
+                else:
+                    failed += 1
+
+                elapsed = time.time() - started_at
+                rate = processed / elapsed if elapsed > 0 else 0.0
+                remaining = max(len(pending_indices) - processed, 0)
+                eta = (remaining / rate) if rate > 0 else None
+                if processed <= 3 or processed % 25 == 0 or ordinal == len(pending_indices):
+                    emit_progress({
+                        "phase": "proofreading",
+                        "message": (
+                            f"Proofread {processed}/{len(pending_indices)} pending clip(s). "
+                            f"Passed {passed}, failed {failed}, auto-failed {auto_failed}, "
+                            f"skipped {skipped}. "
+                            + (f"ETA {int(eta)}s." if eta is not None else "")
+                        ).strip(),
+                        "chapter": chapter,
+                        "threshold": float(threshold),
+                        "processed": processed,
+                        "pending_total": len(pending_indices),
+                        "passed": passed,
+                        "failed": failed,
+                        "auto_failed": auto_failed,
+                        "skipped": skipped,
+                        "eta_seconds": None if eta is None else round(eta, 1),
+                        "elapsed_seconds": round(elapsed, 2),
+                        "current_chunk_index": index,
+                    })
+
+            emit_progress({
+                "phase": "complete",
+                "message": (
+                    f"Proofreading complete in {time.time() - started_at:.1f}s. "
+                    f"Processed {processed}, skipped {skipped}, passed {passed}, failed {failed}."
+                ),
+                "chapter": chapter,
+                "threshold": float(threshold),
+                "processed": processed,
+                "pending_total": len(pending_indices),
+                "passed": passed,
+                "failed": failed,
+                "auto_failed": auto_failed,
+                "skipped": skipped,
+                "elapsed_seconds": round(time.time() - started_at, 2),
+            })
+
+            return {
+                "processed": processed,
+                "skipped": skipped,
+                "auto_failed": auto_failed,
+                "passed": passed,
+                "failed": failed,
+                "chapter": chapter,
+                "threshold": float(threshold),
+            }
+
+    def clear_proofread_failures(self, chapter=None, threshold=1.0):
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return {
+                    "cleared": 0,
+                    "failed_candidates": 0,
+                    "ungraded_with_audio": 0,
+                    "chapter": chapter,
+                    "threshold": float(threshold),
+                }
+
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            cleared = 0
+            failed_candidates = 0
+            ungraded_with_audio = 0
+
+            for chunk in chunks:
+                if not self._chunk_in_scope(chunk, chapter):
+                    continue
+
+                audio_path = (chunk.get("audio_path") or "").strip()
+                if not audio_path:
+                    continue
+
+                proofread = chunk.get("proofread") or {}
+                if not proofread.get("checked"):
+                    ungraded_with_audio += 1
+                    continue
+
+                if proofread.get("passed") and float(proofread.get("score", 0.0) or 0.0) >= float(threshold):
+                    continue
+
+                failed_candidates += 1
+                full_audio_path = os.path.join(self.root_dir, audio_path)
+                if os.path.exists(full_audio_path):
+                    try:
+                        os.remove(full_audio_path)
+                    except OSError:
+                        pass
+
+                chunk["audio_path"] = None
+                chunk["audio_validation"] = None
+                chunk["status"] = "pending"
+                chunk["auto_regen_count"] = 0
+                chunk.pop("generation_token", None)
+                self._clear_proofread_state(chunk)
+                cleared += 1
+
+            if cleared:
+                self._atomic_json_write(chunks, self.chunks_path)
+
+            return {
+                "cleared": cleared,
+                "failed_candidates": failed_candidates,
+                "ungraded_with_audio": ungraded_with_audio,
+                "chapter": chapter,
+                "threshold": float(threshold),
+            }
+
     def recover_interrupted_generating_chunks(self, indices=None, generation_token=None):
         """Recover valid audio for interrupted generating chunks on restart.
 
@@ -1618,6 +2066,8 @@ class ProjectManager:
             if not (0 <= index < len(chunks)):
                 return None
             chunks[index].update(fields)
+            if "audio_path" in fields or "speaker" in fields or "text" in fields or "instruct" in fields:
+                self._clear_proofread_state(chunks[index])
             self._atomic_json_write(chunks, self.chunks_path)
             return chunks[index]
 
@@ -1689,6 +2139,8 @@ class ProjectManager:
                         chunks[index]["generation_token"] = value
                 else:
                     chunks[index][key] = value
+            if "audio_path" in fields or "speaker" in fields or "text" in fields or "instruct" in fields:
+                self._clear_proofread_state(chunks[index])
             if fields.get("status") != "generating" and "generation_token" not in fields:
                 chunks[index].pop("generation_token", None)
             self._atomic_json_write(chunks, self.chunks_path)
@@ -1900,6 +2352,7 @@ class ProjectManager:
                     chunk["status"] = "pending"
                     chunk["auto_regen_count"] = 0
                     chunk.pop("generation_token", None)
+                    self._clear_proofread_state(chunk)
                     invalidated.append(index)
 
             if invalidated:
@@ -1964,6 +2417,7 @@ class ProjectManager:
                     left_chunk["audio_validation"] = None
                     left_chunk["auto_regen_count"] = 0
                     left_chunk.pop("generation_token", None)
+                    self._clear_proofread_state(left_chunk)
 
                     right_chunk = copy.deepcopy(base_chunk)
                     right_chunk["text"] = right_text
@@ -1972,6 +2426,7 @@ class ProjectManager:
                     right_chunk["audio_validation"] = None
                     right_chunk["auto_regen_count"] = 0
                     right_chunk.pop("generation_token", None)
+                    self._clear_proofread_state(right_chunk)
 
                     chunks[index:index + 1] = [left_chunk, right_chunk]
                     changed += 1
@@ -2109,11 +2564,41 @@ class ProjectManager:
                 chunk["status"] = "pending"
                 chunk["audio_validation"] = None
                 chunk["auto_regen_count"] = 0
+                self._clear_proofread_state(chunk)
 
             print(f"update_chunk({index}): instruct='{chunk.get('instruct', '')}', speaker='{chunk.get('speaker', '')}'")
             self.save_chunks(chunks)
             return chunk
         return None
+
+    def prepare_chunk_for_regeneration(self, chunk_ref):
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return None
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+            index = self.resolve_chunk_index(chunk_ref, chunks)
+            if index is None or not (0 <= index < len(chunks)):
+                return None
+
+            chunk = chunks[index]
+            audio_path = (chunk.get("audio_path") or "").strip()
+            if audio_path:
+                full_audio_path = os.path.join(self.root_dir, audio_path)
+                if os.path.exists(full_audio_path):
+                    try:
+                        os.remove(full_audio_path)
+                    except OSError:
+                        pass
+
+            chunk["audio_path"] = None
+            chunk["audio_validation"] = None
+            chunk["status"] = "pending"
+            chunk["auto_regen_count"] = 0
+            chunk.pop("generation_token", None)
+            self._clear_proofread_state(chunk)
+            self._atomic_json_write(chunks, self.chunks_path)
+            return {"index": index, "chunk": chunk}
 
     def _load_tts_settings(self):
         return self._load_app_config().get("tts", {})
@@ -2250,6 +2735,7 @@ class ProjectManager:
                 "audio_path": audio_path,
                 "audio_validation": validation,
                 "error": None,
+                "proofread_cleared": True,
             }
 
         print(f"Chunk {index} failed audio sanity check: {validation['error']}")
@@ -2258,6 +2744,7 @@ class ProjectManager:
             "audio_path": audio_path,
             "audio_validation": validation,
             "error": validation["error"],
+            "proofread_cleared": True,
         }
 
     def generate_chunk_audio(self, index, attempt=0, generation_token=None):
