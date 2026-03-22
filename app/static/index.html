@@ -203,6 +203,21 @@
         .editor-stat-action:hover {
             background-color: var(--app-table-hover);
         }
+        .status-jump-button {
+            appearance: none;
+            border: 0;
+            background: transparent;
+            padding: 0;
+            margin: 0;
+            font: inherit;
+            color: inherit;
+            cursor: pointer;
+            text-align: left;
+        }
+        .status-jump-button:hover,
+        .status-jump-button:focus-visible {
+            text-decoration: underline;
+        }
         #proofread-table-body tr[data-proofread-id] > * {
             background-color: var(--proofread-row-bg, var(--app-card-bg)) !important;
             color: var(--proofread-row-text, var(--app-text)) !important;
@@ -1005,9 +1020,6 @@
                             <td class="align-middle text-muted px-1">|</td>
                             <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-outline-success btn-sm w-100" id="btn-regen-all" onclick="startRender(true)"><i class="fas fa-redo me-1"></i>Regenerate All</button></td>
                             <td class="text-center align-top"><button class="btn btn-danger btn-sm w-100" id="btn-cancel-render" onclick="cancelRender()" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button></td>
-                            <td class="align-middle text-muted px-1">|</td>
-                            <td class="text-center align-top" style="min-width:100px;"><button class="btn btn-warning btn-sm w-100" id="btn-merge"><i class="fas fa-file-audio me-1"></i>Merge All</button></td>
-                            <td class="text-center align-top" style="min-width:130px;"><button class="btn btn-outline-warning btn-sm w-100" id="btn-merge-optimized"><i class="fas fa-box-archive me-1"></i>Optimized Export</button></td>
                         </tr>
                         <tr>
                             <td class="text-center text-muted" style="font-size:0.7rem;">Preview generated audio in the current view</td>
@@ -1016,11 +1028,8 @@
                             <td></td>
                             <td class="text-center text-muted" style="font-size:0.7rem;">Re-render segments in the active scope from scratch</td>
                             <td></td>
-                            <td></td>
-                            <td class="text-center text-muted" style="font-size:0.7rem;">Combine all chunks into final audiobook</td>
-                            <td class="text-center text-muted" style="font-size:0.7rem;">Export <=2 hour MP3 parts in a zip</td>
                         </tr>
-                     </table>
+                    </table>
                 </div>
                 <div class="card-body">
                      <!-- Full Progress Bar -->
@@ -1178,7 +1187,7 @@
                             </div>
                             <div class="col-md-3 col-sm-6">
                                 <div class="small text-muted">Failed</div>
-                                <div class="fw-semibold" id="proofread-failed">0</div>
+                                <button type="button" class="fw-semibold status-jump-button" id="proofread-failed" onclick="jumpToFirstProofreadFailure()">0</button>
                             </div>
                             <div class="col-md-3 col-sm-6">
                                 <div class="small text-muted">Auto-failed</div>
@@ -1254,6 +1263,10 @@
                                 <div class="fw-semibold" id="audio-merge-output-size">0 B</div>
                             </div>
                         </div>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2 justify-content-center mb-3">
+                        <button class="btn btn-warning" id="btn-merge"><i class="fas fa-file-audio me-1"></i>Merge All</button>
+                        <button class="btn btn-outline-warning" id="btn-merge-optimized"><i class="fas fa-box-archive me-1"></i>Optimized Export</button>
                     </div>
                     <div id="audio-player-container" class="text-center" style="display:none;">
                         <h5>Your Audiobook</h5>
@@ -1412,7 +1425,11 @@
 
                 // Trigger tab specific loads
                 if (e.target.dataset.tab === 'editor') {
-                    loadChunks();
+                    syncEditorChunksOnNavigation()
+                        .catch(err => console.error('Editor sync error', err))
+                        .finally(() => {
+                            loadChunks();
+                        });
                     refreshAudioQueueUI().catch(err => console.error('Audio queue refresh error', err));
                     ensureAudioQueuePolling();
                 } else if (e.target.dataset.tab === 'voices') {
@@ -1486,6 +1503,17 @@
                 return res.json();
             }
         };
+
+        async function syncEditorChunksOnNavigation() {
+            try {
+                const result = await API.post('/api/chunks/sync_from_script_if_stale', {});
+                if (result?.synced) {
+                    showToast(`Editor refreshed from the latest script (${result.chunk_count || 0} chunks).`, 'info', 3500);
+                }
+            } catch (e) {
+                console.error('Failed to sync editor chunks from script:', e);
+            }
+        }
 
         const THEME_STORAGE_KEY = 'alexandria-theme';
 
@@ -1816,7 +1844,18 @@
                 throw new Error('No input file selected');
             }
 
-            await API.post('/api/generate_script', {});
+            const ingestionDecision = await resolveScriptIngestionDecision({ continueWorkflow: false });
+            if (ingestionDecision.skipImport) {
+                updateScriptTaskButtons({ running: false });
+                showToast('Existing imported script preserved. Script generation was skipped.', 'info', 5000);
+                return { status: 'skipped' };
+            }
+
+            updateScriptTaskButtons({ running: true });
+            await API.post('/api/generate_script', {
+                force_reimport: !!ingestionDecision.forceReimport,
+                skip_import: false,
+            });
             return pollLogs('script', 'script-logs');
         }
 
@@ -1825,6 +1864,7 @@
             try {
                 await startGenerateScript();
             } catch (e) {
+                updateScriptTaskButtons({ running: false });
                 const detail = e.message || 'Unknown error';
                 if (detail.includes('No input file')) {
                     statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>No file loaded. Please select a text file first.</span>';
@@ -1866,6 +1906,34 @@
         }
 
         let processingWorkflowPollTimer = null;
+        const workflowStageTaskNames = {
+            script: 'script',
+            review: 'review',
+            sanity: 'sanity',
+            repair: 'repair',
+            voices: 'voices',
+            audio: 'audio',
+        };
+
+        async function resolveScriptIngestionDecision({ continueWorkflow }) {
+            const preflight = await API.get('/api/script_ingestion/preflight');
+            if (!preflight?.warn) {
+                return { forceReimport: false, skipImport: false, skipScriptStage: false };
+            }
+
+            const confirmed = await showConfirm(
+                `${preflight.message}\n\nDo you want to completely delete the existing project and re-import the document?`
+            );
+            if (confirmed) {
+                return { forceReimport: true, skipImport: false, skipScriptStage: false };
+            }
+
+            return {
+                forceReimport: false,
+                skipImport: !continueWorkflow,
+                skipScriptStage: !!continueWorkflow,
+            };
+        }
 
         function renderProcessingWorkflowStatus(status) {
             const el = document.getElementById('processing-workflow-status');
@@ -1916,7 +1984,18 @@
         async function refreshProcessingWorkflowStatus() {
             const status = await API.get('/api/status/processing_workflow');
             renderProcessingWorkflowStatus(status);
-            if (Array.isArray(status.logs) && status.logs.length) {
+            const activeTaskName = workflowStageTaskNames[status.current_stage] || null;
+            if (status.running && activeTaskName) {
+                try {
+                    const activeTaskStatus = await API.get(`/api/status/${activeTaskName}`);
+                    renderTaskLogs(activeTaskName, activeTaskStatus, 'script-logs');
+                } catch (e) {
+                    console.error(`Failed to load active workflow task status for ${activeTaskName}`, e);
+                    if (Array.isArray(status.logs) && status.logs.length) {
+                        document.getElementById('script-logs').innerText = status.logs.join('\n');
+                    }
+                }
+            } else if (Array.isArray(status.logs) && status.logs.length) {
                 document.getElementById('script-logs').innerText = status.logs.join('\n');
             }
             const isActive = !!status.running || !!status.paused;
@@ -1925,7 +2004,18 @@
                     try {
                         const current = await API.get('/api/status/processing_workflow');
                         renderProcessingWorkflowStatus(current);
-                        if (Array.isArray(current.logs) && current.logs.length) {
+                        const currentTaskName = workflowStageTaskNames[current.current_stage] || null;
+                        if (current.running && currentTaskName) {
+                            try {
+                                const currentTaskStatus = await API.get(`/api/status/${currentTaskName}`);
+                                renderTaskLogs(currentTaskName, currentTaskStatus, 'script-logs');
+                            } catch (e) {
+                                console.error(`Failed to poll active workflow task status for ${currentTaskName}`, e);
+                                if (Array.isArray(current.logs) && current.logs.length) {
+                                    document.getElementById('script-logs').innerText = current.logs.join('\n');
+                                }
+                            }
+                        } else if (Array.isArray(current.logs) && current.logs.length) {
                             document.getElementById('script-logs').innerText = current.logs.join('\n');
                         }
                         if (!current.running && !current.paused && processingWorkflowPollTimer) {
@@ -1957,15 +2047,21 @@
 
         document.getElementById('btn-process-script').addEventListener('click', async () => {
             try {
+                const ingestionDecision = await resolveScriptIngestionDecision({ continueWorkflow: true });
                 await API.post('/api/processing/start', {
                     process_voices: document.getElementById('process-voices-toggle').checked,
                     generate_audio: document.getElementById('generate-audio-toggle').checked,
+                    force_reimport: !!ingestionDecision.forceReimport,
+                    skip_script_stage: !!ingestionDecision.skipScriptStage,
                 });
                 await refreshProcessingWorkflowStatus();
-                pollLogs('script', 'script-logs').catch(err => {
-                    console.error('Process script log polling failed', err);
-                });
-                showToast('Processing workflow started.', 'success');
+                if (ingestionDecision.skipScriptStage) {
+                    showToast('Script ingestion was skipped. Continuing with the remaining workflow stages.', 'info', 5000);
+                } else if (ingestionDecision.forceReimport) {
+                    showToast('Existing project cleared. Re-importing the source document.', 'warning', 5000);
+                } else {
+                    showToast('Processing workflow started.', 'success');
+                }
             } catch (e) {
                 showToast('Process Script failed: ' + e.message, 'error');
             }
@@ -2187,6 +2283,9 @@
                                         <button class="btn btn-sm btn-outline-secondary design-play-btn" onclick="playVoiceDesignClone(this)" ${designLoaded ? '' : 'disabled'}>
                                             Play
                                         </button>
+                                        <button class="btn btn-sm btn-outline-secondary design-download-btn" onclick="downloadVoiceDesignClone(this)" ${designLoaded ? '' : 'disabled'}>
+                                            Download
+                                        </button>
                                     </div>
                                     <input type="hidden" class="design-ref-audio" value="${config.ref_audio || ''}">
                                     <input type="hidden" class="design-generated-ref-text" value="${config.generated_ref_text || ''}">
@@ -2396,6 +2495,7 @@
             if (!card) return;
             const generateBtn = card.querySelector('.design-generate-btn');
             const playBtn = card.querySelector('.design-play-btn');
+            const downloadBtn = card.querySelector('.design-download-btn');
             const refAudioInput = card.querySelector('.design-ref-audio');
             const generatedRefTextInput = card.querySelector('.design-generated-ref-text');
             if (refAudioInput && typeof refAudio === 'string') {
@@ -2411,6 +2511,9 @@
             }
             if (playBtn) {
                 playBtn.disabled = !loaded;
+            }
+            if (downloadBtn) {
+                downloadBtn.disabled = !loaded;
             }
         }
 
@@ -2512,6 +2615,27 @@
             });
         };
 
+        window.downloadVoiceDesignClone = (btn) => {
+            const card = btn.closest('.card-body');
+            const voiceCard = btn.closest('.voice-card');
+            const refAudio = card.querySelector('.design-ref-audio')?.value;
+            if (!refAudio) {
+                showToast('No reusable voice sample is available yet.', 'warning');
+                return;
+            }
+
+            const speaker = (voiceCard?.dataset.voice || 'voice-sample').trim();
+            const extensionMatch = refAudio.match(/(\.[a-z0-9]+)$/i);
+            const extension = extensionMatch ? extensionMatch[1] : '.wav';
+            const safeSpeaker = speaker.replace(/[^a-z0-9._-]+/gi, '_');
+            const link = document.createElement('a');
+            link.href = `/${refAudio}?t=${Date.now()}`;
+            link.download = `${safeSpeaker}${extension}`;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        };
+
         window.generateOutstandingVoices = async () => {
             const bulkBtn = document.getElementById('generate-outstanding-voices-btn');
             const eligibleSpeakers = Array.from(document.querySelectorAll('.voice-card'))
@@ -2529,6 +2653,7 @@
             const originalText = bulkBtn.textContent;
             try {
                 let generatedCount = 0;
+                const failedSpeakers = [];
                 for (let i = 0; i < eligibleSpeakers.length; i += 1) {
                     const speaker = eligibleSpeakers[i];
                     const voiceCard = getVoiceCardByName(speaker);
@@ -2548,28 +2673,42 @@
                         continue;
                     }
 
-                    if (!descriptionInput?.value.trim() && suggestButton) {
-                        bulkBtn.textContent = `Suggesting ${i + 1}/${eligibleSpeakers.length}...`;
-                        await window.suggestVoiceDescription(suggestButton);
-                    }
-
-                    if (sampleInput && !sampleInput.value.trim()) {
-                        sampleInput.value = voiceCard.dataset.suggestedSample || '';
-                        if (sampleInput.value.trim()) {
-                            debouncedSaveVoices();
+                    try {
+                        if (!descriptionInput?.value.trim() && suggestButton) {
+                            bulkBtn.textContent = `Suggesting ${i + 1}/${eligibleSpeakers.length}...`;
+                            await window.suggestVoiceDescription(suggestButton);
                         }
-                    }
 
-                    if (!descriptionInput?.value.trim() || !generateButton) {
-                        continue;
-                    }
+                        if (sampleInput && !sampleInput.value.trim()) {
+                            sampleInput.value = voiceCard.dataset.suggestedSample || '';
+                            if (sampleInput.value.trim()) {
+                                debouncedSaveVoices();
+                            }
+                        }
 
-                    bulkBtn.textContent = `Generating ${i + 1}/${eligibleSpeakers.length}...`;
-                    await window.generateVoiceDesignClone(generateButton);
-                    generatedCount += 1;
+                        if (!descriptionInput?.value.trim() || !generateButton) {
+                            failedSpeakers.push(`${speaker} (missing description)`);
+                            continue;
+                        }
+
+                        bulkBtn.textContent = `Generating ${i + 1}/${eligibleSpeakers.length}...`;
+                        await window.generateVoiceDesignClone(generateButton);
+                        const nowHasAudio = Boolean((card.querySelector('.design-ref-audio')?.value || '').trim());
+                        if (nowHasAudio) {
+                            generatedCount += 1;
+                        } else {
+                            failedSpeakers.push(`${speaker} (generation failed)`);
+                        }
+                    } catch (e) {
+                        failedSpeakers.push(`${speaker} (${e.message || 'unknown error'})`);
+                    }
                 }
-                if (generatedCount === 0) {
+                if (generatedCount === 0 && failedSpeakers.length === 0) {
                     showToast('No outstanding voices needed generation.', 'info');
+                } else if (failedSpeakers.length > 0) {
+                    const summary = failedSpeakers.slice(0, 4).join(', ');
+                    const suffix = failedSpeakers.length > 4 ? `, and ${failedSpeakers.length - 4} more` : '';
+                    showToast(`Created ${generatedCount} voice${generatedCount === 1 ? '' : 's'}; failed: ${summary}${suffix}.`, 'warning');
                 } else {
                     showToast(`Created ${generatedCount} outstanding voice${generatedCount === 1 ? '' : 's'}.`, 'success');
                 }
@@ -2844,6 +2983,7 @@
         let proofreadChapterAutoSelected = false;
         let audioQueuePollTimer = null;
         let latestAudioState = null;
+        let latestProofreadStatus = null;
         let renderPrepComplete = false;
 
         // Check if any audio is currently playing
@@ -3174,6 +3314,9 @@
             if (!proofread || !proofread.checked) {
                 return '<span class="badge bg-secondary">Not checked</span>';
             }
+            if (proofread.manual_failed) {
+                return '<span class="badge bg-danger">Rejected</span>';
+            }
             if (proofread.manual_validated) {
                 return '<span class="badge bg-primary">Validated</span>';
             }
@@ -3208,6 +3351,33 @@
             return Boolean((chunk?.audio_path || '').trim());
         }
 
+        function getProofreadValidateButtonHtml(chunk, chunkRef) {
+            if (!shouldShowProofreadValidate(chunk)) return '';
+            const proofread = chunk?.proofread || {};
+            const isValidated = Boolean(proofread.manual_validated);
+            const label = isValidated ? 'Reject' : 'Validate';
+            const icon = isValidated ? 'fa-xmark' : 'fa-check';
+            const buttonClass = isValidated ? 'btn-outline-warning' : 'btn-outline-primary';
+            return `<button class="btn btn-sm ${buttonClass} mt-2 ms-2" onclick='validateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas ${icon} me-1"></i>${label}</button>`;
+        }
+
+        function getProofreadEditButtonHtml(chunk, chunkRef) {
+            return `<button class="btn btn-sm btn-outline-secondary mt-2 ms-2" onclick='editProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-pen me-1"></i>Edit</button>`;
+        }
+
+        function getChunkCachedTranscript(chunk) {
+            const proofreadTranscript = String(chunk?.proofread?.transcript_text || '').trim();
+            if (proofreadTranscript) return proofreadTranscript;
+            const validationTranscript = String(chunk?.audio_validation?.transcript_text || '').trim();
+            if (validationTranscript) return validationTranscript;
+            return '';
+        }
+
+        function shouldShowProofreadCompare(chunk) {
+            if (!Boolean((chunk?.audio_path || '').trim())) return false;
+            return !getChunkCachedTranscript(chunk);
+        }
+
         function getProofreadFingerprint(chunk, threshold) {
             const proofread = chunk?.proofread || {};
             return [
@@ -3219,13 +3389,15 @@
                 proofread.score ?? '',
                 proofread.passed ? 1 : 0,
                 proofread.error || '',
-                proofread.transcript_text || '',
+                getChunkCachedTranscript(chunk),
                 proofread.actual_duration_sec ?? '',
                 proofread.expected_duration_sec ?? '',
                 proofread.auto_failed_reason || '',
                 proofread.speaker_match ? 1 : 0,
                 proofread.manual_validated ? 1 : 0,
+                proofread.manual_failed ? 1 : 0,
                 proofread.validated_at ?? '',
+                proofread.failed_at ?? '',
             ].join('|');
         }
 
@@ -3236,8 +3408,9 @@
 
             const proofread = chunk.proofread || {};
             const score = Number.isFinite(Number(proofread.score)) ? Number(proofread.score).toFixed(3) : '—';
-            const transcript = proofread.transcript_text
-                ? escapeHtml(proofread.transcript_text)
+            const transcriptText = getChunkCachedTranscript(chunk);
+            const transcript = transcriptText
+                ? escapeHtml(transcriptText)
                 : '<span class="text-muted small">No transcript captured</span>';
             const detail = proofread.error
                 ? `<div class="small ${Number(proofread.score) >= threshold ? 'text-muted' : 'text-danger'} mt-1">${escapeHtml(proofread.error)}</div>`
@@ -3245,13 +3418,21 @@
             const manualValidationDetail = proofread.manual_validated
                 ? '<div class="small text-primary mt-1">Manually validated by user.</div>'
                 : '';
+            const manualFailureDetail = proofread.manual_failed
+                ? '<div class="small text-danger mt-1">Manually marked as failed by user.</div>'
+                : '';
+            const cachedTranscriptDetail = (!proofread.checked && transcriptText)
+                ? '<div class="small text-muted mt-1">Cached transcript from repair.</div>'
+                : '';
             const durationDetail = proofread.actual_duration_sec != null
                 ? `<div class="small text-muted mt-1">Duration ${proofread.actual_duration_sec}s vs expected ${proofread.expected_duration_sec || 0}s</div>`
                 : '';
             const regenButton = getProofreadGenerateButtonHtml(chunk, chunkRef);
-            const validateButton = shouldShowProofreadValidate(chunk)
-                ? `<button class="btn btn-sm btn-outline-primary mt-2 ms-2" onclick='validateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-check me-1"></i>Validate</button>`
+            const compareButton = shouldShowProofreadCompare(chunk)
+                ? `<button class="btn btn-sm btn-outline-secondary mt-2 ms-2" onclick='compareProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-scale-balanced me-1"></i>Compare</button>`
                 : '';
+            const validateButton = getProofreadValidateButtonHtml(chunk, chunkRef);
+            const editButton = getProofreadEditButtonHtml(chunk, chunkRef);
 
             row.style.cssText = getProofreadRowStyle(chunk, threshold);
 
@@ -3264,6 +3445,8 @@
                     <div class="small mt-1">Score: ${score}</div>
                     ${detail}
                     ${manualValidationDetail}
+                    ${manualFailureDetail}
+                    ${cachedTranscriptDetail}
                 `;
             }
             if (transcriptCell) {
@@ -3273,7 +3456,7 @@
                 const audioHtml = chunk.audio_path
                     ? `<audio controls src="/${chunk.audio_path}" style="width: 210px; height: 30px;"></audio>`
                     : '<span class="text-muted small">No audio</span>';
-                audioCell.innerHTML = `${audioHtml}<div>${regenButton}${validateButton}</div>`;
+                audioCell.innerHTML = `${audioHtml}<div>${regenButton}${compareButton}${validateButton}${editButton}</div>`;
             }
             row.dataset.proofreadFingerprint = getProofreadFingerprint(chunk, threshold);
             return true;
@@ -3294,14 +3477,21 @@
                 const proofread = chunk.proofread || {};
                 const chunkRef = getChunkRef(chunk);
                 const score = Number.isFinite(Number(proofread.score)) ? Number(proofread.score).toFixed(3) : '—';
-                const transcript = proofread.transcript_text
-                    ? escapeHtml(proofread.transcript_text)
+                const transcriptText = getChunkCachedTranscript(chunk);
+                const transcript = transcriptText
+                    ? escapeHtml(transcriptText)
                     : '<span class="text-muted small">No transcript captured</span>';
                 const detail = proofread.error
                     ? `<div class="small ${Number(proofread.score) >= threshold ? 'text-muted' : 'text-danger'} mt-1">${escapeHtml(proofread.error)}</div>`
                     : '';
                 const manualValidationDetail = proofread.manual_validated
                     ? '<div class="small text-primary mt-1">Manually validated by user.</div>'
+                    : '';
+                const manualFailureDetail = proofread.manual_failed
+                    ? '<div class="small text-danger mt-1">Manually marked as failed by user.</div>'
+                    : '';
+                const cachedTranscriptDetail = (!proofread.checked && transcriptText)
+                    ? '<div class="small text-muted mt-1">Cached transcript from repair.</div>'
                     : '';
                 const durationDetail = proofread.actual_duration_sec != null
                     ? `<div class="small text-muted mt-1">Duration ${proofread.actual_duration_sec}s vs expected ${proofread.expected_duration_sec || 0}s</div>`
@@ -3310,9 +3500,11 @@
                     ? `<audio controls src="/${chunk.audio_path}?t=${Date.now()}" style="width: 210px; height: 30px;"></audio>`
                     : '<span class="text-muted small">No audio</span>';
                 const regenButton = getProofreadGenerateButtonHtml(chunk, chunkRef);
-                const validateButton = shouldShowProofreadValidate(chunk)
-                    ? `<button class="btn btn-sm btn-outline-primary mt-2 ms-2" onclick='validateProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-check me-1"></i>Validate</button>`
+                const compareButton = shouldShowProofreadCompare(chunk)
+                    ? `<button class="btn btn-sm btn-outline-secondary mt-2 ms-2" onclick='compareProofreadChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-scale-balanced me-1"></i>Compare</button>`
                     : '';
+                const validateButton = getProofreadValidateButtonHtml(chunk, chunkRef);
+                const editButton = getProofreadEditButtonHtml(chunk, chunkRef);
                 return `
                     <tr data-proofread-id="${escapeHtml(chunkRef)}" data-proofread-fingerprint="${escapeHtml(getProofreadFingerprint(chunk, threshold))}" style="${getProofreadRowStyle(chunk, threshold)}">
                         <td>${escapeHtml(chunk.speaker || '')}</td>
@@ -3325,20 +3517,68 @@
                             <div class="small mt-1">Score: ${score}</div>
                             ${detail}
                             ${manualValidationDetail}
+                            ${manualFailureDetail}
+                            ${cachedTranscriptDetail}
                         </td>
                         <td>
                             <div>${transcript}</div>
                             ${durationDetail}
                         </td>
-                        <td>${audioHtml}<div>${regenButton}${validateButton}</div></td>
+                        <td>${audioHtml}<div>${regenButton}${compareButton}${validateButton}${editButton}</div></td>
                     </tr>
                 `;
             }).join('');
             cachedProofreadVisibleChunkIds = visibleChunks.map(chunk => getChunkRef(chunk));
         }
 
+        function getProofreadDerivedStats(chunks, threshold = getProofreadThreshold(), chapterId = selectedProofreadChapter) {
+            const sourceChunks = Array.isArray(chunks) ? chunks : [];
+            const scopedChunks = chapterId === WHOLE_PROJECT_CHAPTER_ID
+                ? sourceChunks
+                : sourceChunks.filter(chunk => getChunkChapterName(chunk) === chapterId);
+            let passed = 0;
+            let failed = 0;
+            let autoFailed = 0;
+            let skipped = 0;
+
+            scopedChunks.forEach(chunk => {
+                const hasAudio = Boolean((chunk?.audio_path || '').trim());
+                const proofread = chunk?.proofread || null;
+                if (!hasAudio) {
+                    skipped += 1;
+                    return;
+                }
+                if (!proofread || !proofread.checked) {
+                    return;
+                }
+                const score = Number(proofread.score);
+                const isPassed = proofread.passed === true && Number.isFinite(score) && score >= threshold;
+                if (isPassed) {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                    if (proofread.auto_failed_reason) {
+                        autoFailed += 1;
+                    }
+                }
+            });
+
+            return {
+                total: scopedChunks.length,
+                passed,
+                failed,
+                auto_failed: autoFailed,
+                skipped,
+            };
+        }
+
         function renderProofreadTaskStatus(status) {
+            latestProofreadStatus = status || latestProofreadStatus || { running: false, progress: {}, logs: [] };
+            status = latestProofreadStatus;
             const progress = status?.progress || {};
+            const running = !!status?.running;
+            const derived = getProofreadDerivedStats(cachedChunks);
+            const projectDerived = getProofreadDerivedStats(cachedChunks, getProofreadThreshold(), WHOLE_PROJECT_CHAPTER_ID);
             const progressCompleted = Number.isFinite(Number(progress.processed))
                 ? Number(progress.processed)
                 : (Number.isFinite(Number(progress.transcribed)) ? Number(progress.transcribed) : 0);
@@ -3348,13 +3588,15 @@
                     ? Number(progress.transcribe_total)
                     : (Number.isFinite(Number(progress.pending_clips)) ? Number(progress.pending_clips) : 0));
             document.getElementById('proofread-phase').textContent = progress.phase || (status?.running ? 'proofreading' : 'Idle');
-            document.getElementById('proofread-progress').textContent = `${formatNumber(progressCompleted)} / ${formatNumber(progressTotal)}`;
+            document.getElementById('proofread-progress').textContent = running
+                ? `${formatNumber(progressCompleted)} / ${formatNumber(progressTotal)}`
+                : `${formatNumber(derived.passed + derived.failed)} / ${formatNumber(Math.max(derived.total - derived.skipped, 0))}`;
             document.getElementById('proofread-eta').textContent = formatDuration(progress.eta_seconds);
             document.getElementById('proofread-elapsed').textContent = formatDuration(progress.elapsed_seconds || 0);
-            document.getElementById('proofread-passed').textContent = formatNumber(progress.passed || 0);
-            document.getElementById('proofread-failed').textContent = formatNumber(progress.failed || 0);
-            document.getElementById('proofread-auto-failed').textContent = formatNumber(progress.auto_failed || 0);
-            document.getElementById('proofread-skipped').textContent = formatNumber(progress.skipped || 0);
+            document.getElementById('proofread-passed').textContent = formatNumber(running ? (progress.passed || 0) : derived.passed);
+            document.getElementById('proofread-failed').textContent = formatNumber(running ? (progress.failed || 0) : projectDerived.failed);
+            document.getElementById('proofread-auto-failed').textContent = formatNumber(running ? (progress.auto_failed || 0) : derived.auto_failed);
+            document.getElementById('proofread-skipped').textContent = formatNumber(running ? (progress.skipped || 0) : derived.skipped);
 
             const summary = document.getElementById('proofread-run-summary');
             const chapterLabel = selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID ? 'the whole project' : selectedProofreadChapter;
@@ -3366,7 +3608,6 @@
                 summary.textContent = '';
             }
 
-            const running = !!status?.running;
             document.getElementById('btn-proofread-sequence').disabled = running;
             document.getElementById('btn-proofread-book').disabled = running;
             document.getElementById('btn-proofread-discard-selection').disabled = running;
@@ -3379,6 +3620,48 @@
             renderProofreadTaskStatus(await API.get('/api/status/proofread'));
         };
 
+        window.jumpToFirstProofreadFailure = async () => {
+            try {
+                let chunks = Array.isArray(cachedChunks) ? cachedChunks : [];
+                if (!chunks.length) {
+                    chunks = await API.get('/api/chunks');
+                    cachedChunks = chunks;
+                    syncEditorChapterState(chunks);
+                    syncProofreadChapterState(chunks);
+                }
+
+                const firstFailure = chunks.find(chunk => {
+                    const proofread = chunk?.proofread || {};
+                    return Boolean(proofread.checked) && !Boolean(proofread.passed);
+                });
+                if (!firstFailure) {
+                    showToast('No proofread failures were found.', 'info', 2500);
+                    return;
+                }
+
+                const chapterId = getChunkChapterName(firstFailure) || WHOLE_PROJECT_CHAPTER_ID;
+                selectedProofreadChapter = chapterId;
+                renderProofreadTable(chunks);
+                syncProofreadChapterState(chunks);
+                renderProofreadTaskStatus(await API.get('/api/status/proofread'));
+
+                await new Promise(resolve => requestAnimationFrame(() => resolve()));
+
+                const chunkRef = getChunkRef(firstFailure);
+                const row = document.querySelector(`#proofread-table-body tr[data-proofread-id="${CSS.escape(chunkRef)}"]`);
+                if (!row) {
+                    showToast('Found a proofread failure, but could not scroll to it.', 'warning', 3000);
+                    return;
+                }
+
+                document.querySelectorAll('#proofread-table-body tr.table-primary').forEach(tr => tr.classList.remove('table-primary'));
+                row.classList.add('table-primary');
+                row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            } catch (e) {
+                showToast('Failed to jump to the first proofread failure: ' + e.message, 'error');
+            }
+        };
+
         window.saveProofreadThreshold = async () => {
             const thresholdInput = document.getElementById('proofread-threshold');
             const threshold = getProofreadThreshold();
@@ -3388,6 +3671,7 @@
                 config.proofread = { ...(config.proofread || {}), certainty_threshold: threshold };
                 await API.post('/api/config', config);
                 renderProofreadTable(cachedChunks);
+                renderProofreadTaskStatus(latestProofreadStatus || { running: false, progress: {}, logs: [] });
             } catch (e) {
                 showToast('Failed to save proofread certainty: ' + e.message, 'error');
             }
@@ -3396,6 +3680,7 @@
         window.previewProofreadThreshold = () => {
             getProofreadThreshold();
             renderProofreadTable(cachedChunks);
+            renderProofreadTaskStatus(latestProofreadStatus || { running: false, progress: {}, logs: [] });
         };
 
         async function startProofreadRun(chapter) {
@@ -3456,13 +3741,65 @@
 
         window.validateProofreadChunk = async (chunkRef) => {
             try {
-                await API.post(`/api/proofread/${encodeURIComponent(chunkRef)}/validate`, {
+                const result = await API.post(`/api/proofread/${encodeURIComponent(chunkRef)}/validate`, {
                     threshold: getProofreadThreshold(),
                 });
-                showToast('Clip marked as manually validated.', 'success', 3000);
+                const proofread = result?.chunk?.proofread || {};
+                showToast(
+                    proofread.manual_failed
+                        ? 'Clip marked as manually failed.'
+                        : 'Clip marked as manually validated.',
+                    proofread.manual_failed ? 'warning' : 'success',
+                    3000
+                );
                 await loadChunks(false);
             } catch (e) {
                 showToast('Failed to validate clip: ' + e.message, 'error');
+            }
+        };
+
+        window.compareProofreadChunk = async (chunkRef) => {
+            try {
+                await API.post(`/api/proofread/${encodeURIComponent(chunkRef)}/compare`, {
+                    threshold: getProofreadThreshold(),
+                });
+                showToast('Clip compared successfully.', 'success', 3000);
+                await loadChunks(false);
+            } catch (e) {
+                showToast('Failed to compare clip: ' + e.message, 'error');
+            }
+        };
+
+        window.editProofreadChunk = async (chunkRef) => {
+            try {
+                const chunk = (cachedChunks || []).find(candidate => getChunkRef(candidate) === String(chunkRef))
+                    || (await API.get('/api/chunks')).find(candidate => getChunkRef(candidate) === String(chunkRef));
+                if (!chunk) {
+                    showToast('Could not find that clip in the editor.', 'warning');
+                    return;
+                }
+
+                const chapter = getChunkChapterName(chunk);
+                const chapterToggle = document.getElementById('editor-chapter-only');
+                if (chapterToggle) {
+                    chapterToggle.checked = true;
+                }
+                selectedEditorChapter = chapter || WHOLE_PROJECT_CHAPTER_ID;
+
+                const editorTab = document.querySelector('[data-tab="editor"]');
+                if (!editorTab) {
+                    showToast('Editor tab is unavailable.', 'error');
+                    return;
+                }
+                editorTab.click();
+
+                const focused = await focusChunkInEditor(String(chunkRef));
+                if (!focused) {
+                    showToast('Opened the editor, but could not focus that clip.', 'warning');
+                    return;
+                }
+            } catch (e) {
+                showToast('Failed to open clip in editor: ' + e.message, 'error');
             }
         };
 
@@ -3717,6 +4054,7 @@
                 } else {
                     renderProofreadTable(chunks);
                 }
+                renderProofreadTaskStatus(latestProofreadStatus || { running: false, progress: {}, logs: [] });
                 const visibleChunks = getVisibleChunks(chunks);
 
                 renderEditorProgressBar(chunks, latestAudioState);
@@ -4595,6 +4933,23 @@
             return true;
         }
 
+        function updateScriptTaskButtons(status) {
+            const running = !!status?.running;
+            const generateBtn = document.getElementById('btn-gen-script');
+            const reviewBtn = document.getElementById('btn-review-script');
+            const sanityBtn = document.getElementById('btn-script-sanity');
+            const replaceBtn = document.getElementById('btn-replace-missing-chunks');
+            if (generateBtn) {
+                generateBtn.disabled = running;
+                generateBtn.innerHTML = running
+                    ? '<i class="fas fa-spinner fa-spin me-2"></i>Generating Script...'
+                    : '<i class="fas fa-magic me-2"></i>Generate Annotated Script';
+            }
+            if (reviewBtn) reviewBtn.disabled = running;
+            if (sanityBtn) sanityBtn.disabled = running;
+            if (replaceBtn) replaceBtn.disabled = running;
+        }
+
         function renderTaskLogs(taskName, status, elementId = taskLogTargets[taskName]) {
             const el = document.getElementById(elementId);
             if (!el || !status) return;
@@ -4610,6 +4965,9 @@
                 if (status.running) {
                     loadChunks(false).catch(err => console.error('Failed to refresh chunks during repair', err));
                 }
+            }
+            if (taskName === 'script') {
+                updateScriptTaskButtons(status);
             }
             if ('value' in el && el.tagName === 'TEXTAREA') {
                 el.value = logs.join('\n');

@@ -4,11 +4,44 @@ import re
 
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
+_URL_RE = re.compile(r"(?P<url>https?://[^\s<>'\"]+)", re.IGNORECASE)
 _SCRIPT_METADATA_KEYS = ("sanity_cache",)
 
 
 def _clean_string(value):
     return str(value or "").strip()
+
+
+def _replace_urls_with_placeholder(text):
+    value = str(text or "")
+
+    def replace(match):
+        raw_url = match.group("url")
+        trailing = ""
+        while raw_url and raw_url[-1] in ".,!?;:)]}":
+            trailing = raw_url[-1] + trailing
+            raw_url = raw_url[:-1]
+        if not raw_url:
+            return match.group(0)
+        return f"[web link]{trailing}"
+
+    return _URL_RE.sub(replace, value)
+
+
+def _normalize_script_entries(entries):
+    normalized = []
+    if not isinstance(entries, list):
+        return normalized
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        normalized_entry = copy.deepcopy(entry)
+        if "text" in normalized_entry:
+            normalized_entry["text"] = _replace_urls_with_placeholder(normalized_entry.get("text", ""))
+        normalized.append(normalized_entry)
+
+    return normalized
 
 
 def clean_dictionary_entries(entries):
@@ -31,7 +64,7 @@ def clean_dictionary_entries(entries):
 def normalize_script_document(data):
     if isinstance(data, list):
         return {
-            "entries": data,
+            "entries": _normalize_script_entries(data),
             "dictionary": [],
             "sanity_cache": {"phrase_decisions": {}},
         }
@@ -47,7 +80,7 @@ def normalize_script_document(data):
         if not isinstance(phrase_decisions, dict):
             phrase_decisions = {}
         return {
-            "entries": entries,
+            "entries": _normalize_script_entries(entries),
             "dictionary": clean_dictionary_entries(data.get("dictionary", [])),
             "sanity_cache": {
                 "phrase_decisions": phrase_decisions,
@@ -76,7 +109,7 @@ def save_script_document(path, entries=None, dictionary=None, sanity_cache=None)
         }
 
     document = {
-        "entries": current["entries"] if entries is None else entries,
+        "entries": current["entries"] if entries is None else _normalize_script_entries(entries),
         "dictionary": current["dictionary"] if dictionary is None else clean_dictionary_entries(dictionary),
         "sanity_cache": resolved_sanity_cache,
     }

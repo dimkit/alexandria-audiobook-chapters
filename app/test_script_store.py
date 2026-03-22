@@ -34,6 +34,49 @@ class ScriptStoreTests(unittest.TestCase):
                 "accepted",
             )
 
+    def test_save_replaces_full_urls_in_entry_text(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "annotated_script.json")
+            save_script_document(
+                path,
+                entries=[
+                    {
+                        "speaker": "NARRATOR",
+                        "text": "See https://dl.dropboxusercontent.com/s/1owwgy7rfuk8m5g/example.png right now.",
+                        "instruct": "",
+                    }
+                ],
+                dictionary=[],
+            )
+
+            loaded = load_script_document(path)
+            self.assertEqual(loaded["entries"][0]["text"], "See [web link] right now.")
+
+    def test_load_replaces_urls_in_existing_document_and_preserves_punctuation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "annotated_script.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(
+                    """
+{
+  "entries": [
+    {
+      "speaker": "NARRATOR",
+      "text": "Look at https://example.com/test.png, then continue.",
+      "instruct": ""
+    }
+  ],
+  "dictionary": [],
+  "sanity_cache": {
+    "phrase_decisions": {}
+  }
+}
+""".strip()
+                )
+
+            loaded = load_script_document(path)
+            self.assertEqual(loaded["entries"][0]["text"], "Look at [web link], then continue.")
+
 
 if __name__ == "__main__":
     unittest.main()

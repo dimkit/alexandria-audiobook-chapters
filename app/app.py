@@ -56,6 +56,7 @@ SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
 CHUNKS_PATH = os.path.join(ROOT_DIR, "chunks.json")
 AUDIO_QUEUE_STATE_PATH = os.path.join(ROOT_DIR, "audio_queue_state.json")
 SCRIPT_SANITY_PATH = os.path.join(ROOT_DIR, "script_sanity_check.json")
+SCRIPT_REPAIR_TRACE_PATH = os.path.join(ROOT_DIR, "script_repair_trace.jsonl")
 DESIGNED_VOICES_DIR = os.path.join(ROOT_DIR, "designed_voices")
 CLONE_VOICES_DIR = os.path.join(ROOT_DIR, "clone_voices")
 LORA_MODELS_DIR = os.path.join(ROOT_DIR, "lora_models")
@@ -63,7 +64,7 @@ LORA_DATASETS_DIR = os.path.join(ROOT_DIR, "lora_datasets")
 BUILTIN_LORA_DIR = os.path.join(ROOT_DIR, "builtin_lora")
 BUILTIN_LORA_MANIFEST = os.path.join(BUILTIN_LORA_DIR, "manifest.json")
 DATASET_BUILDER_DIR = os.path.join(ROOT_DIR, "dataset_builder")
-PROJECT_ARCHIVE_VERSION = 1
+PROJECT_ARCHIVE_VERSION = 2
 PROJECT_ARCHIVE_MANIFEST_NAME = "project_archive_manifest.json"
 PROJECT_ARCHIVE_ALLOWED_FILES = {
     "annotated_script.json",
@@ -72,6 +73,7 @@ PROJECT_ARCHIVE_ALLOWED_FILES = {
     "chunks.json",
     "script_sanity_check.json",
     "state.json",
+    "transcription_cache.json",
 }
 PROJECT_ARCHIVE_ALLOWED_DIRS = {
     "uploads",
@@ -165,6 +167,12 @@ def _any_project_task_running():
         if audio_queue or audio_current_job is not None:
             return "audio"
     return None
+
+
+def _ensure_task_not_running(task_name: str, conflict_message: str):
+    with task_state_lock:
+        if bool(process_state.get(task_name, {}).get("running")):
+            raise HTTPException(status_code=409, detail=conflict_message)
 
 # Mount static files with absolute path
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -310,6 +318,9 @@ class ProofreadClearFailuresRequest(BaseModel):
 class ProofreadValidateRequest(BaseModel):
     threshold: float = 1.0
 
+class ProofreadCompareRequest(BaseModel):
+    threshold: float = 1.0
+
 class ProofreadDiscardSelectionRequest(BaseModel):
     chapter: Optional[str] = None
 
@@ -416,6 +427,13 @@ class DatasetBuilderUpdateRowsRequest(BaseModel):
 class ProcessingWorkflowRequest(BaseModel):
     process_voices: bool = True
     generate_audio: bool = False
+    force_reimport: bool = False
+    skip_script_stage: bool = False
+
+
+class ScriptGenerationRequest(BaseModel):
+    force_reimport: bool = False
+    skip_import: bool = False
 
 
 class WorkflowPauseRequested(Exception):
@@ -426,6 +444,8 @@ ROLLING_AUDIO_SAMPLE_LIMIT = 50
 AUDIO_HEARTBEAT_INTERVAL_SECONDS = 600
 AUDIO_RECOVERY_POLL_SECONDS = 5
 PROCESSING_WORKFLOW_STATE_PATH = os.path.join(ROOT_DIR, "processing_workflow_state.json")
+PROCESSING_STAGE_ORDER = ["script", "review", "sanity", "repair", "voices", "audio"]
+PROCESSING_STAGE_MARKERS_KEY = "processing_stage_markers"
 PROCESSING_WORKFLOW_STAGE_LABELS = {
     "script": "Generate Annotated Script",
     "review": "Review Script",
@@ -745,6 +765,22 @@ def _atomic_json_write(path, data):
                 pass
 
 
+def _append_script_repair_trace(run_id: str, event_type: str, payload: Optional[dict] = None):
+    record = {
+        "ts": time.time(),
+        "run_id": run_id,
+        "event": event_type,
+        "payload": payload or {},
+    }
+    with open(SCRIPT_REPAIR_TRACE_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _clear_script_repair_trace():
+    if os.path.exists(SCRIPT_REPAIR_TRACE_PATH):
+        os.remove(SCRIPT_REPAIR_TRACE_PATH)
+
+
 def _new_processing_workflow_state():
     return {
         "running": False,
@@ -760,6 +796,255 @@ def _new_processing_workflow_state():
         "completed_at": None,
         "resume_count": 0,
     }
+
+
+def _load_project_state_payload():
+    state_path = os.path.join(ROOT_DIR, "state.json")
+    if not os.path.exists(state_path):
+        return {}
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_project_state_payload(state):
+    _atomic_json_write(os.path.join(ROOT_DIR, "state.json"), state)
+
+
+def _load_processing_stage_markers():
+    state = _load_project_state_payload()
+    markers = state.get(PROCESSING_STAGE_MARKERS_KEY)
+    return dict(markers) if isinstance(markers, dict) else {}
+
+
+def _save_processing_stage_markers(markers, state=None):
+    payload = dict(state) if isinstance(state, dict) else _load_project_state_payload()
+    cleaned = {stage: value for stage, value in dict(markers).items() if stage in PROCESSING_STAGE_ORDER}
+    if cleaned:
+        payload[PROCESSING_STAGE_MARKERS_KEY] = cleaned
+    else:
+        payload.pop(PROCESSING_STAGE_MARKERS_KEY, None)
+    _save_project_state_payload(payload)
+
+
+def _mark_processing_stage_completed_marker(stage_name):
+    if stage_name not in PROCESSING_STAGE_ORDER:
+        return
+    state = _load_project_state_payload()
+    markers = state.get(PROCESSING_STAGE_MARKERS_KEY)
+    markers = dict(markers) if isinstance(markers, dict) else {}
+    markers[stage_name] = {
+        "completed_at": time.time(),
+    }
+    _save_processing_stage_markers(markers, state=state)
+
+
+def _clear_processing_stage_markers(stage_names=None):
+    state = _load_project_state_payload()
+    markers = state.get(PROCESSING_STAGE_MARKERS_KEY)
+    markers = dict(markers) if isinstance(markers, dict) else {}
+    if stage_names is None:
+        changed = bool(markers)
+        markers = {}
+    else:
+        changed = False
+        for stage_name in stage_names:
+            if stage_name in markers:
+                markers.pop(stage_name, None)
+                changed = True
+    if changed:
+        _save_processing_stage_markers(markers, state=state)
+
+
+def _clear_processing_stage_and_downstream(stage_name, include_self=True):
+    if stage_name not in PROCESSING_STAGE_ORDER:
+        return
+    start_index = PROCESSING_STAGE_ORDER.index(stage_name) + (0 if include_self else 1)
+    _clear_processing_stage_markers(PROCESSING_STAGE_ORDER[start_index:])
+
+
+def _derived_processing_completed_stages(options=None):
+    options = options or {}
+    allowed = set(_processing_workflow_stage_sequence(options))
+    markers = _load_processing_stage_markers()
+    completed = []
+
+    for stage_name in PROCESSING_STAGE_ORDER:
+        if stage_name not in allowed:
+            continue
+        if stage_name == "script":
+            if os.path.exists(SCRIPT_PATH):
+                completed.append(stage_name)
+            continue
+        if stage_name == "review" and markers.get(stage_name) and os.path.exists(SCRIPT_PATH):
+            completed.append(stage_name)
+            continue
+        if stage_name in ("sanity", "repair") and markers.get(stage_name) and os.path.exists(SCRIPT_PATH) and os.path.exists(SCRIPT_SANITY_PATH):
+            completed.append(stage_name)
+            continue
+        if stage_name == "voices" and markers.get(stage_name) and os.path.exists(VOICE_CONFIG_PATH):
+            completed.append(stage_name)
+            continue
+        if stage_name == "audio" and markers.get(stage_name) and os.path.exists(CHUNKS_PATH):
+            completed.append(stage_name)
+
+    return completed
+
+
+def _chunk_chapter_summary():
+    if not os.path.exists(CHUNKS_PATH):
+        return {
+            "chunk_count": 0,
+            "chapter_count": 0,
+            "last_chapter": None,
+        }
+    try:
+        with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {
+            "chunk_count": 0,
+            "chapter_count": 0,
+            "last_chapter": None,
+        }
+
+    ordered_chapters = []
+    last_seen = None
+    for chunk in chunks if isinstance(chunks, list) else []:
+        chapter = str((chunk or {}).get("chapter") or "").strip()
+        if not chapter:
+            continue
+        if chapter != last_seen:
+            ordered_chapters.append(chapter)
+            last_seen = chapter
+
+    return {
+        "chunk_count": len(chunks) if isinstance(chunks, list) else 0,
+        "chapter_count": len(ordered_chapters),
+        "last_chapter": ordered_chapters[-1] if ordered_chapters else None,
+    }
+
+
+def _script_ingestion_preflight_summary():
+    state = _load_project_state_payload()
+    input_path = (state.get("input_file_path") or "").strip()
+    if not input_path or not os.path.exists(input_path):
+        return {
+            "warn": False,
+            "reason": "no_input",
+            "message": "",
+        }
+
+    chunk_summary = _chunk_chapter_summary()
+    if chunk_summary["chunk_count"] <= 0:
+        return {
+            "warn": False,
+            "reason": "no_chunks",
+            "message": "",
+            **chunk_summary,
+        }
+
+    try:
+        source_document = load_source_document(input_path)
+    except Exception as e:
+        logger.warning("Script ingestion preflight could not inspect source document: %s", e)
+        return {
+            "warn": False,
+            "reason": "source_inspection_failed",
+            "message": "",
+            **chunk_summary,
+        }
+
+    chapters = source_document.get("chapters") or []
+    last_source_chapter = str((chapters[-1].get("title") if chapters else None) or "").strip() or None
+    source_type = source_document.get("type")
+    source_chapter_count = len(chapters)
+    last_chunk_chapter = chunk_summary["last_chapter"]
+    matches_existing = (
+        source_type == "epub"
+        and bool(last_source_chapter)
+        and bool(last_chunk_chapter)
+        and last_source_chapter == last_chunk_chapter
+    )
+
+    message = ""
+    if matches_existing:
+        message = (
+            "This project already appears to contain a full import of the current EPUB. "
+            f"The last existing chapter is \"{last_chunk_chapter}\" and the last EPUB chapter is also "
+            f"\"{last_source_chapter}\". Re-importing will delete the current generated project state and "
+            "rebuild it from the source document."
+        )
+
+    return {
+        "warn": matches_existing,
+        "reason": "matching_last_chapter" if matches_existing else "no_match",
+        "message": message,
+        "source_type": source_type,
+        "source_chapter_count": source_chapter_count,
+        "last_source_chapter": last_source_chapter,
+        **chunk_summary,
+    }
+
+
+def _mark_script_stage_skipped_for_existing_project():
+    _mark_processing_stage_completed_marker("script")
+    return {"status": "skipped", "skipped_stage": "script"}
+
+
+def _clear_directory_contents(directory):
+    if not os.path.isdir(directory):
+        os.makedirs(directory, exist_ok=True)
+        return
+    for entry in os.listdir(directory):
+        entry_path = os.path.join(directory, entry)
+        if os.path.isdir(entry_path):
+            shutil.rmtree(entry_path)
+        else:
+            os.remove(entry_path)
+
+
+def _clear_project_derived_state(preserve_input_file=True):
+    state = _load_project_state_payload()
+    input_file_path = (state.get("input_file_path") or "").strip()
+
+    files_to_remove = [
+        SCRIPT_PATH,
+        VOICES_PATH,
+        VOICE_CONFIG_PATH,
+        CHUNKS_PATH,
+        project_manager.transcription_cache_path,
+        AUDIOBOOK_PATH,
+        M4B_PATH,
+        AUDIO_QUEUE_STATE_PATH,
+        PROCESSING_WORKFLOW_STATE_PATH,
+        SCRIPT_SANITY_PATH,
+        os.path.join(ROOT_DIR, "audacity_export.zip"),
+        os.path.join(ROOT_DIR, "m4b_cover.jpg"),
+    ]
+    for path in files_to_remove:
+        if os.path.exists(path):
+            os.remove(path)
+
+    _clear_directory_contents(VOICELINES_DIR)
+    _clear_directory_contents(DESIGNED_VOICES_DIR)
+    _clear_directory_contents(CLONE_VOICES_DIR)
+    if not preserve_input_file:
+        _clear_directory_contents(UPLOADS_DIR)
+
+    new_state = {}
+    if preserve_input_file and input_file_path:
+        new_state["input_file_path"] = input_file_path
+    new_state["render_prep_complete"] = False
+    _save_project_state_payload(new_state)
+
+    with project_manager._transcription_cache_lock:
+        project_manager._transcription_cache = None
+    project_manager.engine = None
+    project_manager.asr_engine = None
 
 
 def _persist_processing_workflow_state_locked():
@@ -804,6 +1089,7 @@ def _ensure_processing_workflow_not_paused():
 
 
 def _mark_processing_workflow_stage_complete(stage_name):
+    _mark_processing_stage_completed_marker(stage_name)
     with processing_workflow_lock:
         completed = list(process_state["processing_workflow"].get("completed_stages") or [])
         if stage_name not in completed:
@@ -1009,6 +1295,14 @@ def _project_archive_entries():
     for relative_path in sorted(voice_assets):
         add_relative_path(relative_path)
 
+    discarded_dir = os.path.join(ROOT_DIR, "voicelines", "discarded")
+    if os.path.isdir(discarded_dir):
+        for current_root, _, filenames in os.walk(discarded_dir):
+            for filename in filenames:
+                absolute_path = os.path.join(current_root, filename)
+                relative_path = os.path.relpath(absolute_path, ROOT_DIR).replace(os.sep, "/")
+                add_relative_path(relative_path)
+
     return sorted(entries.items())
 
 
@@ -1029,6 +1323,7 @@ def _clear_project_archive_targets():
         "chunks.json",
         "script_sanity_check.json",
         "state.json",
+        "transcription_cache.json",
         "cloned_audiobook.mp3",
         "optimized_audiobook.zip",
         "audacity_export.zip",
@@ -1079,6 +1374,9 @@ def _reset_runtime_state_after_project_load():
             process_state[task_name]["progress"] = {}
 
     project_manager.engine = None
+    project_manager.asr_engine = None
+    with project_manager._transcription_cache_lock:
+        project_manager._transcription_cache = None
     project_manager.recover_interrupted_generating_chunks()
     project_manager.reconcile_chunk_audio_states()
 
@@ -2018,6 +2316,7 @@ def run_script_repair_task(run_id: str, stop_check=None):
 
     try:
         ensure_active()
+        _append_script_repair_trace(run_id, "repair_run_started", {"script_path": SCRIPT_PATH})
         if os.path.exists(SCRIPT_SANITY_PATH):
             os.remove(SCRIPT_SANITY_PATH)
 
@@ -2025,6 +2324,7 @@ def run_script_repair_task(run_id: str, stop_check=None):
             ROOT_DIR,
             log,
             should_continue=lambda: _task_is_current("repair", run_id) and not (stop_check and stop_check()),
+            trace=lambda event_type, payload: _append_script_repair_trace(run_id, event_type, payload),
         )
         if not _task_is_current("repair", run_id):
             raise WorkflowPauseRequested()
@@ -2036,6 +2336,8 @@ def run_script_repair_task(run_id: str, stop_check=None):
         log(f"Initial invalid chunks: {result['initial_invalid_chunks']}")
         log(f"Initial missing words: {result['initial_missing_words']}")
         log(f"Initial inserted words: {result['initial_inserted_words']}")
+        if result.get("repaired_headings"):
+            log(f"Restored chapter headings from source metadata: {result['repaired_headings']}")
         log(f"Repair passes completed: {result['repaired_targets']}")
 
         if final_sanity["invalid_chunk_count"] == 0:
@@ -2049,12 +2351,30 @@ def run_script_repair_task(run_id: str, stop_check=None):
             )
 
         log("Task repair completed successfully.")
+        _append_script_repair_trace(
+            run_id,
+            "repair_run_completed",
+            {
+                "initial_invalid_chunks": int(result["initial_invalid_chunks"]),
+                "initial_missing_words": int(result["initial_missing_words"]),
+                "initial_inserted_words": int(result["initial_inserted_words"]),
+                "repaired_targets": int(result["repaired_targets"]),
+                "repaired_headings": int(result.get("repaired_headings") or 0),
+                "failed_targets": int(result.get("failed_targets") or 0),
+                "final_invalid_chunks": int(final_sanity["invalid_chunk_count"]),
+                "final_missing_words": int(final_sanity["missing_words"]),
+                "final_inserted_words": int(final_sanity["inserted_words"]),
+            },
+        )
         success = True
     except WorkflowPauseRequested:
+        _append_script_repair_trace(run_id, "repair_run_interrupted", {})
         logger.info("Repair task interrupted")
     except RepairSupersededError:
+        _append_script_repair_trace(run_id, "repair_run_superseded", {})
         logger.info("Repair task superseded by a newer request")
     except Exception as e:
+        _append_script_repair_trace(run_id, "repair_run_error", {"error": str(e)})
         logger.error(f"Error running script repair: {e}")
         if _task_is_current("repair", run_id):
             log(f"Error: {str(e)}")
@@ -2115,6 +2435,50 @@ def run_lost_audio_repair_task(run_id: str, use_asr: bool):
     return success
 
 
+def _run_generate_script_task(run_id: str):
+    state = _load_project_state_payload()
+    input_file = state.get("input_file_path")
+    if not input_file:
+        raise FileNotFoundError("No input file found in state")
+    _clear_processing_stage_and_downstream("script")
+    success = run_process([sys.executable, "-u", "generate_script.py", input_file], "script", run_id)
+    if success:
+        _mark_processing_stage_completed_marker("script")
+    return success
+
+
+def _run_review_script_task(run_id: str):
+    _clear_processing_stage_and_downstream("review")
+    success = run_process([sys.executable, "-u", "review_script.py"], "review", run_id)
+    if success:
+        _mark_processing_stage_completed_marker("review")
+    return success
+
+
+def _run_sanity_task(run_id: str, stop_check=None):
+    _clear_processing_stage_and_downstream("sanity")
+    success = run_script_sanity_task(run_id, stop_check=stop_check)
+    if success:
+        _mark_processing_stage_completed_marker("sanity")
+    return success
+
+
+def _run_repair_task(run_id: str, stop_check=None):
+    _clear_processing_stage_and_downstream("repair")
+    success = run_script_repair_task(run_id, stop_check=stop_check)
+    if success:
+        _mark_processing_stage_completed_marker("repair")
+    return success
+
+
+def _run_voices_task(run_id: str, stop_check=None):
+    _clear_processing_stage_and_downstream("voices")
+    success = run_voice_processing_task(run_id, stop_check=stop_check)
+    if success:
+        _mark_processing_stage_completed_marker("voices")
+    return success
+
+
 def _run_processing_script_stage():
     state_path = os.path.join(ROOT_DIR, "state.json")
     if not os.path.exists(state_path):
@@ -2127,33 +2491,33 @@ def _run_processing_script_stage():
         raise FileNotFoundError("No input file found in state")
 
     run_id = _start_task_run("script")
-    return run_process([sys.executable, "-u", "generate_script.py", input_file], "script", run_id)
+    return _run_generate_script_task(run_id)
 
 
 def _run_processing_review_stage():
     if not os.path.exists(SCRIPT_PATH):
         raise FileNotFoundError("No annotated script found. Generate a script first.")
     run_id = _start_task_run("review")
-    return run_process([sys.executable, "-u", "review_script.py"], "review", run_id)
+    return _run_review_script_task(run_id)
 
 
 def _run_processing_sanity_stage():
     if not os.path.exists(SCRIPT_PATH):
         raise FileNotFoundError("No annotated script found. Generate a script first.")
     run_id = _start_task_run("sanity")
-    return run_script_sanity_task(run_id, stop_check=_processing_workflow_is_pause_requested)
+    return _run_sanity_task(run_id, stop_check=_processing_workflow_is_pause_requested)
 
 
 def _run_processing_repair_stage():
     if not os.path.exists(SCRIPT_PATH):
         raise FileNotFoundError("No annotated script found. Generate a script first.")
     run_id = _start_task_run("repair")
-    return run_script_repair_task(run_id, stop_check=_processing_workflow_is_pause_requested)
+    return _run_repair_task(run_id, stop_check=_processing_workflow_is_pause_requested)
 
 
 def _run_processing_voices_stage():
     run_id = _start_task_run("voices")
-    return run_voice_processing_task(run_id, stop_check=_processing_workflow_is_pause_requested)
+    return _run_voices_task(run_id, stop_check=_processing_workflow_is_pause_requested)
 
 
 def _auto_prepare_segments_for_processing():
@@ -2211,6 +2575,7 @@ def _run_processing_audio_stage():
     remaining = _workflow_pending_audio_indices()
     if remaining:
         raise RuntimeError(f"Audio generation stopped with {len(remaining)} pending segment(s) remaining.")
+    _mark_processing_stage_completed_marker("audio")
     return True
 
 
@@ -2543,6 +2908,8 @@ async def upload_file(file: UploadFile = File(...)):
                 pass
 
     state["input_file_path"] = file_path
+    state["render_prep_complete"] = False
+    state.pop(PROCESSING_STAGE_MARKERS_KEY, None)
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
@@ -2562,6 +2929,11 @@ async def upload_file(file: UploadFile = File(...)):
         "source_type": source_type,
         "chapter_count": chapter_count,
     }
+
+
+@app.get("/api/script_ingestion/preflight")
+async def get_script_ingestion_preflight():
+    return _script_ingestion_preflight_summary()
 
 
 @app.post("/api/reset_project")
@@ -2596,6 +2968,7 @@ async def reset_project():
         VOICE_CONFIG_PATH,
         CHUNKS_PATH,
         project_manager.transcription_cache_path,
+        SCRIPT_REPAIR_TRACE_PATH,
         AUDIOBOOK_PATH,
         M4B_PATH,
         AUDIO_QUEUE_STATE_PATH,
@@ -2658,7 +3031,23 @@ async def reset_project():
     return {"status": "reset", "removed": removed}
 
 @app.post("/api/generate_script")
-async def generate_script(background_tasks: BackgroundTasks):
+async def generate_script(request: ScriptGenerationRequest, background_tasks: BackgroundTasks):
+    _ensure_task_not_running("script", "Script generation is already running.")
+    preflight = _script_ingestion_preflight_summary()
+    if preflight.get("warn") and not request.force_reimport and not request.skip_import:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": preflight.get("message") or "Existing project matches the uploaded EPUB.",
+                "code": "script_ingestion_conflict",
+                "preflight": preflight,
+            },
+        )
+    if request.skip_import:
+        return _mark_script_stage_skipped_for_existing_project()
+    if request.force_reimport:
+        _clear_project_derived_state(preserve_input_file=True)
+
     # Get input file from state.json
     state_path = os.path.join(ROOT_DIR, "state.json")
     if not os.path.exists(state_path):
@@ -2672,7 +3061,7 @@ async def generate_script(background_tasks: BackgroundTasks):
          raise HTTPException(status_code=400, detail="No input file found in state")
 
     run_id = _start_task_run("script")
-    background_tasks.add_task(run_process, [sys.executable, "-u", "generate_script.py", input_file], "script", run_id)
+    background_tasks.add_task(_run_generate_script_task, run_id)
     return {"status": "started", "run_id": run_id}
 
 @app.post("/api/review_script")
@@ -2681,7 +3070,7 @@ async def review_script(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
     run_id = _start_task_run("review")
-    background_tasks.add_task(run_process, [sys.executable, "-u", "review_script.py"], "review", run_id)
+    background_tasks.add_task(_run_review_script_task, run_id)
     return {"status": "started", "run_id": run_id}
 
 @app.post("/api/script_sanity_check")
@@ -2690,7 +3079,7 @@ async def script_sanity_check(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
     run_id = _start_task_run("sanity")
-    background_tasks.add_task(run_script_sanity_task, run_id)
+    background_tasks.add_task(_run_sanity_task, run_id)
     return {"status": "started", "run_id": run_id}
 
 @app.post("/api/replace_missing_chunks")
@@ -2699,7 +3088,7 @@ async def replace_missing_chunks(background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
     run_id = _start_task_run("repair")
-    background_tasks.add_task(run_script_repair_task, run_id)
+    background_tasks.add_task(_run_repair_task, run_id)
     return {"status": "started", "run_id": run_id}
 
 @app.get("/api/annotated_script")
@@ -2741,6 +3130,22 @@ async def start_processing_workflow(request: ProcessingWorkflowRequest):
             "process_voices": bool(request.process_voices),
             "generate_audio": bool(request.generate_audio),
         }
+        if not workflow_state.get("paused"):
+            preflight = _script_ingestion_preflight_summary()
+            if preflight.get("warn") and not request.force_reimport and not request.skip_script_stage:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": preflight.get("message") or "Existing project matches the uploaded EPUB.",
+                        "code": "script_ingestion_conflict",
+                        "preflight": preflight,
+                    },
+                )
+            if request.force_reimport:
+                _clear_project_derived_state(preserve_input_file=True)
+            if request.skip_script_stage:
+                _mark_processing_stage_completed_marker("script")
+
         if workflow_state.get("paused"):
             workflow_state["options"] = options
             workflow_state["running"] = True
@@ -2750,14 +3155,21 @@ async def start_processing_workflow(request: ProcessingWorkflowRequest):
             workflow_state["resume_count"] = int(workflow_state.get("resume_count", 0) or 0) + 1
             _append_processing_workflow_log_locked("Resuming processing workflow.")
         else:
+            completed_stages = _derived_processing_completed_stages(options)
             process_state["processing_workflow"] = _new_processing_workflow_state() | {
                 "running": True,
                 "paused": False,
                 "pause_requested": False,
                 "options": options,
                 "started_at": time.time(),
+                "completed_stages": completed_stages,
             }
             _append_processing_workflow_log_locked("Starting processing workflow.")
+            if completed_stages:
+                labels = [PROCESSING_WORKFLOW_STAGE_LABELS.get(stage, stage) for stage in completed_stages]
+                _append_processing_workflow_log_locked(
+                    f"Skipping already completed stages: {', '.join(labels)}."
+                )
 
         _start_processing_workflow_thread_locked()
         return process_state["processing_workflow"]
@@ -2948,6 +3360,19 @@ def run_voice_processing_task(run_id: str, stop_check=None):
             if not entry.get("type"):
                 entry["type"] = "design"
                 changed = True
+            ref_audio = (entry.get("ref_audio") or "").strip()
+            ref_audio_path = os.path.join(ROOT_DIR, ref_audio) if ref_audio else ""
+            reusable_match = _find_saved_voice_option_for_speaker(speaker)
+            if reusable_match and not (ref_audio and os.path.exists(ref_audio_path)):
+                entry["type"] = reusable_match["type"]
+                entry["ref_audio"] = reusable_match["ref_audio"]
+                if reusable_match.get("ref_text") and not (entry.get("ref_text") or "").strip():
+                    entry["ref_text"] = reusable_match["ref_text"]
+                changed = True
+                log(
+                    f"Auto-populated {speaker} from saved voice '{reusable_match.get('source_name') or reusable_match['ref_audio']}'."
+                )
+                continue
             if not (entry.get("ref_text") or "").strip():
                 suggested = voice.get("suggested_sample_text") or project_manager.suggest_design_sample_text(speaker, chunks)
                 if suggested:
@@ -2963,8 +3388,9 @@ def run_voice_processing_task(run_id: str, stop_check=None):
             speaker = voice["name"]
             entry = updated_config.get(speaker, {})
             alias = (entry.get("alias") or "").strip()
-            if alias and alias in known_names and alias != speaker:
-                log(f"Skipping {speaker}: aliased to {alias}.")
+            alias_target = _resolve_voice_alias_target(speaker, alias, known_names)
+            if alias_target:
+                log(f"Skipping {speaker}: aliased to {alias_target}.")
                 continue
             if entry.get("type", "design") != "design":
                 log(f"Skipping {speaker}: voice type is {entry.get('type')}.")
@@ -2981,33 +3407,51 @@ def run_voice_processing_task(run_id: str, stop_check=None):
             log("Task voices completed successfully.")
             return True
 
+        failures = []
+        created_count = 0
         for index, speaker in enumerate(eligible, start=1):
             ensure_active()
             voice_data = updated_config.setdefault(speaker, {})
             description = (voice_data.get("description") or "").strip()
             sample_text = (voice_data.get("ref_text") or "").strip() or project_manager.suggest_design_sample_text(speaker, chunks)
 
-            if not description:
-                log(f"[{index}/{len(eligible)}] Suggesting voice description for {speaker}...")
-                suggestion = suggest_voice_description_sync(speaker)
-                description = suggestion["voice"].strip()
-                voice_data["description"] = description
-                with open(VOICE_CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(updated_config, f, indent=2, ensure_ascii=False)
+            try:
+                if not description:
+                    log(f"[{index}/{len(eligible)}] Suggesting voice description for {speaker}...")
+                    suggestion = suggest_voice_description_sync(speaker)
+                    description = suggestion["voice"].strip()
+                    voice_data["description"] = description
+                    with open(VOICE_CONFIG_PATH, "w", encoding="utf-8") as f:
+                        json.dump(updated_config, f, indent=2, ensure_ascii=False)
 
-            if not sample_text:
-                raise ValueError(f"No sample text available for '{speaker}'")
+                if not sample_text:
+                    raise ValueError(f"No sample text available for '{speaker}'")
 
-            log(f"[{index}/{len(eligible)}] Generating reusable voice for {speaker}...")
-            materialized = project_manager.materialize_design_voice(
-                speaker=speaker,
-                description=description,
-                sample_text=sample_text,
-                force=False,
-                voice_config=updated_config,
+                log(f"[{index}/{len(eligible)}] Generating reusable voice for {speaker}...")
+                materialized = project_manager.materialize_design_voice(
+                    speaker=speaker,
+                    description=description,
+                    sample_text=sample_text,
+                    force=False,
+                    voice_config=updated_config,
+                )
+                updated_config = materialized["voice_config"]
+                created_count += 1
+                log(f"[{index}/{len(eligible)}] Created reusable voice for {speaker}.")
+            except WorkflowPauseRequested:
+                raise
+            except Exception as e:
+                failures.append((speaker, str(e)))
+                log(f"[{index}/{len(eligible)}] Failed to create voice for {speaker}: {e}")
+                continue
+
+        if failures:
+            failure_preview = ", ".join(f"{speaker} ({message})" for speaker, message in failures[:5])
+            if len(failures) > 5:
+                failure_preview += f", and {len(failures) - 5} more"
+            raise RuntimeError(
+                f"Created {created_count} voice(s), but {len(failures)} speaker(s) failed: {failure_preview}"
             )
-            updated_config = materialized["voice_config"]
-            log(f"[{index}/{len(eligible)}] Created reusable voice for {speaker}.")
 
         log("Task voices completed successfully.")
         success = True
@@ -3081,6 +3525,12 @@ async def get_audiobook():
 async def get_chunks():
     chunks = project_manager.reconcile_chunk_audio_states()
     return chunks
+
+
+@app.post("/api/chunks/sync_from_script_if_stale")
+async def sync_chunks_from_script_if_stale():
+    result = project_manager.sync_chunks_from_script_if_stale()
+    return result
 
 class ChunkRestoreRequest(BaseModel):
     chunk: dict
@@ -3253,6 +3703,17 @@ async def validate_proofread_clip(index: str, request: ProofreadValidateRequest)
     threshold = max(0.0, min(float(request.threshold or 0.0), 1.0))
     try:
         chunk = project_manager.manually_validate_proofread_clip(index, threshold=threshold)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if chunk is None:
+        raise HTTPException(status_code=404, detail="Invalid chunk id")
+    return {"status": "ok", "chunk": chunk}
+
+@app.post("/api/proofread/{index}/compare")
+async def compare_proofread_clip(index: str, request: ProofreadCompareRequest):
+    threshold = max(0.0, min(float(request.threshold or 0.0), 1.0))
+    try:
+        chunk = project_manager.compare_proofread_clip(index, threshold=threshold)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if chunk is None:
@@ -3766,6 +4227,11 @@ async def load_script(request: ScriptLoadRequest):
     if os.path.exists(CHUNKS_PATH):
         os.remove(CHUNKS_PATH)
 
+    state = _load_project_state_payload()
+    state["render_prep_complete"] = False
+    state[PROCESSING_STAGE_MARKERS_KEY] = {"script": {"completed_at": time.time()}}
+    _save_project_state_payload(state)
+
     logger.info(f"Script '{request.name}' loaded")
     return {"status": "loaded", "name": request.name}
 
@@ -3802,6 +4268,82 @@ def _save_manifest(path, manifest):
     """Write a JSON manifest file."""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+
+def _normalize_saved_voice_name(name: str) -> str:
+    return project_manager._normalize_speaker_name(name)
+
+
+def _find_saved_voice_option_for_speaker(speaker: str):
+    normalized_speaker = _normalize_saved_voice_name(speaker)
+    if not normalized_speaker or normalized_speaker == _normalize_saved_voice_name("NARRATOR"):
+        return None
+
+    def _build_rel_audio(directory_name: str, entry: dict) -> str:
+        filename = (entry.get("filename") or "").strip()
+        return f"{directory_name}/{filename}" if filename else ""
+
+    def _match_score(entry: dict, fields):
+        for priority, field in enumerate(fields):
+            candidate = _normalize_saved_voice_name(entry.get(field, ""))
+            if candidate and candidate == normalized_speaker:
+                return priority
+        return None
+
+    best = None
+
+    for entry in _load_manifest(CLONE_VOICES_MANIFEST):
+        rel_audio = _build_rel_audio("clone_voices", entry)
+        if not rel_audio or not os.path.exists(os.path.join(ROOT_DIR, rel_audio)):
+            continue
+        score = _match_score(entry, ("speaker", "name"))
+        if score is None:
+            continue
+        candidate = {
+            "type": "clone",
+            "ref_audio": rel_audio,
+            "ref_text": (entry.get("sample_text") or "").strip(),
+            "source_name": (entry.get("speaker") or entry.get("name") or "").strip(),
+            "priority": (0, score),
+        }
+        if best is None or candidate["priority"] < best["priority"]:
+            best = candidate
+
+    for entry in _load_manifest(DESIGNED_VOICES_MANIFEST):
+        rel_audio = _build_rel_audio("designed_voices", entry)
+        if not rel_audio or not os.path.exists(os.path.join(ROOT_DIR, rel_audio)):
+            continue
+        score = _match_score(entry, ("speaker", "name"))
+        if score is None:
+            continue
+        candidate = {
+            "type": "clone",
+            "ref_audio": rel_audio,
+            "ref_text": (entry.get("sample_text") or "").strip(),
+            "source_name": (entry.get("speaker") or entry.get("name") or "").strip(),
+            "priority": (1, score),
+        }
+        if best is None or candidate["priority"] < best["priority"]:
+            best = candidate
+
+    if best:
+        best.pop("priority", None)
+    return best
+
+
+def _resolve_voice_alias_target(speaker: str, alias: str, known_names):
+    normalized_speaker = _normalize_saved_voice_name(speaker)
+    if not normalized_speaker:
+        return None
+
+    normalized_alias = _normalize_saved_voice_name(alias)
+    if not normalized_alias or normalized_alias == normalized_speaker:
+        return None
+
+    for name in known_names:
+        if _normalize_saved_voice_name(name) == normalized_alias:
+            return name
+    return None
 
 @app.post("/api/voice_design/preview")
 async def voice_design_preview(request: VoiceDesignPreviewRequest):

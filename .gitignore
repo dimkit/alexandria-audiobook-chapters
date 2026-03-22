@@ -16,6 +16,7 @@ voices.json
 annotated_script.json
 annotated_script.txt
 cloned_audiobook.mp3
+optimized_audiobook.zip
 audacity_export.zip
 audiobook.m4b
 m4b_cover.jpg
@@ -41,6 +42,8 @@ script_sanity_check.json
 script_generation_checkpoint.json
 script_review_checkpoint.json
 temp_batch_*.wav
+temp_chunk_*.wav
+transcription_cache.json
 app/flash-attention/
 error_screenshot.png
 app/error_screenshot.png

@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 import zipfile
 
@@ -117,6 +118,124 @@ class ReconcileChunkAudioStatesTests(unittest.TestCase):
         self.assertEqual(recovered[0]["status"], "done")
         self.assertTrue(recovered[0]["audio_validation"]["is_valid"])
         self.assertNotIn("generation_token", recovered[0])
+
+    def test_sync_chunks_from_script_if_stale_rebuilds_when_script_is_newer(self):
+        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "entries": [
+                    {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
+                    {"speaker": "NARRATOR", "text": "First body text.", "instruct": "", "chapter": "Chapter 1"},
+                    {"speaker": "NARRATOR", "text": "Chapter Two", "instruct": "", "chapter": "Chapter 2"},
+                    {"speaker": "NARRATOR", "text": "Second body text.", "instruct": "", "chapter": "Chapter 2"},
+                ],
+                "dictionary": [],
+            }, f)
+
+        stale_chunks = [{
+            "id": 0,
+            "uid": "oldchunk",
+            "speaker": "NARRATOR",
+            "text": "Old stale chunk.",
+            "instruct": "",
+            "status": "done",
+            "audio_path": "voicelines/old.mp3",
+            "audio_validation": {"is_valid": True},
+            "auto_regen_count": 0,
+            "chapter": "Old Chapter",
+        }]
+        self.manager.save_chunks(stale_chunks)
+        os.utime(self.manager.chunks_path, (time.time() - 10, time.time() - 10))
+        os.utime(self.manager.script_path, None)
+
+        result = self.manager.sync_chunks_from_script_if_stale()
+        synced = self.manager.load_chunks()
+
+        self.assertTrue(result["synced"])
+        self.assertEqual(result["reason"], "script_newer_than_chunks")
+        self.assertGreater(len(synced), 1)
+        self.assertEqual({chunk["chapter"] for chunk in synced}, {"Chapter 1", "Chapter 2"})
+        self.assertTrue(all(chunk["status"] == "pending" for chunk in synced))
+        self.assertTrue(all(chunk["audio_path"] is None for chunk in synced))
+
+    def test_sync_chunks_from_script_if_stale_skips_when_chunks_are_current(self):
+        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "entries": [
+                    {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
+                    {"speaker": "NARRATOR", "text": "Current chunk text.", "instruct": "", "chapter": "Chapter 1"},
+                ],
+                "dictionary": [],
+            }, f)
+
+        current_chunks = [{
+            "id": 0,
+            "uid": "currentchunk",
+            "speaker": "NARRATOR",
+            "text": "Current chunk text.",
+            "instruct": "",
+            "status": "done",
+            "audio_path": "voicelines/current.mp3",
+            "audio_validation": {"is_valid": True},
+            "auto_regen_count": 0,
+            "chapter": "Chapter 1",
+        }]
+        self.manager.save_chunks(current_chunks)
+        os.utime(self.manager.script_path, (time.time() - 10, time.time() - 10))
+        os.utime(self.manager.chunks_path, None)
+
+        result = self.manager.sync_chunks_from_script_if_stale()
+        synced = self.manager.load_chunks()
+
+        self.assertFalse(result["synced"])
+        self.assertEqual(result["reason"], "chunks_current")
+        self.assertEqual(synced[0]["uid"], "currentchunk")
+        self.assertEqual(synced[0]["status"], "done")
+
+
+class ChunkBackupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root_dir = self.temp_dir.name
+        os.makedirs(os.path.join(self.root_dir, "voicelines"), exist_ok=True)
+        os.makedirs(os.path.join(self.root_dir, "app"), exist_ok=True)
+
+        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
+            json.dump({"entries": [], "dictionary": []}, f)
+
+        self.manager = ProjectManager(self.root_dir)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _read_json(self, relative_path):
+        with open(os.path.join(self.root_dir, relative_path), "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_chunk_backups_keep_latest_and_preserve_most_audio_version(self):
+        low_audio_chunks = [
+            {"id": 0, "uid": "a", "speaker": "NARRATOR", "text": "One", "instruct": "", "status": "done", "audio_path": "voicelines/a.mp3"},
+            {"id": 1, "uid": "b", "speaker": "NARRATOR", "text": "Two", "instruct": "", "status": "pending", "audio_path": None},
+        ]
+        high_audio_chunks = [
+            {"id": 0, "uid": "a", "speaker": "NARRATOR", "text": "One", "instruct": "", "status": "done", "audio_path": "voicelines/a.mp3"},
+            {"id": 1, "uid": "b", "speaker": "NARRATOR", "text": "Two", "instruct": "", "status": "done", "audio_path": "voicelines/b.mp3"},
+        ]
+        regressed_chunks = [
+            {"id": 0, "uid": "a", "speaker": "NARRATOR", "text": "One revised", "instruct": "", "status": "done", "audio_path": "voicelines/a.mp3"},
+            {"id": 1, "uid": "b", "speaker": "NARRATOR", "text": "Two revised", "instruct": "", "status": "pending", "audio_path": None},
+        ]
+
+        self.manager.save_chunks(low_audio_chunks)
+        self.assertEqual(self._read_json("backups/chunks/chunks.latest.json"), low_audio_chunks)
+        self.assertEqual(self._read_json("backups/chunks/chunks.most_audio.json"), low_audio_chunks)
+
+        self.manager.save_chunks(high_audio_chunks)
+        self.assertEqual(self._read_json("backups/chunks/chunks.latest.json"), high_audio_chunks)
+        self.assertEqual(self._read_json("backups/chunks/chunks.most_audio.json"), high_audio_chunks)
+
+        self.manager.save_chunks(regressed_chunks)
+        self.assertEqual(self._read_json("backups/chunks/chunks.latest.json"), regressed_chunks)
+        self.assertEqual(self._read_json("backups/chunks/chunks.most_audio.json"), high_audio_chunks)
 
 
 class TranscriptionCacheTests(unittest.TestCase):
@@ -1526,7 +1645,7 @@ class RepairLostAudioLinksTests(unittest.TestCase):
         ]
         dictionary_entries = []
         voice_config = {}
-        frequency_cache = self.manager._build_speaker_word_frequency_cache(chunks, dictionary_entries, voice_config)
+        match_cache = self.manager._build_repair_match_cache(chunks, dictionary_entries, voice_config)
 
         original_metrics = self.manager._proofread_similarity_metrics
         try:
@@ -1544,12 +1663,9 @@ class RepairLostAudioLinksTests(unittest.TestCase):
             match = self.manager._best_discarded_repair_match(
                 "narrator",
                 "Common words aurora lantern linger softly tonight.",
-                chunks,
-                dictionary_entries,
-                voice_config,
                 set(),
                 0.9,
-                speaker_word_frequency_cache=frequency_cache,
+                match_cache,
             )
 
             self.assertIsNotNone(match)
@@ -1559,6 +1675,65 @@ class RepairLostAudioLinksTests(unittest.TestCase):
             self.assertEqual(match["metrics"]["dropped_low_frequency_words"], ["aurora", "lantern"])
         finally:
             self.manager._proofread_similarity_metrics = original_metrics
+
+    def test_repair_lost_audio_links_batches_rejected_checkpoint_writes(self):
+        os.makedirs(os.path.join(self.root_dir, "voicelines", "discarded"), exist_ok=True)
+        os.makedirs(os.path.join(self.root_dir, "app"), exist_ok=True)
+        with open(os.path.join(self.root_dir, "app", "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"proofread": {"certainty_threshold": 0.75}}, f)
+
+        discarded_paths = []
+        chunks = []
+        for i in range(30):
+            rel = f"voicelines/discarded/voiceline_{i+1:04d}_narrator.wav"
+            self._write_wav(rel, 0.4)
+            discarded_paths.append(rel)
+            chunks.append({
+                "id": i,
+                "uid": f"u{i}",
+                "speaker": "Narrator",
+                "text": f"Recovered rejected line {i}.",
+                "instruct": "",
+                "status": "pending",
+                "audio_path": None,
+                "audio_validation": None,
+                "auto_regen_count": 0,
+            })
+        self.manager.save_chunks(chunks)
+
+        original_transcribe_bulk = self.manager.transcribe_audio_paths_bulk
+        original_validate = self.manager._validate_audio_path_for_chunk
+        original_atomic_write = self.manager._atomic_json_write
+        write_calls = []
+        try:
+            self.manager.transcribe_audio_paths_bulk = lambda paths, progress_callback=None: {
+                path: {
+                    "text": f"Recovered rejected line {int(os.path.basename(path).split('_')[1]) - 1}.",
+                    "normalized_text": self.manager._normalize_asr_text(
+                        f"Recovered rejected line {int(os.path.basename(path).split('_')[1]) - 1}."
+                    ),
+                }
+                for path in paths
+            }
+            self.manager._validate_audio_path_for_chunk = lambda chunk, path, dictionary_entries: {"is_valid": True}
+
+            def tracked_atomic_write(payload, destination_path):
+                if destination_path == self.manager.chunks_path:
+                    write_calls.append(destination_path)
+                return original_atomic_write(payload, destination_path)
+
+            self.manager._atomic_json_write = tracked_atomic_write
+
+            result = self.manager.repair_lost_audio_links(use_asr=True, rejected_only=True)
+            repaired = self.manager.load_chunks()
+
+            self.assertEqual(result["discarded_retry_relinked"], 30)
+            self.assertTrue(all(chunk.get("audio_path") for chunk in repaired))
+            self.assertEqual(len(write_calls), 2)
+        finally:
+            self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk
+            self.manager._validate_audio_path_for_chunk = original_validate
+            self.manager._atomic_json_write = original_atomic_write
 
     def test_repair_commit_copies_cached_transcription_to_renamed_uid_path(self):
         os.makedirs(os.path.join(self.root_dir, "voicelines", "discarded"), exist_ok=True)
@@ -1596,6 +1771,85 @@ class RepairLostAudioLinksTests(unittest.TestCase):
         cached = self.manager._lookup_cached_transcription(committed)
         self.assertIsNotNone(cached)
         self.assertEqual(cached["text"], "Recovered line.")
+
+    def test_repair_lost_audio_links_exact_match_ignores_punctuation(self):
+        self._write_wav("voicelines/voiceline_0001_narrator.wav", 0.4)
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "u0",
+                "speaker": "Narrator",
+                "text": "What’s a cutie mark?!",
+                "instruct": "",
+                "status": "pending",
+                "audio_path": None,
+                "audio_validation": None,
+                "auto_regen_count": 0,
+            },
+        ])
+
+        original_transcribe_bulk = self.manager.transcribe_audio_paths_bulk
+        original_validate = self.manager._validate_audio_path_for_chunk
+        try:
+            self.manager.transcribe_audio_paths_bulk = lambda paths, progress_callback=None: {
+                paths[0]: {
+                    "text": "What's a cutie mark",
+                    "normalized_text": self.manager._normalize_asr_text("What's a cutie mark"),
+                }
+            }
+            self.manager._validate_audio_path_for_chunk = lambda chunk, path, dictionary_entries: {"is_valid": True}
+
+            result = self.manager.repair_lost_audio_links(use_asr=True)
+            repaired = self.manager.load_chunks()
+
+            self.assertEqual(result["relinked"], 1)
+            self.assertEqual(repaired[0]["audio_path"], "voicelines/voiceline_u0_narrator.wav")
+            self.assertTrue(repaired[0]["audio_validation"]["repair_exact_transcript_match"])
+        finally:
+            self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk
+            self.manager._validate_audio_path_for_chunk = original_validate
+
+    def test_repair_lost_audio_links_discarded_retry_ignores_punctuation(self):
+        os.makedirs(os.path.join(self.root_dir, "voicelines", "discarded"), exist_ok=True)
+        self._write_wav("voicelines/discarded/voiceline_0001_narrator.wav", 0.4)
+        os.makedirs(os.path.join(self.root_dir, "app"), exist_ok=True)
+        with open(os.path.join(self.root_dir, "app", "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"proofread": {"certainty_threshold": 0.75}}, f)
+
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "u0",
+                "speaker": "Narrator",
+                "text": "What’s a cutie mark?!",
+                "instruct": "",
+                "status": "pending",
+                "audio_path": None,
+                "audio_validation": None,
+                "auto_regen_count": 0,
+            },
+        ])
+
+        original_transcribe_bulk = self.manager.transcribe_audio_paths_bulk
+        original_validate = self.manager._validate_audio_path_for_chunk
+        try:
+            self.manager.transcribe_audio_paths_bulk = lambda paths, progress_callback=None: {
+                paths[0]: {
+                    "text": "What's a cutie mark",
+                    "normalized_text": self.manager._normalize_asr_text("What's a cutie mark"),
+                }
+            }
+            self.manager._validate_audio_path_for_chunk = lambda chunk, path, dictionary_entries: {"is_valid": True}
+
+            result = self.manager.repair_lost_audio_links(use_asr=True, rejected_only=True)
+            repaired = self.manager.load_chunks()
+
+            self.assertEqual(result["discarded_retry_relinked"], 1)
+            self.assertEqual(repaired[0]["audio_path"], "voicelines/voiceline_u0_narrator.wav")
+            self.assertTrue(repaired[0]["audio_validation"]["repair_certainty_match"])
+        finally:
+            self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk
+            self.manager._validate_audio_path_for_chunk = original_validate
 
     def test_proofread_uses_alias_tolerant_speaker_match(self):
         uid = "0123456789abcdef0123456789abcdef"
@@ -1636,6 +1890,104 @@ class RepairLostAudioLinksTests(unittest.TestCase):
             self.assertGreaterEqual(proofread["score"], 0.9)
         finally:
             self.manager.transcribe_audio_path = original_transcribe
+
+    def test_proofread_similarity_ignores_punctuation(self):
+        metrics = self.manager._proofread_similarity_metrics(
+            "Wait... what?! Are you sure: 42?",
+            "Wait what are you sure 42",
+        )
+        self.assertEqual(metrics["score"], 1.0)
+
+    def test_proofread_similarity_accepts_common_abbreviation_expansions(self):
+        metrics = self.manager._proofread_similarity_metrics(
+            "Dr Smith arrived just in time.",
+            "Doctor Smith arrived just in time",
+        )
+        self.assertEqual(metrics["score"], 1.0)
+        self.assertTrue(metrics.get("abbreviation_expanded_match"))
+
+    def test_proofread_reuses_repair_cached_transcript_from_audio_validation(self):
+        uid = "44444444444444444444444444444444"
+        self._write_wav(f"voicelines/voiceline_{uid}_narrator.wav", 2.0)
+        text = "What’s a cutie mark?!"
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": uid,
+                "speaker": "Narrator",
+                "text": text,
+                "instruct": "",
+                "status": "done",
+                "audio_path": f"voicelines/voiceline_{uid}_narrator.wav",
+                "audio_validation": {
+                    "is_valid": True,
+                    "transcript_text": "What's a cutie mark",
+                    "normalized_transcript": self.manager._normalize_asr_text("What's a cutie mark"),
+                },
+                "auto_regen_count": 0,
+                "chapter": "Prologue",
+            },
+        ])
+
+        original_transcribe_bulk = self.manager.transcribe_audio_paths_bulk
+        try:
+            def should_not_run(paths, progress_callback=None):
+                raise AssertionError("Proofread should reuse repair-cached transcript from audio_validation")
+
+            self.manager.transcribe_audio_paths_bulk = should_not_run
+            result = self.manager.proofread_chunks(chapter="Prologue", threshold=0.9)
+            chunks = self.manager.load_chunks()
+            proofread = chunks[0]["proofread"]
+
+            self.assertEqual(result["processed"], 1)
+            self.assertEqual(proofread["transcript_text"], "What's a cutie mark")
+            self.assertTrue(proofread["passed"])
+        finally:
+            self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk
+
+    def test_proofread_reuses_cached_audio_duration_from_audio_validation(self):
+        uid = "45454545454545454545454545454545"
+        audio_path = f"voicelines/voiceline_{uid}_narrator.wav"
+        self._write_wav(audio_path, 2.0)
+        text = "Cached duration should be reused."
+        full_audio_path = os.path.join(self.root_dir, audio_path)
+        file_size = os.path.getsize(full_audio_path)
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": uid,
+                "speaker": "Narrator",
+                "text": text,
+                "instruct": "",
+                "status": "done",
+                "audio_path": audio_path,
+                "audio_validation": {
+                    "is_valid": True,
+                    "actual_duration_sec": 2.0,
+                    "file_size_bytes": file_size,
+                    "transcript_text": text,
+                    "normalized_transcript": self.manager._normalize_asr_text(text),
+                },
+                "auto_regen_count": 0,
+                "chapter": "Prologue",
+            },
+        ])
+
+        import project as project_module
+        original_duration_fn = project_module.get_audio_duration_seconds
+        try:
+            def should_not_run(_path):
+                raise AssertionError("Proofread should reuse cached audio duration from audio_validation")
+
+            project_module.get_audio_duration_seconds = should_not_run
+            result = self.manager.proofread_chunks(chapter="Prologue", threshold=0.9)
+            proofread = self.manager.load_chunks()[0]["proofread"]
+
+            self.assertEqual(result["processed"], 1)
+            self.assertEqual(proofread["actual_duration_sec"], 2.0)
+            self.assertTrue(proofread["passed"])
+        finally:
+            project_module.get_audio_duration_seconds = original_duration_fn
 
     def test_proofread_batches_chunk_writes(self):
         uids = [
@@ -1693,7 +2045,7 @@ class RepairLostAudioLinksTests(unittest.TestCase):
 
     def test_proofread_auto_fails_large_duration_mismatch_without_asr(self):
         uid = "fedcba9876543210fedcba9876543210"
-        self._write_wav(f"voicelines/voiceline_{uid}_narrator.wav", 0.25)
+        self._write_wav(f"voicelines/voiceline_{uid}_narrator.wav", 3.0)
         self.manager.save_chunks([
             {
                 "id": 0,
@@ -1702,7 +2054,9 @@ class RepairLostAudioLinksTests(unittest.TestCase):
                 "text": (
                     "This is a much longer line that should auto fail due to duration mismatch without transcription. "
                     "It keeps going well beyond a normal clip length so the duration delta is obviously extreme. "
-                    "That ensures the proofread pass still short circuits before ASR even with the wider tolerance."
+                    "That ensures the proofread pass still short circuits before ASR even with the wider tolerance. "
+                    "Additional filler words push the expected speaking time high enough that the new long clip gate "
+                    "still clearly identifies this as an impossible duration match without needing Whisper at all."
                 ),
                 "instruct": "",
                 "status": "done",
@@ -1726,6 +2080,161 @@ class RepairLostAudioLinksTests(unittest.TestCase):
             self.assertEqual(result["auto_failed"], 1)
             self.assertEqual(proofread["score"], 0.0)
             self.assertEqual(proofread["auto_failed_reason"], "duration_outlier")
+        finally:
+            self.manager.transcribe_audio_path = original_transcribe
+
+    def test_proofread_long_chunk_uses_more_tolerant_duration_gate(self):
+        uid = "abcdefabcdefabcdefabcdefabcdefab"
+        self._write_wav(f"voicelines/voiceline_{uid}_narrator.wav", 0.25)
+        long_text = (
+            "This is a deliberately long narration block that goes well past twenty five words so that proofread should "
+            "use the wider duration tolerance before deciding whether to skip ASR and auto fail the line outright."
+        )
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": uid,
+                "speaker": "Narrator",
+                "text": long_text,
+                "instruct": "",
+                "status": "done",
+                "audio_path": f"voicelines/voiceline_{uid}_narrator.wav",
+                "audio_validation": None,
+                "auto_regen_count": 0,
+                "chapter": "Prologue",
+            },
+        ])
+
+        original_transcribe = self.manager.transcribe_audio_path
+        try:
+            self.manager.transcribe_audio_path = lambda relative_path: {
+                "text": long_text,
+                "normalized_text": self.manager._normalize_asr_text(long_text),
+            }
+            result = self.manager.proofread_chunks(chapter="Prologue", threshold=0.9)
+            chunks = self.manager.load_chunks()
+            proofread = chunks[0]["proofread"]
+
+            self.assertEqual(result["processed"], 1)
+            self.assertEqual(result["auto_failed"], 0)
+            self.assertIsNone(proofread["auto_failed_reason"])
+            self.assertTrue(proofread["passed"])
+        finally:
+            self.manager.transcribe_audio_path = original_transcribe
+
+    def test_proofread_short_audio_always_runs_asr(self):
+        uid = "1234567890abcdef1234567890abcdef"
+        self._write_wav(f"voicelines/voiceline_{uid}_narrator.wav", 1.5)
+        text = (
+            "This transcript is intentionally much longer than the short clip duration so the duration gate would "
+            "normally auto fail it if the short-audio ASR bypass were not in place."
+        )
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": uid,
+                "speaker": "Narrator",
+                "text": text,
+                "instruct": "",
+                "status": "done",
+                "audio_path": f"voicelines/voiceline_{uid}_narrator.wav",
+                "audio_validation": None,
+                "auto_regen_count": 0,
+                "chapter": "Prologue",
+            },
+        ])
+
+        original_transcribe = self.manager.transcribe_audio_path
+        try:
+            self.manager.transcribe_audio_path = lambda relative_path: {
+                "text": text,
+                "normalized_text": self.manager._normalize_asr_text(text),
+            }
+            result = self.manager.proofread_chunks(chapter="Prologue", threshold=0.9)
+            chunks = self.manager.load_chunks()
+            proofread = chunks[0]["proofread"]
+
+            self.assertEqual(result["processed"], 1)
+            self.assertEqual(result["auto_failed"], 0)
+            self.assertIsNone(proofread["auto_failed_reason"])
+            self.assertTrue(proofread["passed"])
+        finally:
+            self.manager.transcribe_audio_path = original_transcribe
+
+    def test_compare_proofread_clip_forces_transcript_on_duration_outlier(self):
+        uid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+        self._write_wav(f"voicelines/voiceline_{uid}_narrator.wav", 3.0)
+        text = (
+            "This line is intentionally long enough that the normal proofread duration gate would have rejected it "
+            "without generating a transcript first."
+        )
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": uid,
+                "speaker": "Narrator",
+                "text": text,
+                "instruct": "",
+                "status": "done",
+                "audio_path": f"voicelines/voiceline_{uid}_narrator.wav",
+                "audio_validation": None,
+                "auto_regen_count": 0,
+                "chapter": "Prologue",
+            },
+        ])
+
+        original_transcribe = self.manager.transcribe_audio_path
+        try:
+            self.manager.transcribe_audio_path = lambda relative_path: {
+                "text": text,
+                "normalized_text": self.manager._normalize_asr_text(text),
+            }
+            updated = self.manager.compare_proofread_clip(uid, threshold=0.9)
+            reloaded = self.manager.load_chunks()
+            proofread = reloaded[0]["proofread"]
+
+            self.assertIsNotNone(updated)
+            self.assertTrue(proofread["forced_compare"])
+            self.assertEqual(proofread["transcript_text"], text)
+            self.assertIsNone(proofread["auto_failed_reason"])
+            self.assertTrue(proofread["passed"])
+        finally:
+            self.manager.transcribe_audio_path = original_transcribe
+
+    def test_compare_proofread_clip_transcribes_even_on_speaker_mismatch(self):
+        uid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        self._write_wav(f"voicelines/voiceline_{uid}_other.wav", 1.5)
+        text = "Speaker mismatch but still compare."
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": uid,
+                "speaker": "Narrator",
+                "text": text,
+                "instruct": "",
+                "status": "done",
+                "audio_path": f"voicelines/voiceline_{uid}_other.wav",
+                "audio_validation": None,
+                "auto_regen_count": 0,
+                "chapter": "Prologue",
+            },
+        ])
+
+        original_transcribe = self.manager.transcribe_audio_path
+        try:
+            self.manager.transcribe_audio_path = lambda relative_path: {
+                "text": text,
+                "normalized_text": self.manager._normalize_asr_text(text),
+            }
+            self.manager.compare_proofread_clip(uid, threshold=0.9)
+            reloaded = self.manager.load_chunks()
+            proofread = reloaded[0]["proofread"]
+
+            self.assertTrue(proofread["forced_compare"])
+            self.assertFalse(proofread["speaker_match"])
+            self.assertEqual(proofread["transcript_text"], text)
+            self.assertFalse(proofread["passed"])
+            self.assertEqual(proofread["error"], "Audio filename speaker does not match the chunk speaker.")
         finally:
             self.manager.transcribe_audio_path = original_transcribe
 
@@ -1861,7 +2370,43 @@ class RepairLostAudioLinksTests(unittest.TestCase):
         self.assertTrue(reloaded[0]["proofread"]["passed"])
         self.assertEqual(reloaded[0]["proofread"]["score"], 1.0)
         self.assertTrue(reloaded[0]["proofread"]["manual_validated"])
+        self.assertFalse(reloaded[0]["proofread"]["manual_failed"])
         self.assertIsNone(reloaded[0]["proofread"]["error"])
+
+    def test_manually_validate_proofread_clip_toggles_validated_clip_to_manual_failure(self):
+        audio_path = "voicelines/voiceline_abababababababababababababababab_narrator.wav"
+        self._write_wav(audio_path, 1.0)
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "abababababababababababababababab",
+                "speaker": "Narrator",
+                "text": "Clip to reject manually.",
+                "status": "done",
+                "audio_path": audio_path,
+                "audio_validation": None,
+                "proofread": {
+                    "checked": True,
+                    "score": 1.0,
+                    "passed": True,
+                    "manual_validated": True,
+                    "audio_path": audio_path,
+                    "validated_at": 123.0,
+                },
+                "chapter": "Chapter One",
+            },
+        ])
+
+        updated = self.manager.manually_validate_proofread_clip("abababababababababababababababab", threshold=1.0)
+        reloaded = self.manager.load_chunks()
+
+        self.assertIsNotNone(updated)
+        self.assertTrue(reloaded[0]["proofread"]["checked"])
+        self.assertFalse(reloaded[0]["proofread"]["passed"])
+        self.assertEqual(reloaded[0]["proofread"]["score"], 0.0)
+        self.assertFalse(reloaded[0]["proofread"]["manual_validated"])
+        self.assertTrue(reloaded[0]["proofread"]["manual_failed"])
+        self.assertEqual(reloaded[0]["proofread"]["error"], "Manually marked as failed by user.")
 
     def test_clear_proofread_failures_keeps_manually_validated_clip(self):
         audio_path = "voicelines/voiceline_ffffffffffffffffffffffffffffffff_narrator.wav"
@@ -1989,6 +2534,93 @@ class RepairLostAudioLinksTests(unittest.TestCase):
             self.assertTrue(reloaded[0]["proofread"]["checked"])
             self.assertTrue(reloaded[0]["proofread"]["passed"])
             self.assertEqual(reloaded[0]["proofread"]["transcript_text"], "Cached transcript should be reused.")
+        finally:
+            self.manager.transcribe_audio_path = original_transcribe
+            self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk
+
+    def test_proofread_auto_resets_scope_when_everything_is_already_scored(self):
+        audio_path = "voicelines/voiceline_44444444444444444444444444444444_narrator.wav"
+        self._write_wav(audio_path, 1.0)
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "44444444444444444444444444444444",
+                "speaker": "Narrator",
+                "text": "Rerun this graded line.",
+                "status": "done",
+                "audio_path": audio_path,
+                "audio_validation": None,
+                "proofread": {
+                    "checked": True,
+                    "score": 0.4,
+                    "passed": False,
+                    "audio_path": audio_path,
+                    "transcript_text": "Rerun this graded line.",
+                    "normalized_transcript": "rerun this graded line",
+                },
+                "chapter": "Chapter One",
+            },
+        ])
+
+        original_transcribe = self.manager.transcribe_audio_path
+        original_transcribe_bulk = self.manager.transcribe_audio_paths_bulk
+        try:
+            def should_not_run(*args, **kwargs):
+                raise AssertionError("ASR should not rerun when transcript cache is preserved")
+            self.manager.transcribe_audio_path = should_not_run
+            self.manager.transcribe_audio_paths_bulk = should_not_run
+
+            result = self.manager.proofread_chunks(chapter="Chapter One", threshold=1.0)
+            reloaded = self.manager.load_chunks()
+
+            self.assertEqual(result["auto_reset_discarded"], 1)
+            self.assertEqual(result["processed"], 1)
+            self.assertTrue(reloaded[0]["proofread"]["checked"])
+            self.assertTrue(reloaded[0]["proofread"]["passed"])
+            self.assertEqual(reloaded[0]["proofread"]["transcript_text"], "Rerun this graded line.")
+        finally:
+            self.manager.transcribe_audio_path = original_transcribe
+            self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk
+
+    def test_proofread_auto_reset_preserves_manual_validation(self):
+        audio_path = "voicelines/voiceline_55555555555555555555555555555555_narrator.wav"
+        self._write_wav(audio_path, 1.0)
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "55555555555555555555555555555555",
+                "speaker": "Narrator",
+                "text": "Keep this manual validation.",
+                "status": "done",
+                "audio_path": audio_path,
+                "audio_validation": None,
+                "proofread": {
+                    "checked": True,
+                    "score": 1.0,
+                    "passed": True,
+                    "audio_path": audio_path,
+                    "manual_validated": True,
+                    "validated_at": 123.0,
+                },
+                "chapter": "Chapter One",
+            },
+        ])
+
+        original_transcribe = self.manager.transcribe_audio_path
+        original_transcribe_bulk = self.manager.transcribe_audio_paths_bulk
+        try:
+            def should_not_run(*args, **kwargs):
+                raise AssertionError("Manually validated unchanged audio should remain skipped")
+            self.manager.transcribe_audio_path = should_not_run
+            self.manager.transcribe_audio_paths_bulk = should_not_run
+
+            result = self.manager.proofread_chunks(chapter="Chapter One", threshold=1.0)
+            reloaded = self.manager.load_chunks()
+
+            self.assertEqual(result["auto_reset_discarded"], 0)
+            self.assertEqual(result["processed"], 0)
+            self.assertTrue(reloaded[0]["proofread"]["manual_validated"])
+            self.assertTrue(reloaded[0]["proofread"]["checked"])
         finally:
             self.manager.transcribe_audio_path = original_transcribe
             self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk

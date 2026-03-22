@@ -1,8 +1,11 @@
 import importlib.util
+import asyncio
 import json
 import os
 import tempfile
 import unittest
+from fastapi import BackgroundTasks
+from fastapi import HTTPException
 
 MODULE_PATH = os.path.join(os.path.dirname(__file__), "app.py")
 SPEC = importlib.util.spec_from_file_location("alexandria_app_module_archive", MODULE_PATH)
@@ -12,6 +15,213 @@ SPEC.loader.exec_module(app_module)
 
 
 class ProjectArchiveHelpersTests(unittest.TestCase):
+    def test_script_ingestion_preflight_warns_when_chunks_match_last_epub_chapter(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            input_path = os.path.join(temp_root, "uploads", "story.epub")
+            os.makedirs(os.path.dirname(input_path), exist_ok=True)
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write("stub")
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"input_file_path": input_path}, f)
+            with open(os.path.join(temp_root, "chunks.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {"id": 0, "chapter": "Chapter 1"},
+                        {"id": 1, "chapter": "Epilogue: Interview"},
+                    ],
+                    f,
+                )
+
+            original_root = app_module.ROOT_DIR
+            original_chunks = app_module.CHUNKS_PATH
+            original_loader = app_module.load_source_document
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
+                app_module.load_source_document = lambda _path: {
+                    "type": "epub",
+                    "chapters": [
+                        {"title": "Chapter 1", "text": "A"},
+                        {"title": "Epilogue: Interview", "text": "B"},
+                    ],
+                }
+                result = app_module._script_ingestion_preflight_summary()
+                self.assertTrue(result["warn"])
+                self.assertEqual(result["reason"], "matching_last_chapter")
+                self.assertEqual(result["last_chapter"], "Epilogue: Interview")
+                self.assertEqual(result["last_source_chapter"], "Epilogue: Interview")
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.CHUNKS_PATH = original_chunks
+                app_module.load_source_document = original_loader
+
+    def test_generate_script_skip_import_marks_script_complete_without_running(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            input_path = os.path.join(temp_root, "uploads", "story.epub")
+            os.makedirs(os.path.dirname(input_path), exist_ok=True)
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write("stub")
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"input_file_path": input_path}, f)
+
+            original_root = app_module.ROOT_DIR
+            original_run_process = app_module.run_process
+            original_preflight = app_module._script_ingestion_preflight_summary
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module._script_ingestion_preflight_summary = lambda: {"warn": True, "message": "already imported"}
+
+                def should_not_run(*_args, **_kwargs):
+                    raise AssertionError("run_process should not be called when script import is skipped")
+
+                app_module.run_process = should_not_run
+                result = asyncio.run(
+                    app_module.generate_script(
+                        app_module.ScriptGenerationRequest(skip_import=True),
+                        BackgroundTasks(),
+                    )
+                )
+                self.assertEqual(result["status"], "skipped")
+
+                with open(os.path.join(temp_root, "state.json"), "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                self.assertIn("script", state["processing_stage_markers"])
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.run_process = original_run_process
+                app_module._script_ingestion_preflight_summary = original_preflight
+
+    def test_start_processing_workflow_skips_persisted_completed_stages(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "processing_stage_markers": {
+                            "script": {"completed_at": 1},
+                            "review": {"completed_at": 2},
+                        }
+                    },
+                    f,
+                )
+
+            original_root = app_module.ROOT_DIR
+            original_workflow_path = app_module.PROCESSING_WORKFLOW_STATE_PATH
+            original_workflow_state = dict(app_module.process_state["processing_workflow"])
+            original_starter = app_module._start_processing_workflow_thread_locked
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.PROCESSING_WORKFLOW_STATE_PATH = os.path.join(temp_root, "processing_workflow_state.json")
+                app_module.process_state["processing_workflow"] = app_module._new_processing_workflow_state()
+                app_module._start_processing_workflow_thread_locked = lambda: None
+
+                result = asyncio.run(
+                    app_module.start_processing_workflow(
+                        app_module.ProcessingWorkflowRequest(process_voices=False, generate_audio=False)
+                    )
+                )
+
+                self.assertTrue(result["running"])
+                self.assertEqual(result["completed_stages"], ["script", "review"])
+                self.assertIn("Skipping already completed stages", result["logs"][-1])
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.PROCESSING_WORKFLOW_STATE_PATH = original_workflow_path
+                app_module.process_state["processing_workflow"] = original_workflow_state
+                app_module._start_processing_workflow_thread_locked = original_starter
+
+    def test_run_generate_script_task_clears_downstream_markers_and_marks_script_complete(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            input_path = os.path.join(temp_root, "uploads", "story.epub")
+            os.makedirs(os.path.dirname(input_path), exist_ok=True)
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write("story")
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "input_file_path": input_path,
+                        "processing_stage_markers": {
+                            "script": {"completed_at": 1},
+                            "review": {"completed_at": 2},
+                            "sanity": {"completed_at": 3},
+                        },
+                    },
+                    f,
+                )
+
+            original_root = app_module.ROOT_DIR
+            original_run_process = app_module.run_process
+            try:
+                app_module.ROOT_DIR = temp_root
+
+                def fake_run_process(command, task_name, run_id):
+                    self.assertEqual(task_name, "script")
+                    self.assertEqual(command[-1], input_path)
+                    return True
+
+                app_module.run_process = fake_run_process
+                self.assertTrue(app_module._run_generate_script_task("run-1"))
+
+                with open(os.path.join(temp_root, "state.json"), "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                self.assertEqual(list(state["processing_stage_markers"].keys()), ["script"])
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.run_process = original_run_process
+
+    def test_load_script_marks_only_script_stage_complete(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            scripts_dir = os.path.join(temp_root, "scripts")
+            os.makedirs(scripts_dir, exist_ok=True)
+            with open(os.path.join(scripts_dir, "demo.json"), "w", encoding="utf-8") as f:
+                json.dump({"entries": [], "dictionary": []}, f)
+            with open(os.path.join(scripts_dir, "demo.voice_config.json"), "w", encoding="utf-8") as f:
+                json.dump({"Narrator": {}}, f)
+            with open(os.path.join(temp_root, "chunks.json"), "w", encoding="utf-8") as f:
+                json.dump([{"id": 0}], f)
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "render_prep_complete": True,
+                        "processing_stage_markers": {
+                            "script": {"completed_at": 1},
+                            "review": {"completed_at": 2},
+                            "sanity": {"completed_at": 3},
+                        },
+                    },
+                    f,
+                )
+
+            original_root = app_module.ROOT_DIR
+            original_scripts = app_module.SCRIPTS_DIR
+            original_script = app_module.SCRIPT_PATH
+            original_voice_config = app_module.VOICE_CONFIG_PATH
+            original_chunks = app_module.CHUNKS_PATH
+            original_audio_state = app_module.process_state["audio"].copy()
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.SCRIPTS_DIR = scripts_dir
+                app_module.SCRIPT_PATH = os.path.join(temp_root, "annotated_script.json")
+                app_module.VOICE_CONFIG_PATH = os.path.join(temp_root, "voice_config.json")
+                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
+                app_module.process_state["audio"]["running"] = False
+
+                result = asyncio.run(app_module.load_script(app_module.ScriptLoadRequest(name="demo")))
+                self.assertEqual(result["status"], "loaded")
+
+                with open(os.path.join(temp_root, "state.json"), "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                self.assertFalse(state["render_prep_complete"])
+                self.assertEqual(list(state["processing_stage_markers"].keys()), ["script"])
+                self.assertFalse(os.path.exists(os.path.join(temp_root, "chunks.json")))
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.SCRIPTS_DIR = original_scripts
+                app_module.SCRIPT_PATH = original_script
+                app_module.VOICE_CONFIG_PATH = original_voice_config
+                app_module.CHUNKS_PATH = original_chunks
+                app_module.process_state["audio"].clear()
+                app_module.process_state["audio"].update(original_audio_state)
+
     def test_normalize_archive_path_rejects_parent_traversal(self):
         with self.assertRaises(ValueError):
             app_module._normalize_archive_path("../secret.txt")
@@ -19,7 +229,9 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
     def test_allowed_archive_paths_cover_expected_project_content(self):
         self.assertTrue(app_module._is_allowed_project_archive_path("annotated_script.json"))
         self.assertTrue(app_module._is_allowed_project_archive_path("voicelines/chunk_001.mp3"))
+        self.assertTrue(app_module._is_allowed_project_archive_path("voicelines/discarded/rejected_001.mp3"))
         self.assertTrue(app_module._is_allowed_project_archive_path("clone_voices/manifest.json"))
+        self.assertTrue(app_module._is_allowed_project_archive_path("transcription_cache.json"))
         self.assertFalse(app_module._is_allowed_project_archive_path("app/config.json"))
 
     def test_archive_state_rewrites_uploaded_file_path_relative_to_root(self):
@@ -47,10 +259,11 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
         self.assertEqual(exported["input_file_path"], "uploads/story.txt")
         self.assertTrue(exported["render_prep_complete"])
 
-    def test_project_archive_entries_include_only_timeline_audio_and_current_voice_assets(self):
+    def test_project_archive_entries_include_timeline_audio_voice_assets_discarded_pool_and_cache(self):
         with tempfile.TemporaryDirectory() as temp_root:
             for dirname in ("voicelines", "clone_voices", "designed_voices", "uploads"):
                 os.makedirs(os.path.join(temp_root, dirname), exist_ok=True)
+            os.makedirs(os.path.join(temp_root, "voicelines", "discarded"), exist_ok=True)
 
             files = {
                 "annotated_script.json": {"entries": [], "dictionary": []},
@@ -66,6 +279,16 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 ],
                 "script_sanity_check.json": {"ok": True},
                 "state.json": {"input_file_path": os.path.join(temp_root, "uploads", "story.txt")},
+                "transcription_cache.json": {
+                    "entries": [
+                        {
+                            "filename": "voicelines/live_a.mp3",
+                            "size_bytes": 4,
+                            "text": "cached transcript",
+                            "normalized_text": "cached transcript",
+                        }
+                    ]
+                },
             }
             for rel, payload in files.items():
                 with open(os.path.join(temp_root, rel), "w", encoding="utf-8") as f:
@@ -75,6 +298,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 "voicelines/live_a.mp3",
                 "voicelines/live_b.mp3",
                 "voicelines/orphan.mp3",
+                "voicelines/discarded/rejected.mp3",
                 "clone_voices/current_clone.wav",
                 "clone_voices/orphan_clone.wav",
                 "designed_voices/current_design.wav",
@@ -116,6 +340,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
             self.assertIn("voicelines/live_a.mp3", entries)
             self.assertIn("voicelines/live_b.mp3", entries)
             self.assertNotIn("voicelines/orphan.mp3", entries)
+            self.assertIn("voicelines/discarded/rejected.mp3", entries)
             self.assertIn("clone_voices/manifest.json", entries)
             self.assertIn("clone_voices/current_clone.wav", entries)
             self.assertNotIn("clone_voices/orphan_clone.wav", entries)
@@ -123,6 +348,92 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
             self.assertIn("designed_voices/current_design.wav", entries)
             self.assertNotIn("designed_voices/orphan_design.wav", entries)
             self.assertIn("uploads/story.txt", entries)
+            self.assertIn("transcription_cache.json", entries)
+
+    def test_restore_project_archive_restores_discarded_pool_and_transcription_cache(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            extract_root = os.path.join(temp_root, "extracted")
+            os.makedirs(os.path.join(extract_root, "voicelines", "discarded"), exist_ok=True)
+            os.makedirs(os.path.join(extract_root, "uploads"), exist_ok=True)
+            os.makedirs(os.path.join(extract_root, "clone_voices"), exist_ok=True)
+            os.makedirs(os.path.join(extract_root, "designed_voices"), exist_ok=True)
+
+            with open(os.path.join(extract_root, "chunks.json"), "w", encoding="utf-8") as f:
+                json.dump([{"id": 0, "audio_path": None}], f)
+            with open(os.path.join(extract_root, "transcription_cache.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {"entries": [{"filename": "voicelines/discarded/rejected.mp3", "size_bytes": 4, "text": "cached"}]},
+                    f,
+                )
+            with open(os.path.join(extract_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"input_file_path": "uploads/story.txt"}, f)
+            with open(os.path.join(extract_root, "uploads", "story.txt"), "wb") as f:
+                f.write(b"story")
+            with open(os.path.join(extract_root, "voicelines", "discarded", "rejected.mp3"), "wb") as f:
+                f.write(b"clip")
+
+            original_root = app_module.ROOT_DIR
+            original_uploads = app_module.UPLOADS_DIR
+            original_project_manager = app_module.project_manager
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.UPLOADS_DIR = os.path.join(temp_root, "uploads")
+
+                class StubManager:
+                    def __init__(self):
+                        self.engine = object()
+                        self.asr_engine = object()
+                        self._transcription_cache_lock = app_module.threading.Lock()
+                        self._transcription_cache = {"stale": True}
+                        self.recovered = False
+                        self.reconciled = False
+
+                    def recover_interrupted_generating_chunks(self):
+                        self.recovered = True
+
+                    def reconcile_chunk_audio_states(self):
+                        self.reconciled = True
+
+                stub_manager = StubManager()
+                app_module.project_manager = stub_manager
+
+                app_module._restore_project_archive(extract_root)
+
+                self.assertTrue(os.path.exists(os.path.join(temp_root, "transcription_cache.json")))
+                self.assertTrue(os.path.exists(os.path.join(temp_root, "voicelines", "discarded", "rejected.mp3")))
+                with open(os.path.join(temp_root, "state.json"), "r", encoding="utf-8") as f:
+                    restored_state = json.load(f)
+                self.assertEqual(restored_state["input_file_path"], os.path.join(temp_root, "uploads", "story.txt"))
+                self.assertIsNone(stub_manager._transcription_cache)
+                self.assertTrue(stub_manager.recovered)
+                self.assertTrue(stub_manager.reconciled)
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.UPLOADS_DIR = original_uploads
+                app_module.project_manager = original_project_manager
+
+    def test_generate_script_rejects_duplicate_start_while_running(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            state_path = os.path.join(temp_root, "state.json")
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump({"input_file_path": os.path.join(temp_root, "uploads", "story.txt")}, f)
+
+            original_root = app_module.ROOT_DIR
+            original_base = app_module.BASE_DIR
+            original_process_state = app_module.process_state["script"].copy()
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.BASE_DIR = temp_root
+                app_module.process_state["script"]["running"] = True
+                with self.assertRaises(HTTPException) as ctx:
+                    asyncio.run(app_module.generate_script(app_module.ScriptGenerationRequest(), BackgroundTasks()))
+                self.assertEqual(ctx.exception.status_code, 409)
+                self.assertEqual(ctx.exception.detail, "Script generation is already running.")
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.BASE_DIR = original_base
+                app_module.process_state["script"].clear()
+                app_module.process_state["script"].update(original_process_state)
 
 
 if __name__ == "__main__":

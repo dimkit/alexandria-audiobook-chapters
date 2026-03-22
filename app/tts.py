@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import urllib.parse
 import threading
 import shutil
+import time
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
@@ -664,6 +665,16 @@ class TTSEngine:
         if os.path.getsize(output_path) == 0:
             raise ValueError("External HTTP API returned an empty audio file")
 
+    @staticmethod
+    def _new_voice_design_preview_path():
+        previews_dir = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "designed_voices",
+            "previews",
+        )
+        os.makedirs(previews_dir, exist_ok=True)
+        return os.path.join(previews_dir, f"preview_{int(time.time() * 1000)}.wav")
+
     # ── Clone prompt cache (local mode) ──────────────────────────
 
     def clear_clone_prompt_cache(self, speaker=None):
@@ -769,12 +780,19 @@ class TTSEngine:
             RuntimeError: If generation fails
         """
         import time
-        import tempfile
-        import torch
 
         lang = language or self._language
         print(f"VoiceDesign: generating preview for description='{description[:80]}...'"
               f"{f', seed={seed}' if seed >= 0 else ''}")
+
+        if self._mode != "local":
+            return self._external_generate_voice_design_preview(
+                description=description,
+                sample_text=sample_text,
+                language=lang,
+            )
+
+        import torch
 
         model = self._init_local_design()
 
@@ -799,12 +817,7 @@ class TTSEngine:
         duration = len(audio) / sr
         print(f"VoiceDesign: done in {gen_time:.1f}s -> {duration:.1f}s audio")
 
-        # Save to previews directory
-        previews_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "designed_voices", "previews")
-        os.makedirs(previews_dir, exist_ok=True)
-
-        filename = f"preview_{int(time.time() * 1000)}.wav"
-        wav_path = os.path.join(previews_dir, filename)
+        wav_path = self._new_voice_design_preview_path()
         self._save_wav(audio, sr, wav_path)
 
         return wav_path, sr
@@ -1699,6 +1712,33 @@ class TTSEngine:
         except Exception as e:
             print(f"Error generating design voice: {e}")
             return False
+
+    def _external_generate_voice_design_preview(self, description, sample_text, language=None):
+        """Generate a reusable voice preview via the external Qwen HTTP API."""
+        import time
+
+        lang = language or self._language
+        t_start = time.time()
+
+        self._init_external()
+        if self._external_backend != "qwen_mlx_http":
+            raise ValueError("Voice design preview is only supported with the MLX HTTP external API")
+
+        result = self._external_http_post("/api/v1/voice-design/generate", {
+            "text": sample_text,
+            "language": lang,
+            "instruct": description,
+            "speed": 1.0,
+            "response_format": "base64",
+        })
+
+        wav_path = self._new_voice_design_preview_path()
+        self._write_base64_audio(result.get("audio"), wav_path)
+        audio, sr = sf.read(wav_path)
+        duration = len(audio) / sr if sr else 0
+        gen_time = time.time() - t_start
+        print(f"VoiceDesign [external] done in {gen_time:.1f}s -> {duration:.1f}s audio")
+        return wav_path, sr
 
     def _external_generate_clone(self, text, speaker, voice_config, output_path):
         """Generate voice-cloned audio via external Gradio server."""

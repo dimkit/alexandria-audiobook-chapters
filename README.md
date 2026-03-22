@@ -570,7 +570,7 @@ curl -X POST http://127.0.0.1:4200/api/project_archive/load \
   -F "file=@alexandria_project.zip"
 ```
 
-Project archives exclude runtime/in-flight files and final merged exports. They also exclude orphaned `voicelines/` files that are no longer referenced by `chunks.json`.
+Project archives exclude runtime/in-flight files and final merged exports. They include the active timeline clips, the `voicelines/discarded/` recovery pool, and `transcription_cache.json`. They still exclude orphaned `voicelines/` files that are no longer referenced by `chunks.json` and are not in the discarded pool.
 
 Local ASR uses `faster-whisper` and runs fully on the machine hosting Alexandria. You can override defaults in `app/config.json` with an `asr` block such as:
 

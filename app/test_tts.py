@@ -3,11 +3,23 @@ from unittest import mock
 import tempfile
 import os
 import base64
+import io
+import wave
 
 from tts import TTSEngine
 
 
 class NormalizeExternalUrlTests(unittest.TestCase):
+    @staticmethod
+    def _wav_payload(sample_rate=24000, frames=240):
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(b"\x00\x00" * frames)
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+
     def test_defaults_empty_value(self):
         self.assertEqual(
             TTSEngine._normalize_external_url(""),
@@ -72,6 +84,60 @@ class NormalizeExternalUrlTests(unittest.TestCase):
         finally:
             if os.path.exists(path):
                 os.unlink(path)
+
+    def test_new_voice_design_preview_path_returns_wav_path(self):
+        preview_path = TTSEngine._new_voice_design_preview_path()
+        self.assertTrue(preview_path.endswith(".wav"))
+        self.assertIn(os.path.join("designed_voices", "previews"), preview_path)
+        self.assertTrue(os.path.isdir(os.path.dirname(preview_path)))
+
+    @mock.patch.object(TTSEngine, "_init_local_design")
+    @mock.patch.object(TTSEngine, "_new_voice_design_preview_path")
+    @mock.patch.object(TTSEngine, "_external_http_post")
+    @mock.patch.object(TTSEngine, "_init_external")
+    def test_generate_voice_design_uses_external_http_api_when_configured(
+        self,
+        mock_init_external,
+        mock_external_http_post,
+        mock_preview_path,
+        mock_init_local_design,
+    ):
+        engine = TTSEngine({
+            "llm": {"api_key": "k"},
+            "tts": {"mode": "external", "url": "localhost:42003", "language": "English"},
+        })
+        engine._external_backend = "qwen_mlx_http"
+        mock_init_external.return_value = "http://localhost:42003"
+        mock_external_http_post.return_value = {"audio": self._wav_payload()}
+
+        fd, preview_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        os.unlink(preview_path)
+        mock_preview_path.return_value = preview_path
+
+        try:
+            wav_path, sample_rate = engine.generate_voice_design(
+                description="Calm narrator voice",
+                sample_text="Hello from the external server.",
+                language="English",
+            )
+        finally:
+            if os.path.exists(preview_path):
+                os.unlink(preview_path)
+
+        self.assertEqual(wav_path, preview_path)
+        self.assertEqual(sample_rate, 24000)
+        mock_init_local_design.assert_not_called()
+        mock_external_http_post.assert_called_once_with(
+            "/api/v1/voice-design/generate",
+            {
+                "text": "Hello from the external server.",
+                "language": "English",
+                "instruct": "Calm narrator voice",
+                "speed": 1.0,
+                "response_format": "base64",
+            },
+        )
 
 
 if __name__ == "__main__":

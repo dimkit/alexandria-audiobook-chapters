@@ -32,11 +32,41 @@ from source_document import load_source_document, iter_document_paragraphs
 
 MAX_CHUNK_CHARS = 500
 PROOFREAD_DURATION_OUTLIER_SECONDS = 10.0
+PROOFREAD_LONG_CHUNK_WORD_THRESHOLD = 25
+PROOFREAD_LONG_CHUNK_DURATION_OUTLIER_SECONDS = 25.0
+PROOFREAD_SHORT_AUDIO_FORCE_ASR_SECONDS = 2.0
 PROOFREAD_BATCH_COMMIT_SIZE = 25
+REPAIR_BATCH_COMMIT_SIZE = 25
 CHAPTER_HEADING_RE = re.compile(
     r'^(chapter|part|book|volume|prologue|epilogue|introduction|conclusion|act|section)\b',
     re.IGNORECASE,
 )
+COMMON_PROOFREAD_ABBREVIATIONS = {
+    "adm": ("admiral",),
+    "approx": ("approximately",),
+    "capt": ("captain",),
+    "cmdr": ("commander",),
+    "col": ("colonel",),
+    "dept": ("department",),
+    "dr": ("doctor",),
+    "etc": ("et", "cetera"),
+    "gen": ("general",),
+    "gov": ("governor",),
+    "jr": ("junior",),
+    "lt": ("lieutenant",),
+    "mr": ("mister",),
+    "mrs": ("missus",),
+    "ms": ("miss",),
+    "no": ("number",),
+    "pres": ("president",),
+    "prof": ("professor",),
+    "rep": ("representative",),
+    "rev": ("reverend",),
+    "sen": ("senator",),
+    "sgt": ("sergeant",),
+    "sr": ("senior",),
+    "vs": ("versus",),
+}
 
 def get_speaker(entry):
     """Get speaker from entry, checking both 'speaker' and 'type' fields."""
@@ -126,6 +156,10 @@ class ProjectManager:
         self.root_dir = root_dir
         self.script_path = os.path.join(root_dir, "annotated_script.json")
         self.chunks_path = os.path.join(root_dir, "chunks.json")
+        self.backups_dir = os.path.join(root_dir, "backups")
+        self.chunks_backups_dir = os.path.join(self.backups_dir, "chunks")
+        self.chunks_latest_backup_path = os.path.join(self.chunks_backups_dir, "chunks.latest.json")
+        self.chunks_best_backup_path = os.path.join(self.chunks_backups_dir, "chunks.most_audio.json")
         self.voicelines_dir = os.path.join(root_dir, "voicelines")
         self.voice_config_path = os.path.join(root_dir, "voice_config.json")
         self.config_path = os.path.join(root_dir, "app", "config.json")
@@ -133,6 +167,7 @@ class ProjectManager:
 
         # Ensure voicelines dir exists
         os.makedirs(self.voicelines_dir, exist_ok=True)
+        os.makedirs(self.chunks_backups_dir, exist_ok=True)
 
         self.engine = None
         self.asr_engine = None
@@ -925,9 +960,20 @@ class ProjectManager:
         return {slug.lower() for slug in allowed if slug}
 
     @classmethod
-    def _proofread_similarity_metrics(cls, expected_text, transcript_text):
-        normalized_expected = cls._normalize_asr_text(expected_text)
-        normalized_transcript = cls._normalize_asr_text(transcript_text)
+    def _expand_common_abbreviation_words(cls, words):
+        expanded = []
+        replaced = False
+        for word in words:
+            replacement = COMMON_PROOFREAD_ABBREVIATIONS.get(word)
+            if replacement:
+                expanded.extend(replacement)
+                replaced = True
+            else:
+                expanded.append(word)
+        return tuple(expanded), replaced
+
+    @staticmethod
+    def _score_proofread_normalized_texts(normalized_expected, normalized_transcript):
         if not normalized_expected or not normalized_transcript:
             return {
                 "score": 0.0,
@@ -970,13 +1016,39 @@ class ProjectManager:
             "transcript_word_count": len(transcript_words),
         }
 
-    def _build_chunk_proofread_result(self, chunk, threshold, voice_config, dictionary_entries):
+    @classmethod
+    def _proofread_similarity_metrics(cls, expected_text, transcript_text):
+        normalized_expected = cls._normalize_asr_text(expected_text)
+        normalized_transcript = cls._normalize_asr_text(transcript_text)
+        base_metrics = cls._score_proofread_normalized_texts(normalized_expected, normalized_transcript)
+
+        expected_words = tuple(normalized_expected.split()) if normalized_expected else tuple()
+        transcript_words = tuple(normalized_transcript.split()) if normalized_transcript else tuple()
+        expanded_expected_words, expected_replaced = cls._expand_common_abbreviation_words(expected_words)
+        expanded_transcript_words, transcript_replaced = cls._expand_common_abbreviation_words(transcript_words)
+
+        if not expected_replaced and not transcript_replaced:
+            return base_metrics
+
+        expanded_metrics = cls._score_proofread_normalized_texts(
+            " ".join(expanded_expected_words),
+            " ".join(expanded_transcript_words),
+        )
+
+        if expanded_metrics["score"] > base_metrics["score"]:
+            expanded_metrics["abbreviation_expanded_match"] = True
+            return expanded_metrics
+
+        return base_metrics
+
+    def _build_chunk_proofread_result(self, chunk, threshold, voice_config, dictionary_entries, force_compare=False):
         audio_path = (chunk.get("audio_path") or "").strip()
         full_audio_path = os.path.join(self.root_dir, audio_path)
         expected_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
         actual_duration_sec = get_audio_duration_seconds(full_audio_path)
         expected_duration_sec = estimate_expected_duration_seconds(text=expected_text)
         duration_delta_sec = abs(actual_duration_sec - expected_duration_sec)
+        duration_gate_sec = self._proofread_duration_outlier_seconds_for_text(expected_text)
         checked_at = time.time()
 
         parsed_audio = self._parse_chunk_audio_candidate_name(os.path.basename(audio_path))
@@ -997,6 +1069,19 @@ class ProjectManager:
         }
 
         if not speaker_match:
+            if force_compare:
+                transcript = self.transcribe_audio_path(audio_path)
+                metrics = self._proofread_similarity_metrics(expected_text, transcript.get("text", ""))
+                score = metrics["score"]
+                return base | metrics | {
+                    "score": score,
+                    "passed": False,
+                    "error": "Audio filename speaker does not match the chunk speaker.",
+                    "auto_failed_reason": None,
+                    "transcript_text": transcript.get("text", ""),
+                    "normalized_transcript": transcript.get("normalized_text") or self._normalize_asr_text(transcript.get("text", "")),
+                    "forced_compare": True,
+                }
             return base | {
                 "score": 0.0,
                 "passed": False,
@@ -1004,7 +1089,12 @@ class ProjectManager:
                 "auto_failed_reason": "speaker_mismatch",
             }
 
-        if duration_delta_sec > PROOFREAD_DURATION_OUTLIER_SECONDS:
+        if (
+            not force_compare
+            and
+            not self._proofread_should_force_asr_for_short_audio(actual_duration_sec)
+            and duration_delta_sec > duration_gate_sec
+        ):
             return base | {
                 "score": 0.0,
                 "passed": False,
@@ -1023,6 +1113,8 @@ class ProjectManager:
             "error": None if score >= float(threshold) else "Transcript confidence below threshold.",
             "auto_failed_reason": None,
             "transcript_text": transcript.get("text", ""),
+            "normalized_transcript": transcript.get("normalized_text") or self._normalize_asr_text(transcript.get("text", "")),
+            "forced_compare": bool(force_compare),
         }
 
     def _commit_proofread_result_locked(self, chunks, index, proofread_result):
@@ -1056,6 +1148,37 @@ class ProjectManager:
             return kept
         return None
 
+    @staticmethod
+    def _cached_chunk_transcript_text(chunk):
+        chunk = chunk or {}
+        proofread = chunk.get("proofread") or {}
+        current_audio_path = (chunk.get("audio_path") or "").strip()
+        if (proofread.get("audio_path") or "").strip() == current_audio_path:
+            transcript_text = (proofread.get("transcript_text") or "").strip()
+            if transcript_text:
+                return transcript_text
+
+        audio_validation = chunk.get("audio_validation") or {}
+        transcript_text = (audio_validation.get("transcript_text") or "").strip()
+        if transcript_text and current_audio_path:
+            return transcript_text
+        return ""
+
+    @staticmethod
+    def _cached_chunk_audio_validation(chunk, full_audio_path):
+        chunk = chunk or {}
+        audio_validation = chunk.get("audio_validation") or {}
+        if not audio_validation:
+            return None
+        try:
+            cached_size = int(audio_validation.get("file_size_bytes"))
+            current_size = os.path.getsize(full_audio_path)
+        except (TypeError, ValueError, OSError):
+            return None
+        if cached_size != current_size:
+            return None
+        return audio_validation
+
     def manually_validate_proofread_clip(self, chunk_ref, threshold=1.0):
         with self._chunks_lock:
             if not os.path.exists(self.chunks_path):
@@ -1078,24 +1201,75 @@ class ProjectManager:
                 raise ValueError("Cannot validate a clip whose audio file is missing.")
 
             existing = dict(chunk.get("proofread") or {})
-            validated = {
+            now = time.time()
+            proofread_state = {
                 **existing,
                 "checked": True,
-                "checked_at": time.time(),
+                "checked_at": now,
                 "threshold": float(threshold),
                 "audio_path": audio_path,
-                "score": 1.0,
-                "passed": True,
-                "error": None,
-                "manual_validated": True,
-                "validated_at": time.time(),
             }
-            if "speaker_match" not in validated:
-                validated["speaker_match"] = True
-            if "transcript_text" not in validated:
-                validated["transcript_text"] = ""
+            if "speaker_match" not in proofread_state:
+                proofread_state["speaker_match"] = True
+            if "transcript_text" not in proofread_state:
+                proofread_state["transcript_text"] = ""
 
-            chunk["proofread"] = validated
+            if existing.get("manual_validated"):
+                proofread_state.update({
+                    "score": 0.0,
+                    "passed": False,
+                    "error": "Manually marked as failed by user.",
+                    "manual_validated": False,
+                    "manual_failed": True,
+                    "failed_at": now,
+                })
+                proofread_state.pop("validated_at", None)
+            else:
+                proofread_state.update({
+                    "score": 1.0,
+                    "passed": True,
+                    "error": None,
+                    "manual_validated": True,
+                    "manual_failed": False,
+                    "validated_at": now,
+                })
+                proofread_state.pop("failed_at", None)
+
+            chunk["proofread"] = proofread_state
+            self._atomic_json_write(chunks, self.chunks_path)
+            return chunk
+
+    def compare_proofread_clip(self, chunk_ref, threshold=1.0):
+        with self._chunks_lock:
+            if not os.path.exists(self.chunks_path):
+                return None
+
+            with open(self.chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+
+            index = self.resolve_chunk_index(chunk_ref, chunks)
+            if index is None or not (0 <= index < len(chunks)):
+                return None
+
+            chunk = chunks[index]
+            audio_path = (chunk.get("audio_path") or "").strip()
+            if not audio_path:
+                raise ValueError("Cannot compare a clip with no audio.")
+
+            full_audio_path = os.path.join(self.root_dir, audio_path)
+            if not os.path.exists(full_audio_path):
+                raise ValueError("Cannot compare a clip whose audio file is missing.")
+
+            dictionary_entries = self.load_dictionary_entries()
+            voice_config = self._load_voice_config()
+            proofread_result = self._build_chunk_proofread_result(
+                chunk,
+                threshold=threshold,
+                voice_config=voice_config,
+                dictionary_entries=dictionary_entries,
+                force_compare=True,
+            )
+            chunk["proofread"] = proofread_result
             self._atomic_json_write(chunks, self.chunks_path)
             return chunk
 
@@ -1143,11 +1317,62 @@ class ProjectManager:
                 "chapter": chapter,
             }
 
+    def _reset_stale_proofread_scope_locked(self, chunks, scoped_indices):
+        discarded = 0
+        preserved_transcripts = 0
+        cleared_transcripts = 0
+
+        for index in scoped_indices:
+            chunk = chunks[index]
+            existing_proofread = chunk.get("proofread") or {}
+            if not existing_proofread or not existing_proofread.get("checked"):
+                continue
+            if existing_proofread.get("manual_validated") and (
+                (existing_proofread.get("audio_path") or "").strip() == (chunk.get("audio_path") or "").strip()
+            ):
+                continue
+
+            replacement = self._discarded_proofread_state(existing_proofread, chunk.get("audio_path"))
+            if replacement:
+                chunk["proofread"] = replacement
+                preserved_transcripts += 1
+            else:
+                chunk.pop("proofread", None)
+                cleared_transcripts += 1
+            discarded += 1
+
+        if discarded:
+            self._atomic_json_write(chunks, self.chunks_path)
+
+        return {
+            "discarded": discarded,
+            "preserved_transcripts": preserved_transcripts,
+            "cleared_transcripts": cleared_transcripts,
+        }
+
     @staticmethod
     def _normalize_asr_text(text):
         text = (text or "").lower()
-        text = re.sub(r"[^a-z0-9']+", " ", text)
+        text = re.sub(r"[^a-z0-9]+", " ", text)
         return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _normalize_asr_words(cls, text):
+        normalized = cls._normalize_asr_text(text)
+        if not normalized:
+            return tuple()
+        return tuple(normalized.split())
+
+    @classmethod
+    def _proofread_duration_outlier_seconds_for_text(cls, text):
+        word_count = cls._count_words(text)
+        if word_count > PROOFREAD_LONG_CHUNK_WORD_THRESHOLD:
+            return PROOFREAD_LONG_CHUNK_DURATION_OUTLIER_SECONDS
+        return PROOFREAD_DURATION_OUTLIER_SECONDS
+
+    @staticmethod
+    def _proofread_should_force_asr_for_short_audio(actual_duration_sec):
+        return float(actual_duration_sec or 0.0) <= PROOFREAD_SHORT_AUDIO_FORCE_ASR_SECONDS
 
     @classmethod
     def _asr_similarity_score(cls, transcript_text, chunk_text):
@@ -1249,6 +1474,44 @@ class ProjectManager:
             return chunks
 
         return []
+
+    def sync_chunks_from_script_if_stale(self):
+        """Rebuild chunks from annotated_script.json when the script is newer.
+
+        This is a conservative sync used when navigating into the editor after a
+        script-generation/review flow. It avoids overwriting user-edited chunks
+        unless the script file is clearly newer than the chunk timeline.
+        """
+        if not os.path.exists(self.script_path):
+            return {"synced": False, "reason": "no_script"}
+
+        if not os.path.exists(self.chunks_path):
+            chunks = self.load_chunks()
+            return {"synced": True, "reason": "missing_chunks", "chunk_count": len(chunks)}
+
+        script_mtime = os.path.getmtime(self.script_path)
+        chunks_mtime = os.path.getmtime(self.chunks_path)
+        if script_mtime <= chunks_mtime:
+            return {"synced": False, "reason": "chunks_current"}
+
+        script = load_script_document(self.script_path)["entries"]
+        chunks = group_into_chunks(script)
+        for i, chunk in enumerate(chunks):
+            chunk["id"] = i
+            chunk["uid"] = chunk.get("uid") or self._new_chunk_uid()
+            chunk["status"] = "pending"
+            chunk["audio_path"] = None
+            chunk["audio_validation"] = None
+            chunk["auto_regen_count"] = 0
+
+        self.save_chunks(chunks)
+        return {
+            "synced": True,
+            "reason": "script_newer_than_chunks",
+            "chunk_count": len(chunks),
+            "script_mtime": script_mtime,
+            "chunks_mtime": chunks_mtime,
+        }
 
     def reconcile_chunk_audio_states(self):
         """Repair stale error states when a stored clip is actually valid.
@@ -1404,12 +1667,50 @@ class ProjectManager:
         index = defaultdict(lambda: defaultdict(list))
         for chunk_index, chunk in enumerate(chunks):
             transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
-            normalized_text = self._normalize_asr_text(transformed_text)
-            if not normalized_text:
+            normalized_words = self._normalize_asr_words(transformed_text)
+            if not normalized_words:
                 continue
             for speaker_slug in self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config):
-                index[speaker_slug][normalized_text].append(chunk_index)
+                index[speaker_slug][normalized_words].append(chunk_index)
         return index
+
+    def _build_repair_match_cache(self, chunks, dictionary_entries, voice_config):
+        text_index = defaultdict(lambda: defaultdict(list))
+        speaker_word_frequency_cache = defaultdict(Counter)
+        speaker_word_index = defaultdict(lambda: defaultdict(set))
+        speaker_chunk_indices = defaultdict(list)
+        chunk_entries = []
+
+        for chunk_index, chunk in enumerate(chunks):
+            transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
+            normalized_words = self._normalize_asr_words(transformed_text)
+            normalized_text = " ".join(normalized_words)
+            speaker_slugs = tuple(self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config))
+            entry = {
+                "index": chunk_index,
+                "normalized_words": normalized_words,
+                "normalized_text": normalized_text,
+                "chapter": (chunk.get("chapter") or "").strip().lower(),
+                "speaker_slugs": speaker_slugs,
+                "transformed_text": transformed_text,
+            }
+            chunk_entries.append(entry)
+            if not normalized_words:
+                continue
+            for speaker_slug in speaker_slugs:
+                text_index[speaker_slug][normalized_words].append(chunk_index)
+                speaker_word_frequency_cache[speaker_slug].update(normalized_words)
+                speaker_chunk_indices[speaker_slug].append(chunk_index)
+                for word in set(normalized_words):
+                    speaker_word_index[speaker_slug][word].add(chunk_index)
+
+        return {
+            "chunk_entries": chunk_entries,
+            "text_index": text_index,
+            "speaker_word_frequency_cache": speaker_word_frequency_cache,
+            "speaker_word_index": speaker_word_index,
+            "speaker_chunk_indices": speaker_chunk_indices,
+        }
 
     def _build_speaker_word_frequency_cache(self, chunks, dictionary_entries, voice_config):
         frequency_cache = defaultdict(Counter)
@@ -1458,39 +1759,79 @@ class ProjectManager:
                 continue
         return " ".join(remaining).strip()
 
+    def _candidate_indices_for_discarded_match(self, speaker_slug, transcript_text, claimed_indices, match_cache):
+        speaker_indices = match_cache["speaker_chunk_indices"].get(speaker_slug) or []
+        if not speaker_indices:
+            return []
+
+        transcript_words = self._normalize_asr_words(transcript_text)
+        if not transcript_words:
+            return []
+
+        word_index = match_cache["speaker_word_index"].get(speaker_slug) or {}
+        candidate_pool = None
+        ranked_words = sorted(
+            set(transcript_words),
+            key=lambda word: (len(word_index.get(word) or ()), word),
+        )
+        for word in ranked_words[:4]:
+            indexed = word_index.get(word)
+            if not indexed:
+                continue
+            indexed = set(indexed)
+            if candidate_pool is None:
+                candidate_pool = indexed
+                continue
+            intersected = candidate_pool & indexed
+            if intersected:
+                candidate_pool = intersected
+            if len(candidate_pool) <= 64:
+                break
+
+        if candidate_pool:
+            filtered = [index for index in candidate_pool if index not in claimed_indices]
+            if filtered:
+                return filtered
+
+        return [index for index in speaker_indices if index not in claimed_indices]
+
     def _best_discarded_repair_match(
         self,
         speaker_slug,
         transcript_text,
-        chunks,
-        dictionary_entries,
-        voice_config,
         claimed_indices,
         threshold,
-        speaker_word_frequency_cache=None,
+        match_cache,
     ):
         if not speaker_slug or not transcript_text:
             return None
 
-        speaker_word_frequency_cache = speaker_word_frequency_cache or {}
+        speaker_word_frequency_cache = match_cache.get("speaker_word_frequency_cache") or {}
         speaker_frequency = speaker_word_frequency_cache.get(speaker_slug) or Counter()
         reduced_transcript_text, dropped_words = self._drop_low_frequency_transcript_words(
             transcript_text,
             speaker_frequency,
             drop_count=2,
         )
+        candidate_indices = self._candidate_indices_for_discarded_match(
+            speaker_slug,
+            transcript_text,
+            claimed_indices,
+            match_cache,
+        )
+        if not candidate_indices:
+            return None
+
         scored = []
-        for index, chunk in enumerate(chunks):
-            if index in claimed_indices:
+        chunk_entries = match_cache.get("chunk_entries") or []
+        for index in candidate_indices:
+            if not (0 <= index < len(chunk_entries)):
                 continue
-            allowed_speaker_slugs = self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config)
-            if speaker_slug not in allowed_speaker_slugs:
-                continue
-            transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
-            metrics = self._proofread_similarity_metrics(transformed_text, transcript_text)
+            entry = chunk_entries[index]
+            metrics = self._proofread_similarity_metrics(entry["transformed_text"], transcript_text)
             reduced_metrics = None
             if dropped_words and reduced_transcript_text:
-                reduced_expected_text = self._remove_selected_words(transformed_text, dropped_words)
+                reduced_expected_text = self._remove_selected_words(entry["transformed_text"], dropped_words)
                 if reduced_expected_text:
                     reduced_metrics = self._proofread_similarity_metrics(reduced_expected_text, reduced_transcript_text)
                     if float(reduced_metrics.get("score", 0.0) or 0.0) > float(metrics.get("score", 0.0) or 0.0):
@@ -1576,7 +1917,7 @@ class ProjectManager:
             and (chunk.get("chapter") or "").strip().lower() == anchor_chapter
         ]
 
-    def _find_asr_repair_match(self, candidate, chunks, claimed_indices, dictionary_entries, transcript_cache):
+    def _find_asr_repair_match(self, candidate, chunks, claimed_indices, dictionary_entries, transcript_cache, match_cache=None):
         settings = self._load_asr_settings()
         window_size = max(int(settings.get("repair_window", 12) or 12), 1)
         threshold = float(settings.get("confidence_threshold", 0.72) or 0.72)
@@ -1591,12 +1932,14 @@ class ProjectManager:
             transcript = self.transcribe_audio_path(relative_path)
             transcript_cache[relative_path] = transcript
 
-        transcript_text = transcript.get("normalized_text") or self._normalize_asr_text(transcript.get("text"))
-        if not transcript_text:
+        transcript_words = self._normalize_asr_words(transcript.get("normalized_text") or transcript.get("text"))
+        if not transcript_words:
             return None
+        transcript_text = " ".join(transcript_words)
 
         candidate_slug = candidate["parsed"].get("speaker_slug") or "speaker"
         chapter_indices = self._candidate_same_chapter_indices(candidate, chunks, claimed_indices)
+        chunk_entries = (match_cache or {}).get("chunk_entries") or []
 
         exact_matches = []
         for index in chapter_indices:
@@ -1604,9 +1947,12 @@ class ProjectManager:
             speaker_slug = sanitize_filename(chunk.get("speaker") or "") or "speaker"
             if candidate_slug != speaker_slug:
                 continue
-            transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
-            normalized_chunk_text = self._normalize_asr_text(transformed_text)
-            if normalized_chunk_text and normalized_chunk_text == transcript_text:
+            if 0 <= index < len(chunk_entries):
+                normalized_chunk_words = chunk_entries[index]["normalized_words"]
+            else:
+                transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
+                normalized_chunk_words = self._normalize_asr_words(transformed_text)
+            if normalized_chunk_words and normalized_chunk_words == transcript_words:
                 exact_matches.append(index)
 
         if len(exact_matches) == 1:
@@ -1634,7 +1980,10 @@ class ProjectManager:
             speaker_slug = sanitize_filename(chunk.get("speaker") or "") or "speaker"
             if candidate_slug != speaker_slug:
                 continue
-            transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
+            if 0 <= index < len(chunk_entries):
+                transformed_text = chunk_entries[index]["transformed_text"]
+            else:
+                transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
             score = self._asr_similarity_score(transcript_text, transformed_text)
             if score <= 0:
                 continue
@@ -1723,7 +2072,8 @@ class ProjectManager:
                     "elapsed_seconds": round(time.time() - repair_started_at, 2),
                 })
 
-            text_index = self._build_lost_audio_repair_text_index(chunks, dictionary_entries, voice_config)
+            match_cache = self._build_repair_match_cache(chunks, dictionary_entries, voice_config)
+            text_index = match_cache["text_index"]
 
             if rejected_only:
                 claimed_indices = {
@@ -1753,11 +2103,7 @@ class ProjectManager:
             discarded_candidates = []
             discarded_scanned_files = 0
             proofread_threshold = float((self._load_app_config().get("proofread") or {}).get("certainty_threshold", 1.0) or 1.0)
-            speaker_word_frequency_cache = self._build_speaker_word_frequency_cache(
-                chunks,
-                dictionary_entries,
-                voice_config,
-            )
+            pending_checkpoint_writes = 0
             if rejected_only or total_candidates == 0:
                 discarded_candidates, discarded_scanned_files = self._collect_repair_candidates_from_dir_locked(
                     self._discarded_voicelines_dir(),
@@ -1844,13 +2190,16 @@ class ProjectManager:
                     continue
 
                 transcript = transcript_cache.get(relative_path) or {}
-                normalized_transcript = transcript.get("normalized_text") or self._normalize_asr_text(transcript.get("text"))
-                if not normalized_transcript:
+                normalized_transcript_words = self._normalize_asr_words(
+                    transcript.get("normalized_text") or transcript.get("text")
+                )
+                if not normalized_transcript_words:
                     unmatched_files += 1
                     self._move_candidate_to_discarded_locked(relative_path)
                     continue
 
-                matching_indices = list(text_index.get(speaker_slug, {}).get(normalized_transcript, []))
+                normalized_transcript = " ".join(normalized_transcript_words)
+                matching_indices = list(text_index.get(speaker_slug, {}).get(normalized_transcript_words, []))
                 if not matching_indices:
                     unmatched_files += 1
                     self._move_candidate_to_discarded_locked(relative_path)
@@ -1875,9 +2224,11 @@ class ProjectManager:
                             target_index,
                             relative_path,
                             validation,
+                            write_immediately=False,
                         )
                         changed = True
                         immediate_commits += 1
+                        pending_checkpoint_writes += 1
                         relinked += 1
                         asr_relinked += 1
                         claimed_indices.add(target_index)
@@ -1888,6 +2239,9 @@ class ProjectManager:
                                 "audio_path": committed_audio_path,
                                 "repair_mode": "exact_transcript",
                             })
+                        if pending_checkpoint_writes >= REPAIR_BATCH_COMMIT_SIZE:
+                            self._atomic_json_write(chunks, self.chunks_path)
+                            pending_checkpoint_writes = 0
 
                 if candidate_index <= 3 or candidate_index % 25 == 0 or candidate_index == total_candidates:
                     elapsed = time.time() - repair_started_at
@@ -1939,12 +2293,9 @@ class ProjectManager:
                     match = self._best_discarded_repair_match(
                         speaker_slug,
                         transcript_text,
-                        chunks,
-                        dictionary_entries,
-                        voice_config,
                         claimed_indices,
                         proofread_threshold,
-                        speaker_word_frequency_cache=speaker_word_frequency_cache,
+                        match_cache,
                     )
                     if not match:
                         if discarded_index <= 3 or discarded_index % 25 == 0 or discarded_index == len(discarded_candidates):
@@ -1983,9 +2334,11 @@ class ProjectManager:
                         target_index,
                         relative_path,
                         validation,
+                        write_immediately=False,
                     )
                     changed = True
                     immediate_commits += 1
+                    pending_checkpoint_writes += 1
                     relinked += 1
                     asr_relinked += 1
                     discarded_retry_relinked += 1
@@ -1998,6 +2351,9 @@ class ProjectManager:
                             "repair_mode": "discarded_certainty",
                             "score": round(match["score"], 4),
                         })
+                    if pending_checkpoint_writes >= REPAIR_BATCH_COMMIT_SIZE:
+                        self._atomic_json_write(chunks, self.chunks_path)
+                        pending_checkpoint_writes = 0
 
                     if discarded_index <= 3 or discarded_index % 25 == 0 or discarded_index == len(discarded_candidates):
                         elapsed = time.time() - repair_started_at
@@ -2017,6 +2373,9 @@ class ProjectManager:
                             "eta_seconds": None if eta is None else round(eta, 1),
                             "elapsed_seconds": round(elapsed, 2),
                         })
+
+            if pending_checkpoint_writes > 0:
+                self._atomic_json_write(chunks, self.chunks_path)
 
             emit_progress({
                 "phase": "complete",
@@ -2086,6 +2445,17 @@ class ProjectManager:
                 index for index in scoped_indices
                 if not bool((chunks[index].get("proofread") or {}).get("checked"))
             ]
+            auto_reset_summary = {
+                "discarded": 0,
+                "preserved_transcripts": 0,
+                "cleared_transcripts": 0,
+            }
+            if scoped_indices and not pending_indices:
+                auto_reset_summary = self._reset_stale_proofread_scope_locked(chunks, scoped_indices)
+                pending_indices = [
+                    index for index in scoped_indices
+                    if not bool((chunks[index].get("proofread") or {}).get("checked"))
+                ]
 
             processed = 0
             skipped = len(scoped_indices) - len(pending_indices)
@@ -2098,11 +2468,19 @@ class ProjectManager:
                 "message": (
                     f"Proofread scan found {len(scoped_indices)} clip(s) in scope, "
                     f"{len(pending_indices)} still need checking."
+                    + (
+                        f" Auto-reset {auto_reset_summary['discarded']} stale grade(s), "
+                        f"preserving {auto_reset_summary['preserved_transcripts']} transcript cache(s)."
+                        if auto_reset_summary["discarded"] > 0
+                        else ""
+                    )
                 ),
                 "chapter": chapter,
                 "threshold": float(threshold),
                 "scoped_clips": len(scoped_indices),
                 "pending_clips": len(pending_indices),
+                "auto_reset_discarded": auto_reset_summary["discarded"],
+                "auto_reset_preserved_transcripts": auto_reset_summary["preserved_transcripts"],
                 "processed": processed,
                 "pending_total": len(pending_indices),
                 "passed": passed,
@@ -2119,9 +2497,15 @@ class ProjectManager:
                 audio_path = (chunk.get("audio_path") or "").strip()
                 full_audio_path = os.path.join(self.root_dir, audio_path)
                 expected_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
-                actual_duration_sec = get_audio_duration_seconds(full_audio_path)
+                cached_validation = self._cached_chunk_audio_validation(chunk, full_audio_path)
+                actual_duration_sec = (
+                    float(cached_validation.get("actual_duration_sec"))
+                    if cached_validation and cached_validation.get("actual_duration_sec") is not None
+                    else get_audio_duration_seconds(full_audio_path)
+                )
                 expected_duration_sec = estimate_expected_duration_seconds(text=expected_text)
                 duration_delta_sec = abs(actual_duration_sec - expected_duration_sec)
+                duration_gate_sec = self._proofread_duration_outlier_seconds_for_text(expected_text)
                 parsed_audio = self._parse_chunk_audio_candidate_name(os.path.basename(audio_path))
                 audio_speaker_slug = (parsed_audio or {}).get("speaker_slug") or ""
                 allowed_speaker_slugs = self._allowed_proofread_speaker_slugs(chunk.get("speaker", ""), voice_config)
@@ -2145,7 +2529,10 @@ class ProjectManager:
                         "auto_failed_reason": "speaker_mismatch",
                     }
                     continue
-                if duration_delta_sec > PROOFREAD_DURATION_OUTLIER_SECONDS:
+                if (
+                    not self._proofread_should_force_asr_for_short_audio(actual_duration_sec)
+                    and duration_delta_sec > duration_gate_sec
+                ):
                     precomputed_results[index] = base | {
                         "score": 0.0,
                         "passed": False,
@@ -2153,10 +2540,7 @@ class ProjectManager:
                         "auto_failed_reason": "duration_outlier",
                     }
                     continue
-                cached_transcript_text = ""
-                existing_proofread = chunk.get("proofread") or {}
-                if (existing_proofread.get("audio_path") or "").strip() == audio_path:
-                    cached_transcript_text = (existing_proofread.get("transcript_text") or "").strip()
+                cached_transcript_text = self._cached_chunk_transcript_text(chunk)
                 if cached_transcript_text:
                     metrics = self._proofread_similarity_metrics(expected_text, cached_transcript_text)
                     score = metrics["score"]
@@ -2287,6 +2671,7 @@ class ProjectManager:
                 "failed": failed,
                 "chapter": chapter,
                 "threshold": float(threshold),
+                "auto_reset_discarded": auto_reset_summary["discarded"],
             }
 
     def clear_proofread_failures(self, chapter=None, threshold=1.0):
@@ -2411,7 +2796,32 @@ class ProjectManager:
     def load_dictionary_entries(self):
         return self.load_script_document()["dictionary"]
 
-    def _atomic_json_write(self, data, target_path, max_retries=5):
+    @staticmethod
+    def _count_audio_linked_chunks(chunks):
+        return sum(1 for chunk in (chunks or []) if str((chunk or {}).get("audio_path") or "").strip())
+
+    def _load_chunk_backup_audio_count(self, backup_path):
+        if not os.path.exists(backup_path):
+            return -1
+        try:
+            with open(backup_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, list):
+                return -1
+            return self._count_audio_linked_chunks(payload)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return -1
+
+    def _update_chunks_backups(self, chunks):
+        if not isinstance(chunks, list):
+            return
+        self._atomic_json_write_raw(chunks, self.chunks_latest_backup_path)
+        current_audio_count = self._count_audio_linked_chunks(chunks)
+        best_audio_count = self._load_chunk_backup_audio_count(self.chunks_best_backup_path)
+        if current_audio_count > best_audio_count:
+            self._atomic_json_write_raw(chunks, self.chunks_best_backup_path)
+
+    def _atomic_json_write_raw(self, data, target_path, max_retries=5):
         """Atomically write JSON data with retry logic for Windows file locking."""
         for attempt in range(max_retries):
             tmp_path = None
@@ -2443,6 +2853,11 @@ class ProjectManager:
                     time.sleep(delay)
                     continue
                 raise
+
+    def _atomic_json_write(self, data, target_path, max_retries=5):
+        self._atomic_json_write_raw(data, target_path, max_retries=max_retries)
+        if os.path.abspath(target_path) == os.path.abspath(self.chunks_path):
+            self._update_chunks_backups(data)
 
     def save_chunks(self, chunks):
         with self._chunks_lock:
@@ -3096,7 +3511,7 @@ class ProjectManager:
 
             attempt += 1
 
-    def _commit_repaired_chunk_locked(self, chunks, index, source_relative_path, validation):
+    def _commit_repaired_chunk_locked(self, chunks, index, source_relative_path, validation, write_immediately=True):
         chunk = chunks[index]
         target_audio_path = self._repair_target_audio_path_locked(chunk, index, source_relative_path)
         if target_audio_path and target_audio_path != source_relative_path:
@@ -3106,7 +3521,8 @@ class ProjectManager:
         chunk["status"] = "done"
         chunk["auto_regen_count"] = 0
         chunk.pop("generation_token", None)
-        self._atomic_json_write(chunks, self.chunks_path)
+        if write_immediately:
+            self._atomic_json_write(chunks, self.chunks_path)
         return target_audio_path
 
     def _finalize_generated_audio(self, index, speaker, text, temp_path, attempt=0, chunk_uid=None):
