@@ -5,11 +5,53 @@ globals().update({k: v for k, v in vars(_shared).items() if not k.startswith("__
 
 router = APIRouter()
 
+def _ensure_new_mode_workflow_inactive(conflict_message: str = "Cannot run this step while Process Script is active. Pause or wait for new-mode workflow first."):
+    state = process_state.get("new_mode_workflow") or {}
+    if bool(state.get("running")) or bool(state.get("paused")):
+        raise HTTPException(status_code=409, detail=conflict_message)
+
 @router.post("/api/reset_project")
 async def reset_project():
-    running_task = _any_project_task_running()
-    if running_task:
-        raise HTTPException(status_code=409, detail=f"Cannot reset while '{running_task}' is running.")
+    # Hard-stop everything before nuking project artifacts.
+    with task_state_lock:
+        for task_name, process in list(task_processes.items()):
+            try:
+                if process and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.5)
+                    except Exception:
+                        process.kill()
+            except Exception:
+                pass
+        task_processes.clear()
+
+        # Invalidate all active run IDs so cooperative tasks stop at the next check.
+        for state in process_state.values():
+            if isinstance(state, dict) and "run_id" in state:
+                state["run_id"] = str(uuid.uuid4())
+
+    with audio_queue_condition:
+        now = time.time()
+        while audio_queue:
+            job = audio_queue.pop(0)
+            job["status"] = "cancelled"
+            job["finished_at"] = now
+            _record_audio_recent_job_locked(job)
+
+        process_state["audio"]["cancel"] = True
+        if audio_current_job is not None:
+            _abandon_audio_job_locked(
+                audio_current_job,
+                audio_current_job.get("run_token"),
+                "Project reset requested",
+                status="cancelled",
+            )
+        _refresh_audio_process_state_locked(persist=True)
+
+    # Signal cancellation for thread-based tasks that poll a cancel flag.
+    if "dataset_builder" in process_state and isinstance(process_state["dataset_builder"], dict):
+        process_state["dataset_builder"]["cancel"] = True
 
     removed = []
     state_path = os.path.join(ROOT_DIR, "state.json")
@@ -108,6 +150,7 @@ async def reset_project():
 
 @router.post("/api/assign_dialogue")
 async def start_assign_dialogue(background_tasks: BackgroundTasks):
+    _ensure_new_mode_workflow_inactive()
     _ensure_task_not_running("assign_dialogue", "Dialogue assignment is already running.")
 
     paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
@@ -135,6 +178,7 @@ async def start_assign_dialogue(background_tasks: BackgroundTasks):
 
 @router.post("/api/extract_temperament")
 async def start_extract_temperament(background_tasks: BackgroundTasks):
+    _ensure_new_mode_workflow_inactive()
     _ensure_task_not_running("extract_temperament", "Temperament extraction is already running.")
 
     paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
@@ -199,6 +243,7 @@ async def reset_new_mode():
 
 @router.post("/api/create_script")
 async def start_create_script(background_tasks: BackgroundTasks):
+    _ensure_new_mode_workflow_inactive()
     _ensure_task_not_running("create_script", "Script creation is already running.")
 
     paragraphs_path    = os.path.join(ROOT_DIR, "paragraphs.json")
@@ -232,6 +277,7 @@ async def start_create_script(background_tasks: BackgroundTasks):
 
 @router.post("/api/process_paragraphs")
 async def start_process_paragraphs(background_tasks: BackgroundTasks):
+    _ensure_new_mode_workflow_inactive()
     _ensure_task_not_running("process_paragraphs", "Paragraph processing is already running.")
 
     # Hard-fail if an annotated script already exists with entries

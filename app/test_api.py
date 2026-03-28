@@ -14,11 +14,48 @@ import os
 import sys
 import time
 import requests
+try:
+    import pytest
+except Exception:  # pragma: no cover - pytest import only needed when running under pytest
+    pytest = None
 
 # ── Global state ─────────────────────────────────────────────
 
-BASE_URL = ""
-FULL_MODE = False
+def _normalize_http_url(raw_url):
+    url = (raw_url or "").strip()
+    if not url:
+        return ""
+    if "://" not in url:
+        url = f"http://{url}"
+    return url.rstrip("/")
+
+
+def _discover_base_url():
+    # Explicit test override wins.
+    for key in ("ALEXANDRIA_TEST_URL", "BASE_URL"):
+        configured = _normalize_http_url(os.getenv(key))
+        if configured:
+            return configured
+
+    # Pinokio can expose the launched URL through the variable named in PINOKIO_SHARE_VAR.
+    # Example: PINOKIO_SHARE_VAR=url and env[url]=http://127.0.0.1:42003
+    share_var_key = (os.getenv("PINOKIO_SHARE_VAR") or "").strip()
+    if share_var_key:
+        shared = _normalize_http_url(os.getenv(share_var_key) or os.getenv(share_var_key.upper()))
+        if shared:
+            return shared
+
+    # Pinokio local share port is a reliable fallback when no direct URL var is present.
+    share_port = (os.getenv("PINOKIO_SHARE_LOCAL_PORT") or "").strip()
+    if share_port.isdigit():
+        return f"http://127.0.0.1:{share_port}"
+
+    # Legacy fallback.
+    return "http://127.0.0.1:4200"
+
+
+BASE_URL = _discover_base_url()
+FULL_MODE = (os.getenv("ALEXANDRIA_TEST_FULL", "").strip().lower() in {"1", "true", "yes", "on"})
 TEST_PREFIX = "_test_"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -31,6 +68,17 @@ shared = {}  # state shared between dependent tests
 
 class TestFailure(Exception):
     pass
+
+
+def skip_test(reason):
+    if pytest is not None and "PYTEST_CURRENT_TEST" in os.environ:
+        pytest.skip(reason)
+    raise TestFailure(f"SKIP: {reason}")
+
+
+def require_full_mode():
+    if not FULL_MODE:
+        skip_test("requires full suite")
 
 
 def section(title):
@@ -163,6 +211,10 @@ def test_save_config_roundtrip():
         raise TestFailure("Config round-trip failed: export section dropped")
     export = readback["export"]
     for key in (
+        "trim_clip_silence_enabled",
+        "trim_silence_threshold_dbfs",
+        "trim_min_silence_len_ms",
+        "trim_keep_padding_ms",
         "normalize_enabled",
         "normalize_target_lufs_mono",
         "normalize_target_lufs_stereo",
@@ -357,7 +409,7 @@ def test_get_annotated_script():
 
 def test_save_script():
     if not shared.get("has_script"):
-        raise TestFailure("SKIP: no annotated script loaded")
+        skip_test("no annotated script loaded")
     r = post("/api/scripts/save", json={"name": f"{TEST_PREFIX}script"})
     assert_status(r, 200)
     data = r.json()
@@ -379,8 +431,12 @@ def test_list_scripts():
 
 def test_load_script():
     if not shared.get("has_script"):
-        raise TestFailure("SKIP: no annotated script loaded")
+        skip_test("no annotated script loaded")
     r = post("/api/scripts/load", json={"name": f"{TEST_PREFIX}script"})
+    if r.status_code == 409:
+        # Loading while generation runs now returns 409; wait briefly and retry once.
+        if wait_for_task("audio", timeout=120):
+            r = post("/api/scripts/load", json={"name": f"{TEST_PREFIX}script"})
     assert_status(r, 200)
     data = r.json()
     if data.get("status") != "loaded":
@@ -389,7 +445,7 @@ def test_load_script():
 
 def test_delete_script():
     if not shared.get("has_script"):
-        raise TestFailure("SKIP: no annotated script loaded")
+        skip_test("no annotated script loaded")
     r = delete(f"/api/scripts/{TEST_PREFIX}script")
     assert_status(r, 200)
     data = r.json()
@@ -447,7 +503,7 @@ def test_get_chunks():
 
 def test_update_chunk():
     if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
+        skip_test("no chunks available")
 
     r = post("/api/chunks/0", json={
         "text": f"{TEST_PREFIX}updated_text",
@@ -474,7 +530,7 @@ def test_update_chunk_404():
 
 def test_insert_chunk():
     if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
+        skip_test("no chunks available")
 
     # Get initial count
     r = get("/api/chunks")
@@ -511,11 +567,11 @@ def test_insert_chunk_404():
 
 def test_delete_chunk():
     if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
+        skip_test("no chunks available")
 
     idx = shared.get("inserted_chunk_index")
     if idx is None:
-        raise TestFailure("SKIP: no inserted chunk to delete")
+        skip_test("no inserted chunk to delete")
 
     # Get count before delete
     r = get("/api/chunks")
@@ -542,7 +598,7 @@ def test_delete_chunk_invalid():
 
 def test_restore_chunk():
     if not shared.get("deleted_chunk"):
-        raise TestFailure("SKIP: no deleted chunk to restore")
+        skip_test("no deleted chunk to restore")
 
     r = get("/api/chunks")
     assert_status(r, 200)
@@ -601,6 +657,7 @@ def test_voice_design_delete_404():
 
 
 def test_voice_design_preview():
+    require_full_mode()
     r = post("/api/voice_design/preview", json={
         "description": "A clear young male voice with a steady tone",
         "sample_text": "This is a test of voice design.",
@@ -612,6 +669,7 @@ def test_voice_design_preview():
 
 
 def test_voice_design_save_and_delete():
+    require_full_mode()
     preview_file = shared.get("preview_file")
     if not preview_file:
         raise TestFailure("SKIP: no preview file from previous test")
@@ -757,6 +815,7 @@ def test_lora_preview_404():
 
 
 def test_lora_preview():
+    require_full_mode()
     models = shared.get("lora_models", [])
     if not models:
         raise TestFailure("SKIP: no LoRA models available")
@@ -871,6 +930,7 @@ def test_get_audacity_export():
 # ── Section 14: Full Tests — Generation ─────────────────────
 
 def test_generate_script():
+    require_full_mode()
     r = post("/api/generate_script")
     if r.status_code == 400:
         raise TestFailure("SKIP: prerequisite not met (no uploaded file or already running)")
@@ -881,6 +941,7 @@ def test_generate_script():
 
 
 def test_review_script():
+    require_full_mode()
     if not shared.get("has_script"):
         raise TestFailure("SKIP: no annotated script loaded")
     r = post("/api/review_script")
@@ -893,6 +954,7 @@ def test_review_script():
 
 
 def test_parse_voices():
+    require_full_mode()
     r = post("/api/parse_voices")
     if r.status_code == 400:
         raise TestFailure("SKIP: already running")
@@ -903,6 +965,7 @@ def test_parse_voices():
 
 
 def test_generate_chunk():
+    require_full_mode()
     if not shared.get("has_chunks"):
         raise TestFailure("SKIP: no chunks available")
     r = post("/api/chunks/0/generate")
@@ -910,33 +973,35 @@ def test_generate_chunk():
 
 
 def test_generate_batch():
+    require_full_mode()
     if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
+        skip_test("no chunks available")
     r = post("/api/generate_batch", json={"indices": [0]})
     if r.status_code == 400:
-        raise TestFailure("SKIP: audio generation already running")
+        skip_test("audio generation already running")
     assert_status(r, 200)
     data = r.json()
-    if data.get("status") != "started":
-        raise TestFailure(f"Expected status=started, got {data}")
+    if data.get("status") not in ("started", "queued"):
+        raise TestFailure(f"Expected status=started|queued, got {data}")
     # Wait for batch to finish so subsequent tests don't conflict
     if not wait_for_task("audio", timeout=120):
         raise TestFailure("generate_batch did not complete within 120s")
 
 
 def test_generate_batch_fast():
+    require_full_mode()
     if not shared.get("has_chunks"):
-        raise TestFailure("SKIP: no chunks available")
+        skip_test("no chunks available")
     # Wait for any prior generation to finish
     if not wait_for_task("audio", timeout=120):
-        raise TestFailure("SKIP: prior audio generation did not finish in time")
+        skip_test("prior audio generation did not finish in time")
     r = post("/api/generate_batch_fast", json={"indices": [0]})
     if r.status_code == 400:
-        raise TestFailure("SKIP: audio generation already running")
+        skip_test("audio generation already running")
     assert_status(r, 200)
     data = r.json()
-    if data.get("status") != "started":
-        raise TestFailure(f"Expected status=started, got {data}")
+    if data.get("status") not in ("started", "queued"):
+        raise TestFailure(f"Expected status=started|queued, got {data}")
 
 
 def test_cancel_audio():
@@ -949,6 +1014,7 @@ def test_cancel_audio():
 
 
 def test_export_audacity():
+    require_full_mode()
     r = post("/api/export_audacity")
     if r.status_code == 400:
         raise TestFailure("SKIP: already running")
@@ -959,6 +1025,7 @@ def test_export_audacity():
 
 
 def test_lora_test_model():
+    require_full_mode()
     models = shared.get("lora_models", [])
     if not models:
         raise TestFailure("SKIP: no LoRA models available")
@@ -974,6 +1041,7 @@ def test_lora_test_model():
 
 
 def test_lora_generate_dataset():
+    require_full_mode()
     r = post("/api/lora/generate_dataset", json={
         "name": f"{TEST_PREFIX}dataset",
         "description": "A clear young male voice",
@@ -991,6 +1059,7 @@ def test_lora_generate_dataset():
 
 
 def test_dataset_builder_generate_sample():
+    require_full_mode()
     # Create a temp project for this test
     post("/api/dataset_builder/create", json={"name": f"{TEST_PREFIX}gen_proj"})
     post("/api/dataset_builder/update_rows", json={
@@ -1168,13 +1237,13 @@ def main():
     global BASE_URL, FULL_MODE
 
     parser = argparse.ArgumentParser(description="Alexandria API test suite")
-    parser.add_argument("--url", default="http://127.0.0.1:4200",
-                        help="Server URL (default: http://127.0.0.1:4200)")
+    parser.add_argument("--url", default=BASE_URL,
+                        help=f"Server URL (default: {BASE_URL})")
     parser.add_argument("--full", action="store_true",
                         help="Include TTS/LLM-dependent tests")
     args = parser.parse_args()
 
-    BASE_URL = args.url.rstrip("/")
+    BASE_URL = _normalize_http_url(args.url)
     FULL_MODE = args.full
 
     print(f"Alexandria API Tests")

@@ -7,6 +7,8 @@ import zipfile
 
 import numpy as np
 import soundfile as sf
+from types import SimpleNamespace
+from pydub import AudioSegment
 
 import project as project_module
 from project import ProjectManager
@@ -440,6 +442,17 @@ class MergeAudioTests(unittest.TestCase):
         sf.write(full_path, samples, sample_rate)
         return full_path
 
+    def _write_tone_with_silence(self, relative_path, lead_s=0.25, tone_s=0.3, tail_s=0.25, hz=440):
+        full_path = os.path.join(self.root_dir, relative_path)
+        sample_rate = 24000
+        lead = np.zeros(int(sample_rate * lead_s), dtype=np.float32)
+        tail = np.zeros(int(sample_rate * tail_s), dtype=np.float32)
+        t = np.arange(int(sample_rate * tone_s), dtype=np.float32) / sample_rate
+        tone = (0.35 * np.sin(2 * np.pi * hz * t)).astype(np.float32)
+        samples = np.concatenate([lead, tone, tail]).astype(np.float32)
+        sf.write(full_path, samples, sample_rate)
+        return full_path
+
     def test_merge_audio_reports_progress_and_creates_mp3(self):
         self._write_wav("voicelines/clip1.wav", duration_seconds=0.5)
         self._write_wav("voicelines/clip2.wav", duration_seconds=0.5)
@@ -735,6 +748,61 @@ class MergeAudioTests(unittest.TestCase):
         self.assertEqual(output_filename, "audiobook.m4b")
         self.assertEqual(len(normalize_calls), 1)
         self.assertTrue(normalize_calls[0].endswith("temp_m4b_combined.wav"))
+
+    def test_trim_cache_persists_and_is_reused(self):
+        original_path = self._write_tone_with_silence("voicelines/trim_me.wav")
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "speaker": "Narrator",
+                "text": "Trim me.",
+                "instruct": "",
+                "chapter": "Chapter 1",
+                "status": "done",
+                "audio_path": "voicelines/trim_me.wav",
+            },
+        ])
+
+        export_config = SimpleNamespace(
+            trim_clip_silence_enabled=True,
+            trim_silence_threshold_dbfs=-45.0,
+            trim_min_silence_len_ms=80,
+            trim_keep_padding_ms=20,
+        )
+
+        timeline_first = self.manager._collect_merge_timeline(export_config=export_config)
+        self.assertEqual(len(timeline_first), 1)
+        trimmed_path = timeline_first[0]["full_path"]
+        self.assertIn(f"voicelines{os.sep}.trim_cache{os.sep}", trimmed_path)
+        self.assertTrue(os.path.exists(trimmed_path))
+
+        original_ms = len(AudioSegment.from_file(original_path))
+        trimmed_ms = len(AudioSegment.from_file(trimmed_path))
+        self.assertLess(trimmed_ms, original_ms)
+
+        mtime_first = os.path.getmtime(trimmed_path)
+        timeline_second = self.manager._collect_merge_timeline(export_config=export_config)
+        self.assertEqual(trimmed_path, timeline_second[0]["full_path"])
+        self.assertEqual(mtime_first, os.path.getmtime(trimmed_path))
+
+    def test_trim_disabled_uses_original_audio_paths(self):
+        original_path = self._write_tone_with_silence("voicelines/no_trim.wav")
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "speaker": "Narrator",
+                "text": "No trim.",
+                "instruct": "",
+                "chapter": "Chapter 1",
+                "status": "done",
+                "audio_path": "voicelines/no_trim.wav",
+            },
+        ])
+
+        export_config = SimpleNamespace(trim_clip_silence_enabled=False)
+        timeline = self.manager._collect_merge_timeline(export_config=export_config)
+        self.assertEqual(len(timeline), 1)
+        self.assertEqual(timeline[0]["full_path"], original_path)
 
     def test_repair_legacy_chunk_order_rewrites_chunks_from_editor_order(self):
         original = [

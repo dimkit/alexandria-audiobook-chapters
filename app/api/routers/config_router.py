@@ -51,6 +51,10 @@ async def get_config():
             "silence_same_speaker_ms": 250,
             "silence_end_of_chapter_ms": 3000,
             "silence_paragraph_ms": 750,
+            "trim_clip_silence_enabled": True,
+            "trim_silence_threshold_dbfs": -50.0,
+            "trim_min_silence_len_ms": 150,
+            "trim_keep_padding_ms": 40,
             "normalize_enabled": True,
             "normalize_target_lufs_mono": -18.0,
             "normalize_target_lufs_stereo": -16.0,
@@ -364,5 +368,4 @@ async def upload_file(file: UploadFile = File(...)):
 @router.get("/api/script_ingestion/preflight")
 async def get_script_ingestion_preflight():
     return _script_ingestion_preflight_summary()
-
 

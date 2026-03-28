@@ -30,6 +30,30 @@
                     <div class="row mb-3">
                         <div class="col">
                             <div class="form-check form-switch mt-1">
+                                <input class="form-check-input" type="checkbox" id="trim-clip-silence-enabled" checked>
+                                <label class="form-check-label" for="trim-clip-silence-enabled">Trim Clip Silence</label>
+                            </div>
+                            <div class="form-text">Removes only leading/trailing silence from generated clips before assembly.</div>
+                        </div>
+                        <div class="col">
+                            <label class="form-label">Trim Silence Threshold (dBFS)</label>
+                            <input type="number" class="form-control" id="trim-silence-threshold-dbfs" value="-50" min="-90" max="-10" step="1">
+                            <div class="form-text">Lower values are less aggressive.</div>
+                        </div>
+                        <div class="col">
+                            <label class="form-label">Minimum Silence Run (ms)</label>
+                            <input type="number" class="form-control" id="trim-min-silence-len-ms" value="150" min="1" step="1">
+                            <div class="form-text">Silence must last at least this long to be trimmed.</div>
+                        </div>
+                        <div class="col">
+                            <label class="form-label">Keep Padding (ms)</label>
+                            <input type="number" class="form-control" id="trim-keep-padding-ms" value="40" min="0" step="1">
+                            <div class="form-text">Retained safety padding at each clip edge after trim.</div>
+                        </div>
+                    </div>
+                    <div class="row mb-3">
+                        <div class="col">
+                            <div class="form-check form-switch mt-1">
                                 <input class="form-check-input" type="checkbox" id="normalize-enabled" checked>
                                 <label class="form-check-label" for="normalize-enabled">Normalize Export Loudness</label>
                             </div>

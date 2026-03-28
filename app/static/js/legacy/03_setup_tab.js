@@ -172,6 +172,18 @@
                     if (config.export.silence_paragraph_ms != null) {
                         document.getElementById('silence-paragraph').value = config.export.silence_paragraph_ms;
                     }
+                    if (config.export.trim_clip_silence_enabled != null) {
+                        document.getElementById('trim-clip-silence-enabled').checked = !!config.export.trim_clip_silence_enabled;
+                    }
+                    if (config.export.trim_silence_threshold_dbfs != null) {
+                        document.getElementById('trim-silence-threshold-dbfs').value = config.export.trim_silence_threshold_dbfs;
+                    }
+                    if (config.export.trim_min_silence_len_ms != null) {
+                        document.getElementById('trim-min-silence-len-ms').value = config.export.trim_min_silence_len_ms;
+                    }
+                    if (config.export.trim_keep_padding_ms != null) {
+                        document.getElementById('trim-keep-padding-ms').value = config.export.trim_keep_padding_ms;
+                    }
                     if (config.export.normalize_enabled != null) {
                         document.getElementById('normalize-enabled').checked = !!config.export.normalize_enabled;
                     }
@@ -327,6 +339,10 @@
                     silence_same_speaker_ms: parseInt(document.getElementById('silence-same-speaker').value) || 250,
                     silence_end_of_chapter_ms: parseInt(document.getElementById('silence-end-of-chapter').value) || 3000,
                     silence_paragraph_ms: parseInt(document.getElementById('silence-paragraph').value) || 750,
+                    trim_clip_silence_enabled: document.getElementById('trim-clip-silence-enabled').checked,
+                    trim_silence_threshold_dbfs: parseFloat(document.getElementById('trim-silence-threshold-dbfs').value) || -50,
+                    trim_min_silence_len_ms: parseInt(document.getElementById('trim-min-silence-len-ms').value) || 150,
+                    trim_keep_padding_ms: parseInt(document.getElementById('trim-keep-padding-ms').value) || 40,
                     normalize_enabled: document.getElementById('normalize-enabled').checked,
                     normalize_target_lufs_mono: parseFloat(document.getElementById('normalize-target-lufs-mono').value) || -18,
                     normalize_target_lufs_stereo: parseFloat(document.getElementById('normalize-target-lufs-stereo').value) || -16,
@@ -357,4 +373,3 @@
                 showToast('Failed to reset project: ' + e.message, 'error');
             }
         });
-

@@ -211,6 +211,66 @@ def _apply_project_dictionary(text):
     return apply_dictionary_to_text(text, _load_project_dictionary_entries())[0]
 
 
+def _delete_saved_script_artifacts(name: str):
+    base = os.path.join(SCRIPTS_DIR, f"{name}.json")
+    if os.path.exists(base):
+        os.remove(base)
+    for suffix in (".voice_config.json", ".paragraphs.json"):
+        companion = os.path.join(SCRIPTS_DIR, f"{name}{suffix}")
+        if os.path.exists(companion):
+            os.remove(companion)
+
+
+def _save_current_script_snapshot(name: str, *, purge_existing: bool = False):
+    if not os.path.exists(SCRIPT_PATH):
+        raise FileNotFoundError("No annotated script to save. Generate a script first.")
+
+    safe_name = _sanitize_name(name)
+    if not safe_name:
+        raise ValueError("Invalid script name.")
+
+    dest = os.path.join(SCRIPTS_DIR, f"{safe_name}.json")
+    existed = os.path.exists(dest)
+    if purge_existing and existed:
+        _delete_saved_script_artifacts(safe_name)
+
+    shutil.copy2(SCRIPT_PATH, dest)
+
+    if os.path.exists(VOICE_CONFIG_PATH):
+        shutil.copy2(VOICE_CONFIG_PATH, os.path.join(SCRIPTS_DIR, f"{safe_name}.voice_config.json"))
+
+    paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
+    if os.path.exists(paragraphs_path):
+        shutil.copy2(paragraphs_path, os.path.join(SCRIPTS_DIR, f"{safe_name}.paragraphs.json"))
+
+    state = _load_project_state_payload()
+    state["loaded_script_name"] = safe_name
+    _save_project_state_payload(state)
+    return {"name": safe_name, "overwrote": existed}
+
+
+def _autosave_name_from_input_file():
+    state = _load_project_state_payload()
+    input_path = (state.get("input_file_path") or "").strip()
+    if not input_path:
+        return ""
+    return _sanitize_name(os.path.splitext(os.path.basename(input_path))[0])
+
+
+def _autosave_current_script_for_workflow(*, purge_existing: bool, trigger: str):
+    auto_name = _autosave_name_from_input_file()
+    if not auto_name:
+        raise RuntimeError("Cannot auto-save script: no imported source file name found.")
+    result = _save_current_script_snapshot(auto_name, purge_existing=purge_existing)
+    logger.info(
+        "Workflow auto-saved script '%s' (trigger=%s, purge_existing=%s)",
+        result["name"],
+        trigger,
+        purge_existing,
+    )
+    return result
+
+
 def _extract_first_json_object(text):
     depth = 0
     start = None
@@ -383,6 +443,10 @@ class ExportConfig(BaseModel):
     silence_same_speaker_ms: int = 250
     silence_end_of_chapter_ms: int = 3000
     silence_paragraph_ms: int = 750
+    trim_clip_silence_enabled: bool = True
+    trim_silence_threshold_dbfs: float = -50.0
+    trim_min_silence_len_ms: int = 150
+    trim_keep_padding_ms: int = 40
     normalize_enabled: bool = True
     normalize_target_lufs_mono: float = -18.0
     normalize_target_lufs_stereo: float = -16.0
@@ -1047,10 +1111,12 @@ def _derived_processing_completed_stages(options=None):
         if stage_name not in allowed:
             continue
         if stage_name == "script":
-            if os.path.exists(SCRIPT_PATH):
+            # Persisted markers are authoritative for restore/resume workflows;
+            # fall back to file existence for legacy projects.
+            if markers.get(stage_name) or os.path.exists(SCRIPT_PATH):
                 completed.append(stage_name)
             continue
-        if stage_name == "review" and markers.get(stage_name) and os.path.exists(SCRIPT_PATH):
+        if stage_name == "review" and markers.get(stage_name):
             completed.append(stage_name)
             continue
         if stage_name in ("sanity", "repair") and markers.get(stage_name) and os.path.exists(SCRIPT_PATH) and os.path.exists(SCRIPT_SANITY_PATH):
@@ -2731,9 +2797,16 @@ def _run_repair_task(run_id: str, stop_check=None):
     return success
 
 
+def _invoke_voice_processing_task(run_id: str, stop_check=None, relay_fn=None):
+    """Route to the voices module implementation without exporting a conflicting symbol."""
+    from .routers.voices_router import run_voice_processing_task as _run_voice_processing_task
+
+    return _run_voice_processing_task(run_id, stop_check=stop_check, relay_fn=relay_fn)
+
+
 def _run_voices_task(run_id: str, stop_check=None):
     _clear_processing_stage_and_downstream("voices")
-    success = run_voice_processing_task(run_id, stop_check=stop_check)
+    success = _invoke_voice_processing_task(run_id, stop_check=stop_check)
     if success:
         _mark_processing_stage_completed_marker("voices")
     return success
@@ -3116,7 +3189,7 @@ def _run_new_mode_workflow_stage(stage_name: str):
     if stage_name == "process_voices":
         # Voices task uses the "voices" task slot, not the stage name
         run_id = _start_task_run("voices")
-        success = run_voice_processing_task(
+        success = _invoke_voice_processing_task(
             run_id,
             stop_check=_new_mode_workflow_is_pause_requested,
             relay_fn=relay,

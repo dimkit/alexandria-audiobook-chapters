@@ -12,6 +12,7 @@ import time
 import copy
 import tempfile
 import uuid
+import hashlib
 from types import SimpleNamespace
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
@@ -26,6 +27,7 @@ from audio_validation import get_audio_duration_seconds, validate_audio_clip
 from audio_validation import estimate_expected_duration_seconds
 from asr import LocalASREngine, LocalASRUnavailableError
 from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
 from script_store import (
     apply_dictionary_to_text,
     load_script_document,
@@ -69,6 +71,10 @@ COMMON_PROOFREAD_ABBREVIATIONS = {
     "sr": ("senior",),
     "vs": ("versus",),
 }
+TRIM_CACHE_VERSION = 1
+TRIM_SILENCE_THRESHOLD_DBFS = -50.0
+TRIM_MIN_SILENCE_LEN_MS = 150
+TRIM_KEEP_PADDING_MS = 40
 
 def get_speaker(entry):
     """Get speaker from entry, checking both 'speaker' and 'type' fields."""
@@ -406,10 +412,106 @@ class ProjectManager:
     def _write_concat_line(cls, handle, path):
         handle.write(f"file '{cls._escape_concat_path(path)}'\n")
 
-    def _collect_merge_timeline(self, progress_callback=None, merge_started_at=None):
+    def _resolve_trim_config(self, export_config=None):
+        cfg = export_config or self._resolve_export_normalization_config(None)
+        return {
+            "enabled": bool(getattr(cfg, "trim_clip_silence_enabled", True)),
+            "silence_threshold_dbfs": float(getattr(cfg, "trim_silence_threshold_dbfs", TRIM_SILENCE_THRESHOLD_DBFS)),
+            "min_silence_len_ms": max(1, int(getattr(cfg, "trim_min_silence_len_ms", TRIM_MIN_SILENCE_LEN_MS))),
+            "keep_padding_ms": max(0, int(getattr(cfg, "trim_keep_padding_ms", TRIM_KEEP_PADDING_MS))),
+        }
+
+    def _trim_cache_dir(self):
+        return os.path.join(self.root_dir, "voicelines", ".trim_cache")
+
+    def _build_trim_cache_key(self, full_path, trim_cfg):
+        stat = os.stat(full_path)
+        rel_path = os.path.relpath(full_path, self.root_dir)
+        payload = "|".join([
+            str(TRIM_CACHE_VERSION),
+            rel_path,
+            str(stat.st_size),
+            str(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            str(trim_cfg["silence_threshold_dbfs"]),
+            str(trim_cfg["min_silence_len_ms"]),
+            str(trim_cfg["keep_padding_ms"]),
+        ])
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _trim_audio_segment_boundaries(segment, trim_cfg):
+        if len(segment) <= 0:
+            return segment, 0, 0, False
+
+        ranges = detect_nonsilent(
+            segment,
+            min_silence_len=trim_cfg["min_silence_len_ms"],
+            silence_thresh=trim_cfg["silence_threshold_dbfs"],
+        )
+        if not ranges:
+            return segment, 0, 0, False
+
+        first_start = int(ranges[0][0])
+        last_end = int(ranges[-1][1])
+        if first_start <= 0 and last_end >= len(segment):
+            return segment, 0, 0, False
+
+        keep = trim_cfg["keep_padding_ms"]
+        trim_start = max(0, first_start - keep)
+        trim_end = min(len(segment), last_end + keep)
+        if trim_end <= trim_start:
+            return segment, 0, 0, False
+
+        lead_removed = trim_start
+        tail_removed = len(segment) - trim_end
+        return segment[trim_start:trim_end], lead_removed, tail_removed, (lead_removed > 0 or tail_removed > 0)
+
+    def _resolve_export_audio_path(self, full_path, trim_cfg):
+        if not trim_cfg["enabled"]:
+            return full_path, {"cache_hit": False, "trimmed": False, "lead_ms": 0, "tail_ms": 0}
+
+        cache_dir = self._trim_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = self._build_trim_cache_key(full_path, trim_cfg)
+        cache_path = os.path.join(cache_dir, f"{cache_key}.wav")
+
+        if os.path.exists(cache_path):
+            try:
+                if os.path.getsize(cache_path) > 44:
+                    return cache_path, {"cache_hit": True, "trimmed": False, "lead_ms": 0, "tail_ms": 0}
+            except OSError:
+                pass
+
+        source_segment = AudioSegment.from_file(full_path)
+        trimmed_segment, lead_ms, tail_ms, changed = self._trim_audio_segment_boundaries(source_segment, trim_cfg)
+
+        exported = trimmed_segment.export(cache_path, format="wav")
+        if hasattr(exported, "close"):
+            exported.close()
+        if not os.path.exists(cache_path) or os.path.getsize(cache_path) <= 44:
+            raise RuntimeError(f"Trim cache export produced invalid file: {cache_path}")
+
+        return cache_path, {
+            "cache_hit": False,
+            "trimmed": bool(changed),
+            "lead_ms": int(lead_ms),
+            "tail_ms": int(tail_ms),
+        }
+
+    def _collect_merge_timeline(self, progress_callback=None, merge_started_at=None, export_config=None, log_callback=None):
         chunks = self.load_chunks()
         timeline = []
         timeline_size_bytes = 0
+        trim_cfg = self._resolve_trim_config(export_config)
+        trim_stats = {
+            "enabled": trim_cfg["enabled"],
+            "processed": 0,
+            "cache_hits": 0,
+            "trimmed_clips": 0,
+            "lead_ms_removed": 0,
+            "tail_ms_removed": 0,
+            "fallback_originals": 0,
+        }
 
         if progress_callback:
             progress_callback({
@@ -432,10 +534,24 @@ class ProjectManager:
             full_path = os.path.join(self.root_dir, path)
             if not os.path.exists(full_path):
                 continue
+            resolved_path = full_path
+            if trim_cfg["enabled"]:
+                try:
+                    resolved_path, trim_info = self._resolve_export_audio_path(full_path, trim_cfg)
+                    trim_stats["processed"] += 1
+                    if trim_info["cache_hit"]:
+                        trim_stats["cache_hits"] += 1
+                    if trim_info["trimmed"]:
+                        trim_stats["trimmed_clips"] += 1
+                        trim_stats["lead_ms_removed"] += int(trim_info["lead_ms"])
+                        trim_stats["tail_ms_removed"] += int(trim_info["tail_ms"])
+                except Exception:
+                    trim_stats["fallback_originals"] += 1
+                    resolved_path = full_path
             item = {
                 "chunk": chunk,
-                "full_path": full_path,
-                "file_size_bytes": os.path.getsize(full_path),
+                "full_path": resolved_path,
+                "file_size_bytes": os.path.getsize(resolved_path),
             }
             timeline.append(item)
             timeline_size_bytes += item["file_size_bytes"]
@@ -450,6 +566,17 @@ class ProjectManager:
                     "estimated_size_bytes": timeline_size_bytes,
                     "output_file_size_bytes": 0,
                 })
+
+        if log_callback and trim_cfg["enabled"]:
+            total_removed_ms = trim_stats["lead_ms_removed"] + trim_stats["tail_ms_removed"]
+            log_callback(
+                "Trim cache: "
+                f"{trim_stats['trimmed_clips']} clip(s) trimmed, "
+                f"{trim_stats['cache_hits']} cache hit(s), "
+                f"{total_removed_ms}ms total removed "
+                f"(lead {trim_stats['lead_ms_removed']}ms, tail {trim_stats['tail_ms_removed']}ms), "
+                f"{trim_stats['fallback_originals']} fallback(s)"
+            )
 
         return timeline
 
@@ -4328,7 +4455,12 @@ class ProjectManager:
 
     def merge_audio(self, progress_callback=None, log_callback=None, export_config=None):
         merge_started_at = time.time()
-        timeline = self._collect_merge_timeline(progress_callback=progress_callback, merge_started_at=merge_started_at)
+        timeline = self._collect_merge_timeline(
+            progress_callback=progress_callback,
+            merge_started_at=merge_started_at,
+            export_config=export_config,
+            log_callback=log_callback,
+        )
 
         if not timeline:
             return False, "No audio segments found"
@@ -4486,7 +4618,12 @@ class ProjectManager:
 
     def export_optimized_mp3_zip(self, progress_callback=None, log_callback=None, export_config=None, max_part_seconds=7200):
         merge_started_at = time.time()
-        timeline = self._collect_merge_timeline(progress_callback=progress_callback, merge_started_at=merge_started_at)
+        timeline = self._collect_merge_timeline(
+            progress_callback=progress_callback,
+            merge_started_at=merge_started_at,
+            export_config=export_config,
+            log_callback=log_callback,
+        )
         if not timeline:
             return False, "No audio segments found"
 
@@ -4700,29 +4837,23 @@ class ProjectManager:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def export_audacity(self):
+    def export_audacity(self, export_config=None):
         """Export project as an Audacity-compatible zip with per-speaker WAV tracks,
         a LOF file for auto-import, and a labels file for chunk annotations."""
-        chunks = self.load_chunks()
+        timeline_items = self._collect_merge_timeline(export_config=export_config)
 
         # Phase 1 — Compute timeline (matching merge_audio pause logic exactly)
         timeline = []  # list of (chunk, segment, abs_start_ms)
         prev_speaker = None
         cursor_ms = 0
 
-        for chunk in chunks:
-            if chunk.get("status") != "done":
-                continue
-            path = chunk.get("audio_path")
-            if not path:
-                continue
-            full_path = os.path.join(self.root_dir, path)
-            if not os.path.exists(full_path):
-                continue
+        for item in timeline_items:
+            chunk = item["chunk"]
+            full_path = item["full_path"]
             try:
                 segment = AudioSegment.from_file(full_path)
             except Exception as e:
-                print(f"Error loading audio for Audacity export {path}: {e}")
+                print(f"Error loading audio for Audacity export {full_path}: {e}")
                 continue
 
             speaker = chunk["speaker"]
@@ -4818,26 +4949,20 @@ class ProjectManager:
         same_speaker_ms = getattr(export_config, "silence_same_speaker_ms", SAME_SPEAKER_PAUSE_MS)
         between_speakers_ms = getattr(export_config, "silence_between_speakers_ms", DEFAULT_PAUSE_MS)
         paragraph_ms = getattr(export_config, "silence_paragraph_ms", 750)
-        chunks = self.load_chunks()
+        timeline_items = self._collect_merge_timeline(export_config=export_config)
 
         # Phase 1 — Compute timeline (same logic as export_audacity)
         timeline = []  # list of (chunk, segment, abs_start_ms)
         prev_chunk = None
         cursor_ms = 0
 
-        for chunk in chunks:
-            if chunk.get("status") != "done":
-                continue
-            path = chunk.get("audio_path")
-            if not path:
-                continue
-            full_path = os.path.join(self.root_dir, path)
-            if not os.path.exists(full_path):
-                continue
+        for item in timeline_items:
+            chunk = item["chunk"]
+            full_path = item["full_path"]
             try:
                 segment = AudioSegment.from_file(full_path)
             except Exception as e:
-                print(f"Error loading audio for M4B export {path}: {e}")
+                print(f"Error loading audio for M4B export {full_path}: {e}")
                 continue
 
             if prev_chunk is not None:

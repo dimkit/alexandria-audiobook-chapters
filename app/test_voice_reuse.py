@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+import asyncio
 
 import app as app_module
 
@@ -172,6 +173,112 @@ class SavedVoiceReuseTests(unittest.TestCase):
                 app_module._append_task_log = original_append_log
                 app_module._finish_task_run = original_finish
                 app_module.project_manager = original_pm
+
+    def test_suggest_voice_description_sync_uses_config_path_without_get_config(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            config_path = os.path.join(temp_root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "llm": {
+                            "base_url": "http://localhost:11434/v1",
+                            "api_key": "local",
+                            "model_name": "test-model",
+                            "timeout": 5,
+                        },
+                        "prompts": {
+                            "voice_prompt": "Describe {character_name}",
+                        },
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            original_config_path = app_module.CONFIG_PATH
+            original_pm = app_module.project_manager
+            original_openai = app_module.OpenAI
+            try:
+                app_module.CONFIG_PATH = config_path
+
+                class FakeProjectManager:
+                    def build_voice_suggestion_prompt(self, speaker, prompt_template):
+                        return {
+                            "prompt": f"{prompt_template} :: {speaker}",
+                            "paragraphs": [],
+                            "context_chars": 0,
+                        }
+
+                class FakeOpenAI:
+                    def __init__(self, **kwargs):
+                        self.chat = self
+                        self.completions = self
+
+                    def create(self, **kwargs):
+                        class _Msg:
+                            content = '{"voice":"Warm, measured narrator voice."}'
+
+                        class _Choice:
+                            message = _Msg()
+
+                        class _Resp:
+                            choices = [_Choice()]
+
+                        return _Resp()
+
+                app_module.project_manager = FakeProjectManager()
+                app_module.OpenAI = FakeOpenAI
+
+                result = app_module.suggest_voice_description_sync("Narrator")
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["speaker"], "Narrator")
+                self.assertEqual(result["voice"], "Warm, measured narrator voice.")
+            finally:
+                app_module.CONFIG_PATH = original_config_path
+                app_module.project_manager = original_pm
+                app_module.OpenAI = original_openai
+
+    def test_get_voices_deduplicates_case_variants(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            script_path = os.path.join(temp_root, "annotated_script.json")
+            voice_config_path = os.path.join(temp_root, "voice_config.json")
+            voices_path = os.path.join(temp_root, "voices.json")
+            with open(script_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "entries": [
+                            {"speaker": "Narrator", "text": "A"},
+                            {"speaker": "NARRATOR", "text": "B"},
+                        ],
+                        "dictionary": [],
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            with open(voice_config_path, "w", encoding="utf-8") as f:
+                json.dump({"narrator": {"type": "design", "description": "x"}}, f, indent=2, ensure_ascii=False)
+
+            original_root = app_module.ROOT_DIR
+            original_script_path = app_module.SCRIPT_PATH
+            original_voice_config_path = app_module.VOICE_CONFIG_PATH
+            original_voices_path = app_module.VOICES_PATH
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.SCRIPT_PATH = script_path
+                app_module.VOICE_CONFIG_PATH = voice_config_path
+                app_module.VOICES_PATH = voices_path
+
+                voices = asyncio.run(app_module.get_voices())
+                self.assertEqual(len(voices), 1)
+                self.assertEqual(voices[0]["name"], "NARRATOR")
+                self.assertEqual(voices[0]["line_count"], 2)
+                self.assertEqual((voices[0]["config"] or {}).get("description"), "x")
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.SCRIPT_PATH = original_script_path
+                app_module.VOICE_CONFIG_PATH = original_voice_config_path
+                app_module.VOICES_PATH = original_voices_path
 
 
 if __name__ == "__main__":

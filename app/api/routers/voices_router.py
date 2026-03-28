@@ -5,6 +5,58 @@ globals().update({k: v for k, v in vars(_shared).items() if not k.startswith("__
 
 router = APIRouter()
 
+
+def _normalized_speaker(name: str) -> str:
+    return project_manager._normalize_speaker_name(name)
+
+
+def _canonical_speaker_name(name: str) -> str:
+    normalized = _normalized_speaker(name)
+    if normalized == _normalized_speaker("NARRATOR"):
+        return "NARRATOR"
+    return (name or "").strip()
+
+
+def _canonicalize_voice_config_keys(voice_config: Dict[str, dict]) -> Dict[str, dict]:
+    """Collapse duplicate voice-config keys case-insensitively."""
+    if not isinstance(voice_config, dict):
+        return {}
+
+    canonical = {}
+    key_by_normalized = {}
+    for raw_key, raw_value in voice_config.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        normalized = _normalized_speaker(key)
+        if not normalized:
+            continue
+        chosen_key = key_by_normalized.get(normalized)
+        if not chosen_key:
+            chosen_key = _canonical_speaker_name(key)
+            key_by_normalized[normalized] = chosen_key
+            canonical[chosen_key] = dict(raw_value or {})
+            continue
+
+        # Merge duplicate entry into existing canonical key without clobbering
+        # already-populated values.
+        existing = canonical.setdefault(chosen_key, {})
+        for field, value in dict(raw_value or {}).items():
+            existing_value = existing.get(field)
+            if existing_value in (None, "", []):
+                existing[field] = value
+
+    return canonical
+
+
+def _find_config_key_case_insensitive(voice_config: Dict[str, dict], speaker: str):
+    target = _normalized_speaker(speaker)
+    for key in voice_config.keys():
+        if _normalized_speaker(key) == target:
+            return key
+    return None
+
+
 @router.get("/api/voices")
 async def get_voices():
     # Parse voices directly from the current script (no stale cache)
@@ -13,13 +65,25 @@ async def get_voices():
     if os.path.exists(SCRIPT_PATH):
         try:
             script_data = _load_project_script_document()["entries"]
-            voices_set = set()
+            voices_map = {}
+            line_counts_by_norm: dict[str, int] = {}
             for entry in script_data:
                 speaker = (entry.get("speaker") or entry.get("type") or "").strip()
                 if speaker:
-                    voices_set.add(speaker)
-                    line_counts[speaker] = line_counts.get(speaker, 0) + 1
-            voices_list = sorted(voices_set)
+                    normalized = _normalized_speaker(speaker)
+                    if not normalized:
+                        continue
+                    canonical_name = voices_map.get(normalized)
+                    if not canonical_name:
+                        canonical_name = _canonical_speaker_name(speaker)
+                        voices_map[normalized] = canonical_name
+                    line_counts_by_norm[normalized] = line_counts_by_norm.get(normalized, 0) + 1
+            voices_list = sorted(voices_map.values(), key=lambda value: value.casefold())
+            line_counts = {
+                voices_map[norm]: count
+                for norm, count in line_counts_by_norm.items()
+                if norm in voices_map
+            }
             # Update voices.json for compatibility with other tools
             with open(VOICES_PATH, "w", encoding="utf-8") as f:
                 json.dump(voices_list, f, indent=2, ensure_ascii=False)
@@ -33,10 +97,10 @@ async def get_voices():
     voice_config = {}
     if os.path.exists(VOICE_CONFIG_PATH):
         with open(VOICE_CONFIG_PATH, "r", encoding="utf-8") as f:
-            voice_config = json.load(f)
+            voice_config = _canonicalize_voice_config_keys(json.load(f))
 
     # Count paragraphs per speaker from paragraphs.json (new pipeline only)
-    para_counts: dict[str, int] = {}
+    para_counts_by_norm: dict[str, int] = {}
     paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
     if os.path.exists(paragraphs_path):
         try:
@@ -45,14 +109,17 @@ async def get_voices():
             for p in para_doc.get("paragraphs", []):
                 spk = (p.get("speaker") or "").strip()
                 if spk:
-                    para_counts[spk] = para_counts.get(spk, 0) + 1
+                    normalized = _normalized_speaker(spk)
+                    if normalized:
+                        para_counts_by_norm[normalized] = para_counts_by_norm.get(normalized, 0) + 1
         except Exception:
             pass
 
     result = []
     chunks = project_manager.load_chunks()
     for voice_name in voices_list:
-        config = voice_config.get(voice_name, {})
+        config_key = _find_config_key_case_insensitive(voice_config, voice_name)
+        config = voice_config.get(config_key, {}) if config_key else {}
         sample_suggestion = project_manager.suggest_design_sample_text(voice_name, chunks)
         ref_audio = (config.get("ref_audio") or "").strip()
         ref_audio_path = os.path.join(ROOT_DIR, ref_audio) if ref_audio and not os.path.isabs(ref_audio) else ref_audio
@@ -63,7 +130,7 @@ async def get_voices():
             "suggested_sample_text": sample_suggestion,
             "design_clone_loaded": design_clone_loaded,
             "line_count": line_counts.get(voice_name, 0),
-            "paragraph_count": para_counts.get(voice_name, 0),
+            "paragraph_count": para_counts_by_norm.get(_normalized_speaker(voice_name), 0),
         })
     return result
 
@@ -105,7 +172,11 @@ async def save_voice_config(config_data: Dict[str, VoiceConfigItem]):
     # Update current config with new data
     for voice_name, config in config_data.items():
         # Convert Pydantic model to dict
-        current_config[voice_name] = config.model_dump()
+        target_name = _canonical_speaker_name(voice_name)
+        existing_key = _find_config_key_case_insensitive(current_config, target_name)
+        current_config[existing_key or target_name] = config.model_dump()
+
+    current_config = _canonicalize_voice_config_keys(current_config)
 
     with open(VOICE_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(current_config, f, indent=2, ensure_ascii=False)
@@ -122,10 +193,10 @@ async def save_voice_config_with_invalidation(request: VoiceConfigSaveRequest):
             detail=f"Cannot update voices while {running_task} work is running",
         )
 
-    new_config = {
-        voice_name: config_item.model_dump()
+    new_config = _canonicalize_voice_config_keys({
+        _canonical_speaker_name(voice_name): config_item.model_dump()
         for voice_name, config_item in (request.config or {}).items()
-    }
+    })
     result = project_manager.save_voice_config_with_invalidation(
         new_config,
         confirm_invalidation=bool(request.confirm_invalidation),
@@ -138,7 +209,13 @@ def suggest_voice_description_sync(speaker: str):
     if not speaker:
         raise ValueError("Speaker is required")
 
-    config = asyncio.run(get_config())
+    config = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            config = {}
     prompts = config.get("prompts", {})
     prompt_template = (prompts.get("voice_prompt") or "").strip()
     if not prompt_template:
@@ -204,7 +281,7 @@ def run_voice_processing_task(run_id: str, stop_check=None, relay_fn=None):
         if os.path.exists(VOICE_CONFIG_PATH):
             with open(VOICE_CONFIG_PATH, "r", encoding="utf-8") as f:
                 try:
-                    voice_config = json.load(f)
+                    voice_config = _canonicalize_voice_config_keys(json.load(f))
                 except (json.JSONDecodeError, ValueError):
                     voice_config = {}
 

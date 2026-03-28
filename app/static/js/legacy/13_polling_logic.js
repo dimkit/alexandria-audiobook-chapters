@@ -196,9 +196,28 @@
         }
 
         async function reconnectTaskLogs() {
+            let newModeWorkflowActive = false;
+            try {
+                const workflowStatus = await API.get('/api/status/new_mode_workflow');
+                newModeWorkflowActive = !!workflowStatus?.running || !!workflowStatus?.paused;
+            } catch (e) {
+                console.error('Failed to prefetch new_mode_workflow status', e);
+            }
+
             for (const [taskName, elementId] of Object.entries(taskLogTargets)) {
                 const el = document.getElementById(elementId);
                 if (!el) continue;
+                const isNewModeStageTask = (
+                    taskName === 'process_paragraphs'
+                    || taskName === 'assign_dialogue'
+                    || taskName === 'extract_temperament'
+                    || taskName === 'create_script'
+                );
+                if (newModeWorkflowActive && isNewModeStageTask) {
+                    // Avoid multiple pollers writing to the same script log pane
+                    // while the new-mode workflow is orchestrating these stages.
+                    continue;
+                }
                 try {
                     const status = await API.get(`/api/status/${taskName}`);
                     renderTaskLogs(taskName, status, elementId);
@@ -406,4 +425,3 @@
                 showToast('Error deleting script: ' + e.message, 'error');
             }
         }
-
