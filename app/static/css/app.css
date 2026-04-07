@@ -44,6 +44,24 @@
             transition: background-color 0.2s ease, color 0.2s ease;
         }
         .container-wide { max-width: 85%; margin-left: auto; margin-right: auto; padding-left: 12px; padding-right: 12px; }
+        .tab-content > .card:last-child { margin-bottom: 0; }
+        #voices-list {
+            height: calc(100vh - 460px);
+            min-height: 200px;
+            overflow-y: auto;
+            overflow-x: hidden;
+        }
+        #editor-tab .table-responsive {
+            height: calc(100vh - 390px);
+            min-height: 250px;
+            overflow-y: auto;
+        }
+        #editor-tab thead th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background-color: var(--app-card-bg);
+        }
         .nav-link { cursor: pointer; }
         .log-window {
             background-color: #1e1e1e;

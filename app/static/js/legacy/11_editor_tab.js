@@ -12,6 +12,7 @@
         let latestAudioState = null;
         let latestProofreadStatus = null;
         let renderPrepComplete = false;
+        let _queueStatusToastShown = false;
 
         // Check if any audio is currently playing
         function isAudioPlaying() {
@@ -124,8 +125,7 @@
 
         function syncEditorChapterState(chunks) {
             const select = document.getElementById('editor-chapter-select');
-            const summary = document.getElementById('editor-chapter-summary');
-            if (!select || !summary) return;
+            if (!select) return;
 
             const options = buildEditorChapterOptions(chunks);
             const firstRealChapter = options.find(option => option.id !== WHOLE_PROJECT_CHAPTER_ID);
@@ -155,12 +155,6 @@
                 select.value = selectedEditorChapter;
             }
 
-            const visibleCount = getVisibleChunks(chunks).length;
-            const viewLabel = selectedEditorChapter === WHOLE_PROJECT_CHAPTER_ID
-                ? `Showing all ${visibleCount} segments.`
-                : `Showing ${visibleCount} segments from ${selectedEditorChapter}.`;
-            const scopeLabel = isChapterOnlyEnabled() ? `Batch actions target ${getActionScopeLabel()}.` : 'Batch actions target the entire book.';
-            summary.textContent = `${viewLabel} ${scopeLabel}`;
             updateDeleteChapterButtonVisibility();
         }
 
@@ -1076,17 +1070,19 @@
         }
 
         function renderAudioQueueStatus(audioState) {
-            const el = document.getElementById('editor-queue-status');
-            if (!el) return;
+            if (_queueStatusToastShown) return;
 
             const current = audioState?.current_job;
             const queued = (audioState?.queue || []).length;
+            let msg = '';
             if (current) {
-                el.textContent = `Running job #${current.id}: ${current.label}. ${queued} queued behind it.`;
+                msg = `Running job #${current.id}: ${current.label}. ${queued} queued behind it.`;
             } else if (queued > 0) {
-                el.textContent = `${queued} audio job${queued === 1 ? '' : 's'} queued.`;
-            } else {
-                el.textContent = '';
+                msg = `${queued} audio job${queued === 1 ? '' : 's'} queued.`;
+            }
+            if (msg) {
+                showToast(msg, 'info', 6000);
+                _queueStatusToastShown = true;
             }
         }
 

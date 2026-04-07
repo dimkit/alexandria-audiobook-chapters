@@ -27,25 +27,33 @@
                          <div id="full-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
                      </div>
 
-                     <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
-                         <div class="d-flex flex-wrap align-items-center gap-3">
-                             <div class="d-flex align-items-center gap-2">
-                                 <label for="editor-chapter-select" class="form-label mb-0 fw-semibold">Chapter</label>
-                                 <select id="editor-chapter-select" class="form-select form-select-sm" style="min-width: 260px;" oninput="changeEditorChapter(this.value)" onchange="changeEditorChapter(this.value)">
-                                     <option value="__whole_project__">Whole Project</option>
-                                 </select>
-                             </div>
-                             <div class="form-check form-switch mb-0">
-                                 <input class="form-check-input" type="checkbox" id="editor-chapter-only" checked onchange="changeEditorScope()">
-                                 <label class="form-check-label fw-semibold" for="editor-chapter-only">Chapter Only</label>
-                             </div>
-                             <button class="btn btn-outline-danger btn-sm" onclick="deleteChapter()" id="btn-delete-chapter" title="Delete entire chapter and all its clips" style="display:none;">
-                                 <i class="fas fa-book-dead me-1"></i>Delete Chapter
-                             </button>
+                     <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+                         <div class="d-flex align-items-center gap-2">
+                             <label for="editor-chapter-select" class="form-label mb-0 fw-semibold">Chapter</label>
+                             <select id="editor-chapter-select" class="form-select form-select-sm" style="min-width: 260px;" oninput="changeEditorChapter(this.value)" onchange="changeEditorChapter(this.value)">
+                                 <option value="__whole_project__">Whole Project</option>
+                             </select>
                          </div>
-                         <div class="text-end">
-                             <div id="editor-chapter-summary" class="text-muted small">Showing all segments.</div>
-                             <div id="editor-queue-status" class="text-muted small"></div>
+                         <div class="form-check form-switch mb-0">
+                             <input class="form-check-input" type="checkbox" id="editor-chapter-only" checked onchange="changeEditorScope()">
+                             <label class="form-check-label fw-semibold" for="editor-chapter-only">Chapter Only</label>
+                         </div>
+                         <button class="btn btn-outline-danger btn-sm" onclick="deleteChapter()" id="btn-delete-chapter" title="Delete entire chapter and all its clips" style="display:none;">
+                             <i class="fas fa-book-dead me-1"></i>Delete Chapter
+                         </button>
+                         <button class="btn btn-outline-secondary btn-sm" id="btn-auto-proofread" onclick="toggleAutoProofread()">
+                             <i class="fas fa-spell-check me-1"></i>Auto Proofread
+                         </button>
+                         <button class="btn btn-outline-secondary btn-sm" id="btn-advanced-controls" onclick="toggleAdvancedControls()">
+                             <i class="fas fa-sliders-h me-1"></i>Advanced Controls
+                         </button>
+                         <div id="legacy-only-buttons" style="display:none; gap:0.5rem;">
+                             <button class="btn btn-outline-primary btn-sm" id="btn-merge-orphans" onclick="mergeOrphans()">
+                                 <i class="fas fa-compress-alt me-1"></i>Merge Orphans
+                             </button>
+                             <button class="btn btn-outline-secondary btn-sm" id="btn-decompose-long-segments" onclick="decomposeLongSegments()">
+                                 <i class="fas fa-cut me-1"></i>Decompose Long Segments
+                             </button>
                          </div>
                      </div>
 
@@ -91,24 +99,7 @@
                              </tbody>
                          </table>
                      </div>
-                     <div class="mt-3">
-                         <div class="d-flex justify-content-end gap-2">
-                             <button class="btn btn-outline-secondary btn-sm" id="btn-auto-proofread" onclick="toggleAutoProofread()">
-                                 <i class="fas fa-spell-check me-1"></i>Auto Proofread
-                             </button>
-                             <button class="btn btn-outline-secondary btn-sm" id="btn-advanced-controls" onclick="toggleAdvancedControls()">
-                                 <i class="fas fa-sliders-h me-1"></i>Advanced Controls
-                             </button>
-                             <div id="legacy-only-buttons" style="display:none; gap:0.5rem;">
-                                 <button class="btn btn-outline-primary btn-sm" id="btn-merge-orphans" onclick="mergeOrphans()">
-                                     <i class="fas fa-compress-alt me-1"></i>Merge Orphans
-                                 </button>
-                                 <button class="btn btn-outline-secondary btn-sm" id="btn-decompose-long-segments" onclick="decomposeLongSegments()">
-                                     <i class="fas fa-cut me-1"></i>Decompose Long Segments
-                                 </button>
-                             </div>
-                         </div>
-                         <div id="advanced-controls-panel" style="display:none; justify-content:flex-end; gap:0.5rem;" class="mt-2">
+                     <div id="advanced-controls-panel" style="display:none; justify-content:flex-end; gap:0.5rem;" class="mt-2">
                              <button class="btn btn-outline-success btn-sm" id="btn-repair-lost-audio" onclick="repairLostAudio()">
                                  <i class="fas fa-link me-1"></i>Lost Audio Repair
                              </button>
@@ -122,7 +113,6 @@
                                  <i class="fas fa-eraser me-1"></i>Invalidate Stale Audio
                              </button>
                          </div>
-                     </div>
                 </div>
             </div>
         </div>
