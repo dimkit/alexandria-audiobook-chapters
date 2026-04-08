@@ -56,6 +56,7 @@ app/error_screenshot.png
 debug_raw_response.txt
 test.txt
 tts_style_test*.json
+models/
 
 # Python cache
 __pycache__/
