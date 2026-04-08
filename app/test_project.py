@@ -161,6 +161,55 @@ class ReconcileChunkAudioStatesTests(unittest.TestCase):
         self.assertEqual(self.manager.resolve_voice_speaker("Narrator", voice_config), "NARRATOR")
         self.assertEqual(self.manager.resolve_voice_speaker("narrator", voice_config), "NARRATOR")
 
+    def test_resolve_voice_speaker_applies_narrator_threshold(self):
+        self.manager.set_narrator_threshold(10)
+        chunks = [
+            {"id": 0, "speaker": "NARRATOR", "text": "Narration line."},
+            {"id": 1, "speaker": "Bob", "text": "Hi."},
+            {"id": 2, "speaker": "Alice", "text": "Line 1"},
+            {"id": 3, "speaker": "Alice", "text": "Line 2"},
+            {"id": 4, "speaker": "Alice", "text": "Line 3"},
+            {"id": 5, "speaker": "Alice", "text": "Line 4"},
+            {"id": 6, "speaker": "Alice", "text": "Line 5"},
+            {"id": 7, "speaker": "Alice", "text": "Line 6"},
+            {"id": 8, "speaker": "Alice", "text": "Line 7"},
+            {"id": 9, "speaker": "Alice", "text": "Line 8"},
+            {"id": 10, "speaker": "Alice", "text": "Line 9"},
+            {"id": 11, "speaker": "Alice", "text": "Line 10"},
+        ]
+        voice_config = {
+            "NARRATOR": {},
+            "Bob": {},
+            "Alice": {},
+        }
+
+        self.assertEqual(
+            self.manager.resolve_voice_speaker("Bob", voice_config, chunks=chunks),
+            "NARRATOR",
+        )
+        self.assertEqual(
+            self.manager.resolve_voice_speaker("Alice", voice_config, chunks=chunks),
+            "Alice",
+        )
+
+    def test_resolve_voice_speaker_manual_alias_overrides_narrator_threshold(self):
+        self.manager.set_narrator_threshold(10)
+        chunks = [
+            {"id": 0, "speaker": "NARRATOR", "text": "Narration line."},
+            {"id": 1, "speaker": "Bob", "text": "Hi."},
+            {"id": 2, "speaker": "Alice", "text": "Hello there."},
+        ]
+        voice_config = {
+            "NARRATOR": {},
+            "Bob": {"alias": "Alice"},
+            "Alice": {},
+        }
+
+        self.assertEqual(
+            self.manager.resolve_voice_speaker("Bob", voice_config, chunks=chunks),
+            "Alice",
+        )
+
     def test_recovers_interrupted_generating_chunk_with_valid_audio(self):
         self._write_wav("voicelines/recovered.wav", duration_seconds=3.0)
         chunks = [{
@@ -3255,7 +3304,6 @@ class RepairLostAudioLinksTests(unittest.TestCase):
         finally:
             self.manager.transcribe_audio_path = original_transcribe
             self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk
-
 
 if __name__ == "__main__":
     unittest.main()

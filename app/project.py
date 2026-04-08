@@ -211,6 +211,8 @@ def script_entries_to_chunks(script_entries, max_chars=MAX_CHUNK_CHARS):
     return chunks
 
 class ProjectManager:
+    DEFAULT_NARRATOR_THRESHOLD = 10
+
     def __init__(self, root_dir):
         self.root_dir = root_dir
         self.script_path = os.path.join(root_dir, "annotated_script.json")
@@ -1853,7 +1855,52 @@ class ProjectManager:
     def _normalize_speaker_name(name):
         return re.sub(r"\s+", " ", (name or "").strip()).casefold()
 
-    def resolve_voice_speaker(self, speaker, voice_config):
+    def get_narrator_threshold(self):
+        state = self._load_state()
+        raw = state.get("narrator_threshold", self.DEFAULT_NARRATOR_THRESHOLD)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = self.DEFAULT_NARRATOR_THRESHOLD
+        return max(0, value)
+
+    def set_narrator_threshold(self, value):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = self.DEFAULT_NARRATOR_THRESHOLD
+        parsed = max(0, parsed)
+        state = self._load_state()
+        state["narrator_threshold"] = parsed
+        self._save_state(state)
+        return parsed
+
+    @staticmethod
+    def _count_speaker_lines(chunks, speaker):
+        speaker_key = ProjectManager._normalize_speaker_name(speaker)
+        if not speaker_key:
+            return 0
+        count = 0
+        for chunk in chunks or []:
+            text = (chunk.get("text") or "").strip()
+            if not text:
+                continue
+            if ProjectManager._normalize_speaker_name(chunk.get("speaker")) == speaker_key:
+                count += 1
+        return count
+
+    def _resolve_narrator_name(self, voice_config, chunks=None):
+        narrator_key = self._normalize_speaker_name("NARRATOR")
+        for name in voice_config.keys():
+            if self._normalize_speaker_name(name) == narrator_key:
+                return name
+        for chunk in chunks or []:
+            speaker = (chunk.get("speaker") or "").strip()
+            if self._normalize_speaker_name(speaker) == narrator_key:
+                return speaker
+        return None
+
+    def resolve_voice_speaker(self, speaker, voice_config, chunks=None):
         """Resolve a speaker alias to a configured target speaker.
 
         Aliases are case-insensitive and can chain, but any invalid target,
@@ -1872,16 +1919,18 @@ class ProjectManager:
         # Canonicalize the starting speaker to the configured key when a
         # case-variant exists (e.g. "Narrator" -> "NARRATOR").
         current = lookup.get(self._normalize_speaker_name(original), original)
+        manual_alias_used = False
         seen = {self._normalize_speaker_name(current)}
         while current:
             voice_data = voice_config.get(current, {})
             alias = (voice_data.get("alias") or "").strip()
             if not alias:
-                return current
+                break
 
             target = lookup.get(self._normalize_speaker_name(alias))
             if not target or self._normalize_speaker_name(target) == self._normalize_speaker_name(current):
-                return current
+                break
+            manual_alias_used = True
 
             target_key = self._normalize_speaker_name(target)
             if target_key in seen:
@@ -1891,7 +1940,35 @@ class ProjectManager:
             seen.add(target_key)
             current = target
 
-        return original
+        resolved = current or original
+        if manual_alias_used:
+            return resolved
+
+        threshold = self.get_narrator_threshold()
+        if threshold <= 0:
+            return resolved
+
+        resolved_key = self._normalize_speaker_name(resolved)
+        narrator_key = self._normalize_speaker_name("NARRATOR")
+        if resolved_key == narrator_key:
+            return resolved
+
+        try:
+            chunk_list = chunks if chunks is not None else self.load_chunks()
+        except Exception:
+            chunk_list = []
+
+        narrator_name = self._resolve_narrator_name(voice_config, chunk_list)
+        if not narrator_name:
+            return resolved
+        if self._normalize_speaker_name(narrator_name) == resolved_key:
+            return resolved
+
+        line_count = self._count_speaker_lines(chunk_list, resolved)
+        if line_count < threshold:
+            return narrator_name
+
+        return resolved
 
     @staticmethod
     def _voice_entry_from_config(voice_config, speaker):
@@ -1929,8 +2006,8 @@ class ProjectManager:
             if not speaker:
                 continue
 
-            old_resolved = self.resolve_voice_speaker(speaker, old_config)
-            new_resolved = self.resolve_voice_speaker(speaker, new_config)
+            old_resolved = self.resolve_voice_speaker(speaker, old_config, chunks=chunks)
+            new_resolved = self.resolve_voice_speaker(speaker, new_config, chunks=chunks)
 
             alias_changed = self._normalize_speaker_name(old_resolved) != self._normalize_speaker_name(new_resolved)
             old_ref_audio = self._voice_ref_audio_from_config(old_config, old_resolved)
@@ -4889,7 +4966,7 @@ class ProjectManager:
 
             speaker = chunk["speaker"]
             voice_config = self._load_voice_config()
-            resolved_speaker = self.resolve_voice_speaker(speaker, voice_config)
+            resolved_speaker = self.resolve_voice_speaker(speaker, voice_config, chunks=chunks)
             voice_config = self.prepare_runtime_voice_config(voice_config, [resolved_speaker])
             text = chunk["text"]
             transformed_text, _ = apply_dictionary_to_text(text, self.load_dictionary_entries())
@@ -5829,7 +5906,7 @@ class ProjectManager:
                 continue
 
             speaker = chunks[idx].get("speaker", "")
-            speaker = self.resolve_voice_speaker(speaker, voice_config)
+            speaker = self.resolve_voice_speaker(speaker, voice_config, chunks=chunks)
             voice_data = voice_config.get(speaker, {})
             voice_type = voice_data.get("type", "custom")
 
@@ -5872,7 +5949,7 @@ class ProjectManager:
                 continue
 
             speaker = chunks[idx].get("speaker", "")
-            resolved = self.resolve_voice_speaker(speaker, voice_config)
+            resolved = self.resolve_voice_speaker(speaker, voice_config, chunks=chunks)
             group_key = self._normalize_speaker_name(resolved) or resolved
             groups.setdefault(group_key, []).append(idx)
             labels.setdefault(group_key, resolved)
@@ -5925,7 +6002,7 @@ class ProjectManager:
         voice_config = {}
         voice_config = self._load_voice_config()
         resolved_speakers = {
-            self.resolve_voice_speaker(chunks[idx].get("speaker", ""), voice_config)
+            self.resolve_voice_speaker(chunks[idx].get("speaker", ""), voice_config, chunks=chunks)
             for idx in indices if 0 <= idx < len(chunks)
         }
         voice_config = self.prepare_runtime_voice_config(voice_config, resolved_speakers)
@@ -5968,24 +6045,38 @@ class ProjectManager:
                     chunk = chunks[idx]
                     transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
                     transformed_texts[idx] = transformed_text
+                    resolved_speaker = self.resolve_voice_speaker(chunk.get("speaker", ""), voice_config, chunks=chunks)
                     batch_chunks.append({
                         "index": idx,
                         "text": transformed_text,
                         "instruct": chunk.get("instruct", ""),
-                        "speaker": self.resolve_voice_speaker(chunk.get("speaker", ""), voice_config)
+                        "speaker": resolved_speaker
                     })
 
             # Call batch TTS with single seed
             batch_start = time.time()
-            batch_results = engine.generate_batch(batch_chunks, voice_config, self.root_dir, batch_seed)
+            batch_results = engine.generate_batch(
+                batch_chunks,
+                voice_config,
+                self.root_dir,
+                batch_seed,
+                cancel_check=cancel_check,
+            )
 
             # Process completed chunks - convert to MP3 and update status
             chunks = self.load_chunks()  # Reload for each batch
+            if cancel_check and cancel_check():
+                cancelled = True
 
             processed_in_batch = len(batch_results["completed"]) + len(batch_results["failed"])
             shared_elapsed = (time.time() - batch_start) / processed_in_batch if processed_in_batch > 0 else 0.0
 
             for idx in batch_results["completed"]:
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    temp_path = os.path.join(self.root_dir, f"temp_batch_{idx}.wav")
+                    self._cleanup_temp_file(temp_path)
+                    continue
                 if not (0 <= idx < len(chunks)):
                     print(f"Chunk {idx} skipped: index out of range (chunks changed during generation?)")
                     results["failed"].append((idx, "Index out of range after reload"))
@@ -6038,7 +6129,7 @@ class ProjectManager:
                         print(f"Chunk {idx} completed: {updated_chunk['audio_path']}")
                         if item_callback:
                             item_callback(idx, True, shared_elapsed, word_counts.get(idx, 0), word_counts.get(idx, 0))
-                    elif auto_regen_retry_attempts > 0:
+                    elif auto_regen_retry_attempts > 0 and not (cancel_check and cancel_check()):
                         print(f"Chunk {idx} failed validation in batch; retrying immediately at the front of the queue")
                         retry_start = time.time()
                         retry_success, retry_msg = self.generate_chunk_audio(idx, attempt=1, generation_token=generation_token)
@@ -6090,9 +6181,15 @@ class ProjectManager:
                     item_callback(idx, False, shared_elapsed, word_counts.get(idx, 0), 0)
 
             chunks = self.load_chunks()
+            if cancel_check and cancel_check():
+                cancelled = True
 
             if progress_callback:
                 progress_callback(len(results["completed"]), len(results["failed"]), total)
+
+            if cancelled:
+                print(f"[CANCEL] Stopping after batch {batch_num + 1}")
+                break
 
         # Reset remaining "generating" chunks to "pending" on cancel or completion
         done_indices = set(results["completed"]) | {idx for idx, _ in results["failed"]}

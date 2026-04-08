@@ -927,11 +927,11 @@ class TTSEngine:
         else:
             return self._external_generate_custom(text, instruct_text, speaker, voice_config, output_path)
 
-    def generate_clone_voice(self, text, speaker, voice_config, output_path):
+    def generate_clone_voice(self, text, speaker, voice_config, output_path, instruct_text=""):
         """Generate audio using voice cloning. Returns True on success."""
         if self._mode == "local":
             if self._resolve_local_backend() == "mlx":
-                return self._mlx_generate_clone(text, speaker, voice_config, output_path)
+                return self._mlx_generate_clone(text, speaker, voice_config, output_path, instruct_text=instruct_text)
             return self._local_generate_clone(text, speaker, voice_config, output_path)
         else:
             return self._external_generate_clone(text, speaker, voice_config, output_path)
@@ -946,7 +946,7 @@ class TTSEngine:
         voice_type = voice_data.get("type", "custom")
 
         if voice_type == "clone":
-            return self.generate_clone_voice(text, speaker, voice_config, output_path)
+            return self.generate_clone_voice(text, speaker, voice_config, output_path, instruct_text=instruct_text)
         elif voice_type in ("lora", "builtin_lora"):
             return self.generate_lora_voice(text, instruct_text, voice_data, output_path)
         elif voice_type == "design":
@@ -1179,7 +1179,7 @@ class TTSEngine:
 
     # ── Batch generation ─────────────────────────────────────────
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         """Generate multiple audio files.
 
         Local mode: uses native list-based batch API for custom voices.
@@ -1199,8 +1199,17 @@ class TTSEngine:
         if not chunks:
             return results
 
+        def _cancel_requested():
+            try:
+                return bool(cancel_check and cancel_check())
+            except Exception:
+                return False
+
         if self._mode == "local" and self._resolve_local_backend() == "mlx":
             for chunk in chunks:
+                if _cancel_requested():
+                    print("[CANCEL] Stopping MLX local batch generation.")
+                    break
                 idx = chunk["index"]
                 output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
                 try:
@@ -1243,24 +1252,43 @@ class TTSEngine:
                 design_chunks.append(chunk)
             else:
                 custom_chunks.append(chunk)
-
         # Process custom voice chunks
-        if custom_chunks:
+        if custom_chunks and not _cancel_requested():
             if self._mode == "local":
-                batch_results = self._local_batch_custom(custom_chunks, voice_config, output_dir, batch_seed)
+                batch_results = self._local_batch_custom(
+                    custom_chunks,
+                    voice_config,
+                    output_dir,
+                    batch_seed,
+                    cancel_check=cancel_check,
+                )
             else:
-                batch_results = self._sequential_custom(custom_chunks, voice_config, output_dir, batch_seed)
+                batch_results = self._sequential_custom(
+                    custom_chunks,
+                    voice_config,
+                    output_dir,
+                    batch_seed,
+                    cancel_check=cancel_check,
+                )
             results["completed"].extend(batch_results["completed"])
             results["failed"].extend(batch_results["failed"])
             self._clear_gpu_cache()
 
         # Process clone voice chunks (batched by speaker in local mode)
-        if clone_chunks:
+        if clone_chunks and not _cancel_requested():
             if self._mode == "local":
-                batch_results = self._local_batch_clone(clone_chunks, voice_config, output_dir)
+                batch_results = self._local_batch_clone(
+                    clone_chunks,
+                    voice_config,
+                    output_dir,
+                    cancel_check=cancel_check,
+                )
             else:
                 batch_results = {"completed": [], "failed": []}
                 for chunk in clone_chunks:
+                    if _cancel_requested():
+                        print("[CANCEL] Stopping clone voice batch generation.")
+                        break
                     idx = chunk["index"]
                     output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
                     try:
@@ -1278,12 +1306,20 @@ class TTSEngine:
             self._clear_gpu_cache()
 
         # Process LoRA voice chunks (batched by adapter in local mode)
-        if lora_chunks:
+        if lora_chunks and not _cancel_requested():
             if self._mode == "local":
-                batch_results = self._local_batch_lora(lora_chunks, voice_config, output_dir)
+                batch_results = self._local_batch_lora(
+                    lora_chunks,
+                    voice_config,
+                    output_dir,
+                    cancel_check=cancel_check,
+                )
             else:
                 batch_results = {"completed": [], "failed": []}
                 for chunk in lora_chunks:
+                    if _cancel_requested():
+                        print("[CANCEL] Stopping LoRA batch generation.")
+                        break
                     idx = chunk["index"]
                     output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
                     speaker = chunk.get("speaker")
@@ -1306,8 +1342,11 @@ class TTSEngine:
             self._clear_gpu_cache()
 
         # Process design voice chunks (sequential — each line has unique description)
-        if design_chunks:
+        if design_chunks and not _cancel_requested():
             for chunk in design_chunks:
+                if _cancel_requested():
+                    print("[CANCEL] Stopping voice design batch generation.")
+                    break
                 idx = chunk["index"]
                 output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
                 speaker = chunk.get("speaker")
@@ -1353,12 +1392,20 @@ class TTSEngine:
             print(f"Error generating custom voice for '{speaker}' with MLX backend: {e}")
             return False
 
-    def _mlx_generate_clone(self, text, speaker, voice_config, output_path):
+    def _mlx_generate_clone(self, text, speaker, voice_config, output_path, instruct_text=""):
         """Generate clone voice audio using local MLX backend."""
         try:
             voice_data = voice_config.get(speaker, {})
             ref_audio_path = voice_data.get("ref_audio")
             ref_text = voice_data.get("generated_ref_text") or voice_data.get("ref_text") or "."
+            character_style = (voice_data.get("character_style") or voice_data.get("default_style") or "").strip()
+            line_instruct = (instruct_text or "").strip()
+            if line_instruct and character_style:
+                instruct = f"{line_instruct} {character_style}".strip()
+            elif line_instruct:
+                instruct = line_instruct
+            else:
+                instruct = character_style
 
             if not ref_audio_path:
                 print(f"Warning: Clone voice for '{speaker}' missing ref_audio. Skipping.")
@@ -1373,12 +1420,27 @@ class TTSEngine:
                 return False
 
             model = self._init_local_mlx_model("base")
-            audio, sr = self._mlx_generate_with_temp_dir(
-                model,
-                text=text,
-                ref_audio=ref_audio_path,
-                ref_text=ref_text,
-            )
+            kwargs = {
+                "text": text,
+                "ref_audio": ref_audio_path,
+                "ref_text": ref_text,
+            }
+            if instruct:
+                kwargs["instruct"] = instruct
+            try:
+                audio, sr = self._mlx_generate_with_temp_dir(
+                    model,
+                    **kwargs,
+                )
+            except TypeError as e:
+                if "instruct" in kwargs:
+                    kwargs.pop("instruct", None)
+                    audio, sr = self._mlx_generate_with_temp_dir(
+                        model,
+                        **kwargs,
+                    )
+                else:
+                    raise
             self._save_wav(audio, sr, output_path)
             return True
         except Exception as e:
@@ -1485,7 +1547,7 @@ class TTSEngine:
             print(f"Error generating clone voice for '{speaker}': {e}")
             return False
 
-    def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         """Batch generate custom voice using native list API with sub-batching.
 
         Autoregressive batch generation runs for as long as the longest sequence.
@@ -1559,6 +1621,9 @@ class TTSEngine:
         total_audio_duration = 0.0
 
         for sb_idx, (start, end) in enumerate(sub_batches):
+            if cancel_check and cancel_check():
+                print("[CANCEL] Stopping custom voice sub-batch generation.")
+                break
             sb_texts = texts[start:end]
             sb_speakers = speakers[start:end]
             sb_instructs = instructs[start:end]
@@ -1620,7 +1685,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_clone(self, chunks, voice_config, output_dir):
+    def _local_batch_clone(self, chunks, voice_config, output_dir, cancel_check=None):
         """Batch generate clone voices, grouped by speaker.
 
         Chunks sharing the same speaker (same reference audio) are batched
@@ -1652,6 +1717,9 @@ class TTSEngine:
         total_audio_duration = 0.0
 
         for speaker, group in speaker_groups.items():
+            if cancel_check and cancel_check():
+                print("[CANCEL] Stopping clone voice grouped batch generation.")
+                break
             try:
                 prompt = self._get_clone_prompt(speaker, voice_config)
             except Exception as e:
@@ -1680,6 +1748,9 @@ class TTSEngine:
                   f"in {len(sub_batches)} sub-batch(es)")
 
             for sb_idx, (start, end) in enumerate(sub_batches):
+                if cancel_check and cancel_check():
+                    print("[CANCEL] Stopping clone voice sub-batch generation.")
+                    break
                 sb_texts = texts[start:end]
                 sb_indices = indices[start:end]
 
@@ -1731,7 +1802,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_lora(self, chunks, voice_config, output_dir):
+    def _local_batch_lora(self, chunks, voice_config, output_dir, cancel_check=None):
         """Batch generate LoRA voices, grouped by adapter.
 
         Chunks sharing the same adapter are batched together through
@@ -1775,6 +1846,9 @@ class TTSEngine:
         total_audio_duration = 0.0
 
         for adapter_path, (voice_data, group) in adapter_groups.items():
+            if cancel_check and cancel_check():
+                print("[CANCEL] Stopping LoRA grouped batch generation.")
+                break
             if not os.path.isdir(adapter_path):
                 print(f"  Error: adapter path not found: {adapter_path}")
                 for chunk in group:
@@ -1839,6 +1913,9 @@ class TTSEngine:
                   f"in {len(sub_batches)} sub-batch(es)")
 
             for sb_idx, (start, end) in enumerate(sub_batches):
+                if cancel_check and cancel_check():
+                    print("[CANCEL] Stopping LoRA sub-batch generation.")
+                    break
                 sb_texts = texts[start:end]
                 sb_instructs = instructs_raw[start:end]
                 sb_indices = indices[start:end]
@@ -2097,11 +2174,14 @@ class TTSEngine:
             print(f"Error generating clone voice for '{speaker}': {e}")
             return False
 
-    def _sequential_custom(self, chunks, voice_config, output_dir, batch_seed=-1):
+    def _sequential_custom(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
         """Sequential custom voice generation for external mode (no native batch)."""
         results = {"completed": [], "failed": []}
 
         for chunk in chunks:
+            if cancel_check and cancel_check():
+                print("[CANCEL] Stopping sequential custom generation.")
+                break
             idx = chunk["index"]
             output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
             try:

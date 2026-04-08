@@ -45,11 +45,24 @@
         }
         .container-wide { max-width: 85%; margin-left: auto; margin-right: auto; padding-left: 12px; padding-right: 12px; }
         .tab-content > .card:last-child { margin-bottom: 0; }
+        #voices-tab {
+            padding-bottom: 0 !important;
+            margin-bottom: 0 !important;
+        }
+        #voices-tab > .card {
+            margin-bottom: 0 !important;
+        }
         #voices-list {
-            height: calc(100vh - 460px);
-            min-height: 200px;
-            overflow-y: auto;
+            height: auto;
+            max-height: none;
+            min-height: 0;
+            margin-bottom: 0;
+            padding-bottom: 0;
             overflow-x: hidden;
+            overflow-y: auto;
+        }
+        #voices-list .voice-card:last-child {
+            margin-bottom: 0 !important;
         }
         #editor-tab .table-responsive {
             height: calc(100vh - 390px);
@@ -109,6 +122,14 @@
         .voice-card.alias-active .voice-primary-content {
             opacity: 0.45;
             filter: grayscale(1);
+        }
+        .voice-card.narrator-threshold-active {
+            border-left-color: #f0ad00;
+            background: color-mix(in srgb, #f0ad00 10%, var(--app-card-bg));
+        }
+        .voice-card.narrator-threshold-active .voice-primary-content {
+            opacity: 0.58;
+            filter: saturate(0.75);
         }
         .voice-card .voice-alias-box {
             background: color-mix(in srgb, var(--app-card-bg) 88%, transparent);

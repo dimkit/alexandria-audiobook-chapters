@@ -261,6 +261,7 @@ def _audio_generation_active_for_script_load() -> bool:
                 audio_current_job = None
                 audio_recovery_request = None
                 process_state["audio"]["cancel"] = False
+                audio_cancel_event.clear()
                 process_state["audio"]["merge_running"] = False
                 _append_audio_log_locked("[HEAL] Cleared stale audio runtime state after project reset.")
                 _refresh_audio_process_state_locked(persist=True)

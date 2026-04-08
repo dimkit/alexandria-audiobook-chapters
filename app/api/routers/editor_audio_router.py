@@ -1060,59 +1060,13 @@ async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background
 
 @router.post("/api/cancel_audio")
 async def cancel_audio():
-    """Cancel the current audio job and clear any queued jobs."""
+    """Cancel immediately: hard-wipe current job, queue, and persisted queue state."""
     global audio_recovery_request
-    cancelled_or_cleared = False
     with audio_queue_condition:
-        cleared = len(audio_queue)
-        now = time.time()
-        while audio_queue:
-            job = audio_queue.pop(0)
-            job["status"] = "cancelled"
-            job["finished_at"] = now
-            _record_audio_recent_job_locked(job)
-        if cleared:
-            cancelled_or_cleared = True
-
-        if audio_current_job is not None:
-            process_state["audio"]["cancel"] = True
-            audio_recovery_request = None
-            _append_audio_log_locked(f"[CANCEL] Cancellation requested for job #{audio_current_job['id']}")
-            if cleared:
-                _append_audio_log_locked(f"[CANCEL] Cleared {cleared} queued job(s)")
-            abandoned = _abandon_audio_job_locked(
-                audio_current_job,
-                audio_current_job.get("run_token"),
-                "User requested cancellation",
-                status="cancelled",
-            )
-            cancelled_or_cleared = True
-            if abandoned:
-                _refresh_audio_process_state_locked(persist=True)
-                if os.path.exists(AUDIO_QUEUE_STATE_PATH):
-                    os.remove(AUDIO_QUEUE_STATE_PATH)
-                return {"status": "cancelled", "cleared_queued_jobs": cleared}
-            _refresh_audio_process_state_locked(persist=True)
-            if os.path.exists(AUDIO_QUEUE_STATE_PATH):
-                os.remove(AUDIO_QUEUE_STATE_PATH)
-            return {"status": "cancelling", "cleared_queued_jobs": cleared}
-
-        if cleared:
-            audio_recovery_request = None
-            _append_audio_log_locked(f"[CANCEL] Cleared {cleared} queued job(s)")
-            _refresh_audio_process_state_locked(persist=True)
-            if os.path.exists(AUDIO_QUEUE_STATE_PATH):
-                os.remove(AUDIO_QUEUE_STATE_PATH)
-            return {"status": "cancelled", "cleared_queued_jobs": cleared}
-
-    # Not running — still reset any stuck "generating" chunks (e.g. from a crash)
-    reset_count = project_manager.reset_generating_chunks()
-    with audio_queue_condition:
-        audio_recovery_request = None
-        process_state["audio"]["cancel"] = False
-        _refresh_audio_process_state_locked(persist=True)
-    if os.path.exists(AUDIO_QUEUE_STATE_PATH):
-        os.remove(AUDIO_QUEUE_STATE_PATH)
-    return {"status": "not_running", "reset_chunks": reset_count}
+        _append_audio_log_locked(
+            f"[CANCEL] /api/cancel_audio invoked (current_job={'yes' if audio_current_job is not None else 'no'}, queued={len(audio_queue)})"
+        )
+        wipe = _hard_wipe_audio_runtime_locked("User requested cancellation via /api/cancel_audio")
+        return {"status": "cancelled", **wipe}
 
 ## ── Saved Scripts ──────────────────────────────────────────────

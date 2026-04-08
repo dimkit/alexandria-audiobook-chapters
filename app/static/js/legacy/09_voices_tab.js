@@ -5,6 +5,76 @@
             return (value || '').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
         }
 
+        let _voiceSettingsSaveTimer = null;
+        let _voicesListResizeBound = false;
+
+        function layoutVoicesListContainer() {
+            const list = document.getElementById('voices-list');
+            const tab = document.getElementById('voices-tab');
+            if (!list || !tab || tab.style.display === 'none') return;
+
+            // Reset before measuring so we compute available viewport space accurately.
+            list.style.maxHeight = 'none';
+            list.style.height = 'auto';
+
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+            const rect = list.getBoundingClientRect();
+            const bottomPadding = 24;
+            const available = Math.floor(viewportHeight - rect.top - bottomPadding);
+            const minScrollableHeight = 220;
+
+            if (available >= minScrollableHeight) {
+                list.style.maxHeight = `${available}px`;
+                list.style.overflowY = 'auto';
+            } else {
+                list.style.maxHeight = 'none';
+                list.style.overflowY = 'visible';
+            }
+        }
+
+        function getNarratorThresholdValue() {
+            const input = document.getElementById('narrator-threshold-input');
+            if (!input) return 10;
+            const parsed = parseInt(input.value, 10);
+            return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10;
+        }
+
+        function getNarratorName(cards) {
+            const narratorCard = cards.find(card => normalizeVoiceName(card.dataset.voice) === normalizeVoiceName('NARRATOR'));
+            return narratorCard ? narratorCard.dataset.voice : '';
+        }
+
+        async function loadVoiceSettings() {
+            const input = document.getElementById('narrator-threshold-input');
+            if (!input) return;
+            try {
+                const result = await API.get('/api/voices/settings');
+                const value = Number(result?.narrator_threshold);
+                input.value = Number.isFinite(value) && value >= 0 ? String(value) : '10';
+            } catch (_e) {
+                input.value = input.value || '10';
+            }
+        }
+
+        async function saveVoiceSettingsNow() {
+            const input = document.getElementById('narrator-threshold-input');
+            if (!input) return;
+            const value = getNarratorThresholdValue();
+            input.value = String(value);
+            await API.post('/api/voices/settings', { value });
+        }
+
+        function debouncedSaveVoiceSettings() {
+            clearTimeout(_voiceSettingsSaveTimer);
+            _voiceSettingsSaveTimer = setTimeout(() => {
+                saveVoiceSettingsNow().then(() => {
+                    updateVoiceAliasStates();
+                }).catch((e) => {
+                    showToast(`Failed to save narrator threshold: ${e.message}`, 'error');
+                });
+            }, 500);
+        }
+
         // Suggest aliases for names where one is a substring of another.
         // The name with fewer paragraphs gets aliased to the one with more.
         // Only fills empty AKA inputs — never overwrites a user-set alias.
@@ -82,12 +152,22 @@
         function updateVoiceAliasStates() {
             const cards = Array.from(document.querySelectorAll('.voice-card'));
             const nameMap = new Map(cards.map(card => [normalizeVoiceName(card.dataset.voice), card.dataset.voice]));
+            const narratorThreshold = getNarratorThresholdValue();
+            const narratorName = getNarratorName(cards);
 
             cards.forEach(card => {
                 const target = getVoiceAliasTarget(card, nameMap);
-                const disabled = Boolean(target);
+                const lineCount = Number(card.dataset.lineCount || 0);
+                const isNarrator = normalizeVoiceName(card.dataset.voice) === normalizeVoiceName('NARRATOR');
+                const thresholdTarget = (!target && narratorName && !isNarrator && lineCount < narratorThreshold)
+                    ? narratorName
+                    : '';
+                const disabled = Boolean(target || thresholdTarget);
+                const manualAliasActive = Boolean(target);
+                const narratorThresholdActive = Boolean(thresholdTarget);
 
-                card.classList.toggle('alias-active', disabled);
+                card.classList.toggle('alias-active', manualAliasActive);
+                card.classList.toggle('narrator-threshold-active', narratorThresholdActive);
                 card.querySelectorAll('input, select, textarea, button').forEach(control => {
                     if (control.classList.contains('voice-alias-input')) {
                         control.disabled = false;
@@ -98,9 +178,13 @@
 
                 const status = card.querySelector('.voice-alias-status');
                 if (status) {
-                    status.textContent = disabled
-                        ? `Aliased to ${target}. Generation will use that character's voice settings.`
-                        : 'Match another visible character name here to disable this row and reuse that voice.';
+                    if (manualAliasActive) {
+                        status.textContent = `Aliased to ${target}. Generation will use that character's voice settings.`;
+                    } else if (narratorThresholdActive) {
+                        status.textContent = `Auto-aliased to ${thresholdTarget} because ${lineCount} line${lineCount === 1 ? '' : 's'} is below narrator threshold ${narratorThreshold}. Set AKA to override this.`;
+                    } else {
+                        status.textContent = 'Match another visible character name here to disable this row and reuse that voice.';
+                    }
                 }
             });
         }
@@ -121,7 +205,7 @@
             const lineLabel = `${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`;
 
             return `
-                <div class="card voice-card mb-3" data-voice="${safeName}" data-suggested-sample="${escapeHtml(voice.suggested_sample_text || '')}">
+                <div class="card voice-card mb-3" data-voice="${safeName}" data-line-count="${lineCount}" data-suggested-sample="${escapeHtml(voice.suggested_sample_text || '')}">
                     <div class="card-body">
                         <div class="row">
                             <div class="col-md-3">
@@ -301,6 +385,7 @@
         };
 
         async function loadVoices() {
+            await loadVoiceSettings();
             // Refresh voice caches so dropdowns are populated
             try {
                 window._designedVoicesCache = await API.get('/api/voice_design/list');
@@ -316,11 +401,13 @@
             const container = document.getElementById('voices-list');
             if (voices.length === 0) {
                 container.innerHTML = '<div class="alert alert-info">No voices found. Generate a script first.</div>';
+                layoutVoicesListContainer();
                 return;
             }
             container.innerHTML = voices.map((v, i) => createVoiceCard(v, i)).join('');
             updateVoiceAliasStates();
             const suggestedAliases = suggestVoiceAliases(voices);
+            layoutVoicesListContainer();
 
             let filledMissingDesignSample = false;
             voices.forEach(voice => {
@@ -685,7 +772,7 @@
 
             // Convert any "Custom Voice" cards to "Voice Design" so they get voices generated
             Array.from(document.querySelectorAll('.voice-card'))
-                .filter(card => !card.classList.contains('alias-active'))
+                .filter(card => !card.classList.contains('alias-active') && !card.classList.contains('narrator-threshold-active'))
                 .filter(card => card.querySelector('.voice-type:checked')?.value === 'custom')
                 .forEach(card => {
                     const designRadio = card.querySelector('.voice-type[value="design"]');
@@ -696,7 +783,7 @@
                 });
 
             const eligibleSpeakers = Array.from(document.querySelectorAll('.voice-card'))
-                .filter(card => !card.classList.contains('alias-active'))
+                .filter(card => !card.classList.contains('alias-active') && !card.classList.contains('narrator-threshold-active'))
                 .filter(card => card.querySelector('.voice-type:checked')?.value === 'design')
                 .map(card => card.dataset.voice)
                 .filter(Boolean);
@@ -714,7 +801,7 @@
                 for (let i = 0; i < eligibleSpeakers.length; i += 1) {
                     const speaker = eligibleSpeakers[i];
                     const voiceCard = getVoiceCardByName(speaker);
-                    if (!voiceCard || voiceCard.classList.contains('alias-active')) {
+                    if (!voiceCard || voiceCard.classList.contains('alias-active') || voiceCard.classList.contains('narrator-threshold-active')) {
                         continue;
                     }
 
@@ -799,3 +886,22 @@
                 clearBtn.textContent = originalText;
             }
         };
+
+        const narratorThresholdInput = document.getElementById('narrator-threshold-input');
+        if (narratorThresholdInput) {
+            narratorThresholdInput.addEventListener('input', () => {
+                updateVoiceAliasStates();
+                debouncedSaveVoiceSettings();
+            });
+            narratorThresholdInput.addEventListener('change', () => {
+                updateVoiceAliasStates();
+                debouncedSaveVoiceSettings();
+            });
+        }
+
+        if (!_voicesListResizeBound) {
+            window.addEventListener('resize', () => {
+                layoutVoicesListContainer();
+            });
+            _voicesListResizeBound = true;
+        }

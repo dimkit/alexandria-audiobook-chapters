@@ -280,6 +280,142 @@ class SavedVoiceReuseTests(unittest.TestCase):
                 app_module.VOICE_CONFIG_PATH = original_voice_config_path
                 app_module.VOICES_PATH = original_voices_path
 
+    def test_clear_uploaded_voices_clears_only_current_script_assets_and_text(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            clone_dir = os.path.join(temp_root, "clone_voices")
+            designed_dir = os.path.join(temp_root, "designed_voices")
+            os.makedirs(clone_dir, exist_ok=True)
+            os.makedirs(designed_dir, exist_ok=True)
+
+            script_path = os.path.join(temp_root, "annotated_script.json")
+            voice_config_path = os.path.join(temp_root, "voice_config.json")
+
+            with open(script_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"entries": [{"speaker": "CAT", "text": "meow"}, {"speaker": "NARRATOR", "text": "narrate"}]},
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            with open(voice_config_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "CAT": {
+                            "type": "design",
+                            "ref_audio": "clone_voices/booka_cat.wav",
+                            "ref_text": "cat sample",
+                            "generated_ref_text": "cat generated sample",
+                        },
+                        "DOG": {
+                            "type": "design",
+                            "ref_audio": "clone_voices/bookb_dog.wav",
+                            "ref_text": "dog sample",
+                            "generated_ref_text": "dog generated sample",
+                        },
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            for path in (
+                os.path.join(clone_dir, "booka_cat.wav"),
+                os.path.join(clone_dir, "bookb_dog.wav"),
+                os.path.join(designed_dir, "booka_cat_design.wav"),
+                os.path.join(designed_dir, "bookb_dog_design.wav"),
+            ):
+                with open(path, "wb") as f:
+                    f.write(b"wav")
+
+            with open(os.path.join(clone_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {"script_title": "BookA", "speaker": "CAT", "filename": "booka_cat.wav", "generated": True},
+                        {"script_title": "BookB", "speaker": "DOG", "filename": "bookb_dog.wav", "generated": True},
+                    ],
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            with open(os.path.join(designed_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {"script_title": "BookA", "speaker": "CAT", "filename": "booka_cat_design.wav"},
+                        {"script_title": "BookB", "speaker": "DOG", "filename": "bookb_dog_design.wav"},
+                    ],
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            original_root = app_module.ROOT_DIR
+            original_script_path = app_module.SCRIPT_PATH
+            original_voice_config_path = app_module.VOICE_CONFIG_PATH
+            original_clone_dir = app_module.CLONE_VOICES_DIR
+            original_designed_dir = app_module.DESIGNED_VOICES_DIR
+            original_clone_manifest = app_module.CLONE_VOICES_MANIFEST
+            original_designed_manifest = app_module.DESIGNED_VOICES_MANIFEST
+            original_task_running = app_module._any_project_task_running
+            original_pm = app_module.project_manager
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.SCRIPT_PATH = script_path
+                app_module.VOICE_CONFIG_PATH = voice_config_path
+                app_module.CLONE_VOICES_DIR = clone_dir
+                app_module.DESIGNED_VOICES_DIR = designed_dir
+                app_module.CLONE_VOICES_MANIFEST = os.path.join(clone_dir, "manifest.json")
+                app_module.DESIGNED_VOICES_MANIFEST = os.path.join(designed_dir, "manifest.json")
+                app_module._any_project_task_running = lambda: None
+
+                class FakeProjectManager:
+                    engine = None
+
+                    def _current_script_title(self):
+                        return "BookA"
+
+                    def _normalize_speaker_name(self, value):
+                        return (value or "").strip().lower()
+
+                app_module.project_manager = FakeProjectManager()
+
+                result = asyncio.run(app_module.clear_uploaded_voices_for_current_script())
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["script_title"], "BookA")
+
+                with open(os.path.join(clone_dir, "manifest.json"), "r", encoding="utf-8") as f:
+                    clone_manifest = json.load(f)
+                with open(os.path.join(designed_dir, "manifest.json"), "r", encoding="utf-8") as f:
+                    designed_manifest = json.load(f)
+                self.assertEqual(len(clone_manifest), 1)
+                self.assertEqual(clone_manifest[0]["script_title"], "BookB")
+                self.assertEqual(len(designed_manifest), 1)
+                self.assertEqual(designed_manifest[0]["script_title"], "BookB")
+
+                self.assertFalse(os.path.exists(os.path.join(clone_dir, "booka_cat.wav")))
+                self.assertFalse(os.path.exists(os.path.join(designed_dir, "booka_cat_design.wav")))
+                self.assertTrue(os.path.exists(os.path.join(clone_dir, "bookb_dog.wav")))
+                self.assertTrue(os.path.exists(os.path.join(designed_dir, "bookb_dog_design.wav")))
+
+                with open(voice_config_path, "r", encoding="utf-8") as f:
+                    updated_cfg = json.load(f)
+                self.assertEqual(updated_cfg["CAT"].get("ref_audio"), "")
+                self.assertEqual(updated_cfg["CAT"].get("ref_text"), "")
+                self.assertEqual(updated_cfg["CAT"].get("generated_ref_text"), "")
+                self.assertEqual(updated_cfg["DOG"].get("ref_audio"), "clone_voices/bookb_dog.wav")
+                self.assertEqual(updated_cfg["DOG"].get("ref_text"), "dog sample")
+                self.assertEqual(updated_cfg["DOG"].get("generated_ref_text"), "dog generated sample")
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.SCRIPT_PATH = original_script_path
+                app_module.VOICE_CONFIG_PATH = original_voice_config_path
+                app_module.CLONE_VOICES_DIR = original_clone_dir
+                app_module.DESIGNED_VOICES_DIR = original_designed_dir
+                app_module.CLONE_VOICES_MANIFEST = original_clone_manifest
+                app_module.DESIGNED_VOICES_MANIFEST = original_designed_manifest
+                app_module._any_project_task_running = original_task_running
+                app_module.project_manager = original_pm
+
     def test_save_voice_config_with_invalidation_preserves_unsubmitted_voices(self):
         captured = {}
 

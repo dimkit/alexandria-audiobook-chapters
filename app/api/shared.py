@@ -65,6 +65,7 @@ UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
 CHUNKS_PATH = os.path.join(ROOT_DIR, "chunks.json")
 AUDIO_QUEUE_STATE_PATH = os.path.join(ROOT_DIR, "audio_queue_state.json")
+AUDIO_CANCEL_TOMBSTONE_PATH = os.path.join(ROOT_DIR, "audio_cancel_tombstone.json")
 SCRIPT_SANITY_PATH = os.path.join(ROOT_DIR, "script_sanity_check.json")
 SCRIPT_REPAIR_TRACE_PATH = os.path.join(ROOT_DIR, "script_repair_trace.jsonl")
 DESIGNED_VOICES_DIR = os.path.join(ROOT_DIR, "designed_voices")
@@ -754,8 +755,47 @@ audio_queue_lock = threading.RLock()
 audio_queue_condition = threading.Condition(audio_queue_lock)
 audio_queue = []
 audio_current_job = None
+audio_cancel_event = threading.Event()
+audio_current_runner_thread = None
+audio_current_runner_token = None
 audio_job_counter = 0
 audio_recovery_request = None
+
+
+def _force_kill_thread(thread):
+    """Brutally terminate a Python thread via async exception injection."""
+    try:
+        import ctypes
+        thread_id = getattr(thread, "ident", None)
+        if not thread_id:
+            return False
+        result = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_long(thread_id),
+            ctypes.py_object(SystemExit),
+        )
+        if result == 0:
+            return False
+        if result > 1:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), None)
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _force_kill_active_audio_runner_locked():
+    global audio_current_runner_thread, audio_current_runner_token
+    runner = audio_current_runner_thread
+    if runner is None:
+        return False
+    killed = _force_kill_thread(runner)
+    if killed:
+        _append_audio_log_locked("[CANCEL] Force-killed active audio runner thread.")
+    else:
+        _append_audio_log_locked("[CANCEL] Could not force-kill active audio runner thread.")
+    audio_current_runner_thread = None
+    audio_current_runner_token = None
+    return killed
 
 
 def _trim_logs(logs, limit=1000):
@@ -978,6 +1018,7 @@ def _recompute_audio_metrics_locked():
 def _serialize_audio_job(job):
     return {
         "id": job["id"],
+        "corr_id": job.get("corr_id"),
         "kind": job["kind"],
         "status": job["status"],
         "label": job["label"],
@@ -1482,6 +1523,7 @@ def _pause_audio_queue_for_workflow():
 
         if audio_current_job is not None:
             process_state["audio"]["cancel"] = True
+            audio_cancel_event.set()
             audio_recovery_request = None
             _append_audio_log_locked(f"[WORKFLOW] Pause requested for audio job #{audio_current_job['id']}")
             if cleared:
@@ -1677,6 +1719,7 @@ def _reset_runtime_state_after_project_load():
         audio_current_job = None
         audio_recovery_request = None
         process_state["audio"]["cancel"] = False
+        audio_cancel_event.clear()
         process_state["audio"]["queue"] = []
         process_state["audio"]["current_job"] = None
         process_state["audio"]["recent_jobs"] = []
@@ -1759,6 +1802,80 @@ def _refresh_audio_process_state_locked(persist=False):
     process_state["audio"]["merge_progress"] = dict(process_state["audio"].get("merge_progress") or _new_audio_merge_progress())
     if persist:
         _persist_audio_queue_state_locked()
+
+
+def _write_audio_cancel_tombstone_locked(reason, job=None):
+    payload = {
+        "requested_at": time.time(),
+        "reason": reason,
+        "job_id": (job or {}).get("id"),
+        "corr_id": (job or {}).get("corr_id"),
+        "run_token": (job or {}).get("run_token"),
+    }
+    _atomic_json_write(AUDIO_CANCEL_TOMBSTONE_PATH, payload)
+
+
+def _clear_audio_cancel_tombstone_locked():
+    if not os.path.exists(AUDIO_CANCEL_TOMBSTONE_PATH):
+        return False
+    try:
+        os.remove(AUDIO_CANCEL_TOMBSTONE_PATH)
+    except OSError:
+        return False
+    return True
+
+
+def _hard_wipe_audio_runtime_locked(reason):
+    """Immediately clear runtime audio work and persisted queue state."""
+    global audio_current_job, audio_recovery_request, audio_current_runner_thread, audio_current_runner_token
+
+    active_job = audio_current_job
+    cleared_queued_jobs = len(audio_queue)
+    reset_count = 0
+    if active_job is not None:
+        reset_count = project_manager.reset_generating_chunks(
+            indices=active_job.get("indices"),
+            generation_token=active_job.get("run_token"),
+        )
+    else:
+        reset_count = project_manager.reset_generating_chunks()
+
+    _write_audio_cancel_tombstone_locked(reason, active_job)
+
+    now = time.time()
+    while audio_queue:
+        job = audio_queue.pop(0)
+        job["status"] = "cancelled"
+        job["finished_at"] = now
+        _record_audio_recent_job_locked(job)
+
+    if active_job is not None:
+        active_job["status"] = "cancelled"
+        active_job["finished_at"] = now
+        _record_audio_recent_job_locked(active_job)
+
+    _force_kill_active_audio_runner_locked()
+
+    audio_current_job = None
+    audio_current_runner_thread = None
+    audio_current_runner_token = None
+    audio_recovery_request = None
+    process_state["audio"]["cancel"] = False
+    audio_cancel_event.clear()
+    _refresh_audio_process_state_locked(persist=False)
+    audio_queue_condition.notify_all()
+
+    if os.path.exists(AUDIO_QUEUE_STATE_PATH):
+        try:
+            os.remove(AUDIO_QUEUE_STATE_PATH)
+        except OSError:
+            pass
+
+    return {
+        "cleared_queued_jobs": cleared_queued_jobs,
+        "had_active_job": active_job is not None,
+        "reset_chunks": reset_count,
+    }
 
 
 def _append_audio_log(message):
@@ -1926,6 +2043,7 @@ def _enqueue_audio_job(kind, indices, label=None, scope=None):
     global audio_job_counter
 
     with audio_queue_condition:
+        _clear_audio_cancel_tombstone_locked()
         audio_job_counter += 1
         if audio_current_job is None and not audio_queue:
             process_state["audio"]["logs"] = []
@@ -1943,10 +2061,12 @@ def _enqueue_audio_job(kind, indices, label=None, scope=None):
                     valid_indices.append(idx)
                     word_counts[idx] = _count_words(text)
         if not valid_indices:
+            _append_audio_log_locked("[QUEUE] Rejecting enqueue request: no valid non-empty indices after resolution.")
             raise HTTPException(status_code=400, detail="No non-empty chunk indices provided")
 
         job = {
             "id": audio_job_counter,
+            "corr_id": f"audio-{audio_job_counter:05d}-{uuid.uuid4().hex[:8]}",
             "kind": kind,
             "indices": valid_indices,
             "pending_indices": list(valid_indices),
@@ -1968,7 +2088,7 @@ def _enqueue_audio_job(kind, indices, label=None, scope=None):
         }
         audio_queue.append(job)
         _append_audio_log_locked(
-            f"[QUEUE] Job #{job['id']} queued: {job['label']} ({job['total_chunks']} chunks, scope={job['scope']})"
+            f"[QUEUE] Job #{job['id']} ({job['corr_id']}) queued: {job['label']} ({job['total_chunks']} chunks, scope={job['scope']})"
         )
         _refresh_audio_process_state_locked(persist=True)
         queue_position = len(audio_queue)
@@ -1997,6 +2117,7 @@ def _clone_audio_job_for_retry(job, pending_indices, reason):
     retry_count = job.get("recovery_count", 0) + 1
     return {
         "id": audio_job_counter,
+        "corr_id": f"audio-{audio_job_counter:05d}-{uuid.uuid4().hex[:8]}",
         "kind": job["kind"],
         "indices": list(pending_indices),
         "pending_indices": list(pending_indices),
@@ -2031,6 +2152,31 @@ def _restore_audio_queue_state():
             payload = json.load(f)
     except (OSError, json.JSONDecodeError, ValueError) as e:
         logger.warning(f"Failed to restore audio queue state: {e}")
+        return
+
+    # A cancellation can race with process shutdown. In that case, a stale
+    # running state may still be persisted. A tombstone explicitly blocks
+    # restart-time job resurrection after any cancel request.
+    if os.path.exists(AUDIO_CANCEL_TOMBSTONE_PATH):
+        try:
+            with open(AUDIO_CANCEL_TOMBSTONE_PATH, "r", encoding="utf-8") as f:
+                tombstone = json.load(f)
+        except Exception:
+            tombstone = {}
+        try:
+            os.remove(AUDIO_CANCEL_TOMBSTONE_PATH)
+        except OSError:
+            pass
+        try:
+            os.remove(AUDIO_QUEUE_STATE_PATH)
+        except OSError:
+            pass
+        logger.info(
+            "Discarded persisted audio queue state due to cancel tombstone (reason=%r, job_id=%r, corr_id=%r).",
+            tombstone.get("reason"),
+            tombstone.get("job_id"),
+            tombstone.get("corr_id"),
+        )
         return
 
     # Guard: if there are no valid chunks (project was reset or deleted while the
@@ -2075,6 +2221,7 @@ def _restore_audio_queue_state():
                 continue
             restored_jobs.append({
                 "id": int(raw_job.get("id", 0) or 0),
+                "corr_id": (raw_job.get("corr_id") or f"audio-{int(raw_job.get('id', 0) or 0):05d}-{uuid.uuid4().hex[:8]}"),
                 "kind": raw_job.get("kind", "parallel"),
                 "indices": progress["indices"],
                 "pending_indices": progress["pending_indices"],
@@ -2102,6 +2249,7 @@ def _restore_audio_queue_state():
             if progress["pending_indices"]:
                 resumed_job = {
                     "id": int(raw_current.get("id", 0) or 0),
+                    "corr_id": (raw_current.get("corr_id") or f"audio-{int(raw_current.get('id', 0) or 0):05d}-{uuid.uuid4().hex[:8]}"),
                     "kind": raw_current.get("kind", "parallel"),
                     "indices": progress["indices"],
                     "pending_indices": progress["pending_indices"],
@@ -2178,10 +2326,10 @@ def _perform_audio_recovery_locked(job, run_token, reason):
     if retry_job is not None:
         audio_queue.insert(0, retry_job)
         _append_audio_log_locked(
-            f"[RECOVER] Re-queued {len(retry_job['indices'])} stalled chunk(s) from job #{job['id']} to the front of the queue"
+            f"[RECOVER] Re-queued {len(retry_job['indices'])} stalled chunk(s) from job #{job['id']} ({job.get('corr_id')}) to the front of the queue as #{retry_job['id']} ({retry_job.get('corr_id')})"
         )
     else:
-        _append_audio_log_locked(f"[RECOVER] No remaining chunks to re-queue for job #{job['id']}")
+        _append_audio_log_locked(f"[RECOVER] No remaining chunks to re-queue for job #{job['id']} ({job.get('corr_id')})")
 
     audio_current_job = None
     process_state["audio"]["cancel"] = False
@@ -2192,13 +2340,20 @@ def _perform_audio_recovery_locked(job, run_token, reason):
 
 
 def _abandon_audio_job_locked(job, run_token, reason, *, status="cancelled"):
-    global audio_current_job, audio_recovery_request
+    global audio_current_job, audio_recovery_request, audio_current_runner_thread, audio_current_runner_token
 
     if audio_current_job is None:
+        _append_audio_log_locked("[CANCEL] Abandon requested but no active job exists.")
         return False
     if audio_current_job["id"] != job["id"] or audio_current_job.get("run_token") != run_token:
+        _append_audio_log_locked(
+            f"[CANCEL] Abandon skipped due to token/job mismatch requested_job={job.get('id')} requested_token={run_token}"
+        )
         return False
 
+    _append_audio_log_locked(
+        f"[CANCEL] Abandoning job #{job['id']} ({job.get('corr_id')}) status={status} reason='{reason}' run_token={run_token} pending={len(job.get('pending_indices', []))}"
+    )
     reset_count = project_manager.reset_generating_chunks(
         indices=job.get("indices"),
         generation_token=run_token,
@@ -2207,19 +2362,22 @@ def _abandon_audio_job_locked(job, run_token, reason, *, status="cancelled"):
     job["finished_at"] = time.time()
     _record_audio_recent_job_locked(job)
     _append_audio_log_locked(
-        f"[CANCEL] Abandoned job #{job['id']} and reset {reset_count} generating chunk(s) to pending"
+        f"[CANCEL] Abandoned job #{job['id']} ({job.get('corr_id')}) and reset {reset_count} generating chunk(s) to pending"
     )
 
     audio_current_job = None
     audio_recovery_request = None
+    audio_current_runner_thread = None
+    audio_current_runner_token = None
     process_state["audio"]["cancel"] = False
+    audio_cancel_event.clear()
     _refresh_audio_process_state_locked(persist=True)
     audio_queue_condition.notify_all()
     return True
 
 
 def _audio_job_runner(job, settings, run_token, result_holder, done_event):
-    job_prefix = f"[JOB {job['id']}]"
+    job_prefix = f"[JOB {job['id']}|{job.get('corr_id', 'no-cid')}]"
 
     def is_active():
         with audio_queue_lock:
@@ -2246,7 +2404,7 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
         with audio_queue_lock:
             if not is_active():
                 return True
-            return process_state["audio"]["cancel"]
+            return process_state["audio"]["cancel"] or audio_cancel_event.is_set()
 
     try:
         if job["kind"] == "parallel":
@@ -2269,7 +2427,7 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
                 item_callback=item_callback,
                 generation_token=run_token,
             )
-    except Exception as e:
+    except BaseException as e:
         result_holder["error"] = str(e)
     finally:
         done_event.set()
@@ -2297,13 +2455,16 @@ def _prepare_job_indices_for_execution_locked(job, settings):
 
 
 def _audio_queue_worker():
-    global audio_current_job, audio_recovery_request
+    global audio_current_job, audio_recovery_request, audio_current_runner_thread, audio_current_runner_token
 
     while True:
         with audio_queue_condition:
             while not audio_queue:
                 audio_current_job = None
+                audio_current_runner_thread = None
+                audio_current_runner_token = None
                 process_state["audio"]["cancel"] = False
+                audio_cancel_event.clear()
                 audio_recovery_request = None
                 _refresh_audio_process_state_locked(persist=True)
                 audio_queue_condition.wait()
@@ -2314,7 +2475,10 @@ def _audio_queue_worker():
             job["started_at"] = time.time()
             job["run_token"] = uuid.uuid4().hex
             process_state["audio"]["cancel"] = False
+            audio_cancel_event.clear()
             audio_recovery_request = None
+            audio_current_runner_thread = None
+            audio_current_runner_token = None
             _refresh_audio_process_state_locked(persist=True)
 
         settings = _load_audio_worker_settings()
@@ -2322,7 +2486,7 @@ def _audio_queue_worker():
             if audio_current_job is job:
                 _prepare_job_indices_for_execution_locked(job, settings)
                 _refresh_audio_process_state_locked(persist=True)
-        job_prefix = f"[JOB {job['id']}]"
+        job_prefix = f"[JOB {job['id']}|{job.get('corr_id', 'no-cid')}]"
 
         _append_audio_log(
             f"{job_prefix} Starting {job['kind']} generation for {job['total_chunks']} chunks ({job['label']})"
@@ -2337,6 +2501,10 @@ def _audio_queue_worker():
             name=f"audio-job-{job['id']}",
         )
         runner.start()
+        with audio_queue_condition:
+            if audio_current_job is job and audio_current_job.get("run_token") == job.get("run_token"):
+                audio_current_runner_thread = runner
+                audio_current_runner_token = job.get("run_token")
 
         abandoned = False
         while not done_event.wait(AUDIO_RECOVERY_POLL_SECONDS):
@@ -2385,8 +2553,11 @@ def _audio_queue_worker():
             job["finished_at"] = time.time()
             _record_audio_recent_job_locked(job)
             audio_current_job = None
+            audio_current_runner_thread = None
+            audio_current_runner_token = None
             audio_recovery_request = None
             process_state["audio"]["cancel"] = False
+            audio_cancel_event.clear()
             _refresh_audio_process_state_locked(persist=True)
             audio_queue_condition.notify_all()
 

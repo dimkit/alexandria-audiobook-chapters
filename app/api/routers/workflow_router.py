@@ -41,6 +41,7 @@ async def reset_project():
             _record_audio_recent_job_locked(job)
 
         process_state["audio"]["cancel"] = True
+        audio_cancel_event.set()
         if audio_current_job is not None:
             _abandon_audio_job_locked(
                 audio_current_job,
@@ -51,6 +52,7 @@ async def reset_project():
         # Ensure reset always clears worker pointers, even if abandon raced.
         audio_current_job = None
         audio_recovery_request = None
+        audio_cancel_event.clear()
         _refresh_audio_process_state_locked(persist=True)
 
     # Signal cancellation for thread-based tasks that poll a cancel flag.
@@ -122,6 +124,7 @@ async def reset_project():
         audio_current_job = None
         audio_recovery_request = None
         process_state["audio"]["cancel"] = False
+        audio_cancel_event.clear()
         process_state["audio"]["queue"] = []
         process_state["audio"]["current_job"] = None
         process_state["audio"]["recent_jobs"] = []

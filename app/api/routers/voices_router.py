@@ -5,6 +5,9 @@ globals().update({k: v for k, v in vars(_shared).items() if not k.startswith("__
 
 router = APIRouter()
 
+class NarratorThresholdRequest(BaseModel):
+    value: int
+
 
 def _normalized_speaker(name: str) -> str:
     return project_manager._normalize_speaker_name(name)
@@ -93,6 +96,12 @@ async def get_voices():
     if not voices_list:
         return []
 
+    narrator_threshold = project_manager.get_narrator_threshold()
+    narrator_name = next(
+        (name for name in voices_list if _normalized_speaker(name) == _normalized_speaker("NARRATOR")),
+        "",
+    )
+
     # Combine with config
     voice_config = {}
     if os.path.exists(VOICE_CONFIG_PATH):
@@ -121,6 +130,14 @@ async def get_voices():
         config_key = _find_config_key_case_insensitive(voice_config, voice_name)
         config = voice_config.get(config_key, {}) if config_key else {}
         sample_suggestion = project_manager.suggest_design_sample_text(voice_name, chunks)
+        manual_alias = bool((config.get("alias") or "").strip())
+        line_count = line_counts.get(voice_name, 0)
+        auto_narrator_alias = (
+            not manual_alias
+            and bool(narrator_name)
+            and _normalized_speaker(voice_name) != _normalized_speaker("NARRATOR")
+            and line_count < narrator_threshold
+        )
         ref_audio = (config.get("ref_audio") or "").strip()
         ref_audio_path = os.path.join(ROOT_DIR, ref_audio) if ref_audio and not os.path.isabs(ref_audio) else ref_audio
         design_clone_loaded = bool(ref_audio and ref_audio_path and os.path.exists(ref_audio_path))
@@ -129,10 +146,22 @@ async def get_voices():
             "config": config,
             "suggested_sample_text": sample_suggestion,
             "design_clone_loaded": design_clone_loaded,
-            "line_count": line_counts.get(voice_name, 0),
+            "line_count": line_count,
             "paragraph_count": para_counts_by_norm.get(_normalized_speaker(voice_name), 0),
+            "auto_narrator_alias": auto_narrator_alias,
+            "auto_alias_target": narrator_name if auto_narrator_alias else "",
         })
     return result
+
+
+@router.get("/api/voices/settings")
+async def get_voice_settings():
+    return {"narrator_threshold": project_manager.get_narrator_threshold()}
+
+
+@router.post("/api/voices/settings")
+async def save_voice_settings(request: NarratorThresholdRequest):
+    return {"status": "saved", "narrator_threshold": project_manager.set_narrator_threshold(request.value)}
 
 @router.post("/api/parse_voices")
 async def parse_voices(background_tasks: BackgroundTasks):
@@ -497,48 +526,71 @@ async def clear_uploaded_voices_for_current_script():
         except Exception:
             pass
 
+    def _split_manifest_entries(manifest, *, is_generated_manifest=False):
+        kept = []
+        removed = []
+        for entry in manifest:
+            entry_script_title = _normalize_saved_voice_name(entry.get("script_title", ""))
+            entry_name = _normalize_saved_voice_name(entry.get("name", ""))
+            entry_speaker = _normalize_saved_voice_name(entry.get("speaker", ""))
+            is_generated = bool(entry.get("generated"))
+
+            title_match = bool(entry_script_title) and entry_script_title == normalized_title
+            prefixed_name_match = bool(entry_name) and entry_name.startswith(normalized_title_prefix)
+            temp_speaker_match = (
+                normalized_title == _normalize_saved_voice_name("Project")
+                and is_generated_manifest
+                and is_generated
+                and bool(entry_speaker)
+                and entry_speaker in current_speakers
+            )
+
+            if title_match or prefixed_name_match or temp_speaker_match:
+                removed.append(entry)
+            else:
+                kept.append(entry)
+        return kept, removed
+
     clone_manifest = _load_manifest(CLONE_VOICES_MANIFEST)
-    kept_entries = []
-    removed_entries = []
+    kept_clone_entries, removed_clone_entries = _split_manifest_entries(
+        clone_manifest, is_generated_manifest=True
+    )
 
-    for entry in clone_manifest:
-        entry_script_title = _normalize_saved_voice_name(entry.get("script_title", ""))
-        entry_name = _normalize_saved_voice_name(entry.get("name", ""))
-        entry_speaker = _normalize_saved_voice_name(entry.get("speaker", ""))
-        is_generated = bool(entry.get("generated"))
-
-        title_match = bool(entry_script_title) and entry_script_title == normalized_title
-        prefixed_name_match = bool(entry_name) and entry_name.startswith(normalized_title_prefix)
-        temp_speaker_match = (
-            normalized_title == _normalize_saved_voice_name("Project")
-            and is_generated
-            and bool(entry_speaker)
-            and entry_speaker in current_speakers
-        )
-
-        if title_match or prefixed_name_match or temp_speaker_match:
-            removed_entries.append(entry)
-        else:
-            kept_entries.append(entry)
+    designed_manifest = _load_manifest(DESIGNED_VOICES_MANIFEST)
+    kept_designed_entries, removed_designed_entries = _split_manifest_entries(
+        designed_manifest, is_generated_manifest=False
+    )
 
     removed_relative_paths = []
+    removed_speakers = set()
     removed_files = 0
-    for entry in removed_entries:
-        filename = (entry.get("filename") or "").strip()
-        if not filename:
-            continue
-        rel_path = f"clone_voices/{filename}"
-        removed_relative_paths.append(rel_path)
-        abs_path = os.path.join(CLONE_VOICES_DIR, filename)
-        if os.path.exists(abs_path):
-            try:
-                os.remove(abs_path)
-                removed_files += 1
-            except OSError:
-                pass
 
-    if len(kept_entries) != len(clone_manifest):
-        _save_manifest(CLONE_VOICES_MANIFEST, kept_entries)
+    def _remove_files_from_entries(entries, base_dir, rel_prefix):
+        nonlocal removed_files
+        for entry in entries:
+            speaker_key = _normalize_saved_voice_name(entry.get("speaker", ""))
+            if speaker_key:
+                removed_speakers.add(speaker_key)
+            filename = (entry.get("filename") or "").strip()
+            if not filename:
+                continue
+            rel_path = f"{rel_prefix}/{filename}"
+            removed_relative_paths.append(rel_path)
+            abs_path = os.path.join(base_dir, filename)
+            if os.path.exists(abs_path):
+                try:
+                    os.remove(abs_path)
+                    removed_files += 1
+                except OSError:
+                    pass
+
+    _remove_files_from_entries(removed_clone_entries, CLONE_VOICES_DIR, "clone_voices")
+    _remove_files_from_entries(removed_designed_entries, DESIGNED_VOICES_DIR, "designed_voices")
+
+    if len(kept_clone_entries) != len(clone_manifest):
+        _save_manifest(CLONE_VOICES_MANIFEST, kept_clone_entries)
+    if len(kept_designed_entries) != len(designed_manifest):
+        _save_manifest(DESIGNED_VOICES_MANIFEST, kept_designed_entries)
 
     updated_voice_config = False
     if os.path.exists(VOICE_CONFIG_PATH):
@@ -553,10 +605,18 @@ async def clear_uploaded_voices_for_current_script():
             if not isinstance(cfg, dict):
                 continue
             ref_audio = (cfg.get("ref_audio") or "").strip()
+            speaker_key = _normalize_saved_voice_name(speaker)
+            should_clear_text = speaker_key in removed_speakers or (ref_audio and ref_audio in removed_set)
             if ref_audio and ref_audio in removed_set:
                 cfg["ref_audio"] = ""
-                if "generated_ref_text" in cfg:
+                updated_voice_config = True
+            if should_clear_text:
+                if cfg.get("ref_text"):
+                    cfg["ref_text"] = ""
+                    updated_voice_config = True
+                if cfg.get("generated_ref_text"):
                     cfg["generated_ref_text"] = ""
+                    updated_voice_config = True
                 updated_voice_config = True
 
         if updated_voice_config:
@@ -572,7 +632,7 @@ async def clear_uploaded_voices_for_current_script():
     return {
         "status": "ok",
         "script_title": script_title,
-        "removed_manifest_entries": len(removed_entries),
+        "removed_manifest_entries": len(removed_clone_entries) + len(removed_designed_entries),
         "removed_files": removed_files,
         "updated_voice_config": updated_voice_config,
     }

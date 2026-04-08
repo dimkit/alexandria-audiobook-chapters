@@ -10,12 +10,17 @@ class AudioQueueMetricsTests(unittest.TestCase):
             self._backup_process_audio = copy.deepcopy(app_module.process_state["audio"])
             self._backup_audio_queue = copy.deepcopy(app_module.audio_queue)
             self._backup_audio_current_job = copy.deepcopy(app_module.audio_current_job)
+            self._backup_audio_cancel_event_set = app_module.audio_cancel_event.is_set()
 
     def tearDown(self):
         with app_module.audio_queue_lock:
             app_module.process_state["audio"] = self._backup_process_audio
             app_module.audio_queue[:] = self._backup_audio_queue
             app_module.audio_current_job = self._backup_audio_current_job
+            if self._backup_audio_cancel_event_set:
+                app_module.audio_cancel_event.set()
+            else:
+                app_module.audio_cancel_event.clear()
 
     def test_refresh_preserves_sample_buffer_for_tracker_updates(self):
         with app_module.audio_queue_lock:
@@ -114,7 +119,6 @@ class AudioQueueMetricsTests(unittest.TestCase):
                 self.assertIn("reset 3 generating chunk(s)", app_module.process_state["audio"]["logs"][-1])
         finally:
             app_module.project_manager.reset_generating_chunks = original_reset
-
 
 if __name__ == "__main__":
     unittest.main()

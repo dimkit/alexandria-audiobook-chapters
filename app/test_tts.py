@@ -156,6 +156,5 @@ class LocalBackendResolutionTests(unittest.TestCase):
         engine = TTSEngine({"tts": {"mode": "local", "local_backend": "mlx"}})
         self.assertEqual(engine.local_backend, "qwen")
 
-
 if __name__ == "__main__":
     unittest.main()
