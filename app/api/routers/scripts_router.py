@@ -112,6 +112,48 @@ async def load_project_archive(file: UploadFile = File(...)):
 class ScriptSaveRequest(BaseModel):
     name: str
 
+def _script_source_prefix(name: str) -> str:
+    return f"{name}.source"
+
+
+def _find_saved_script_source_companion(name: str):
+    prefix = _script_source_prefix(name)
+    matches = []
+    for entry in os.listdir(SCRIPTS_DIR):
+        if not entry.startswith(prefix):
+            continue
+        if entry == f"{name}.json":
+            continue
+        full_path = os.path.join(SCRIPTS_DIR, entry)
+        if os.path.isfile(full_path):
+            matches.append(full_path)
+    if not matches:
+        return None
+    matches.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    return matches[0]
+
+
+def _save_script_source_companion(name: str):
+    source_companion = _find_saved_script_source_companion(name)
+    while source_companion:
+        try:
+            os.remove(source_companion)
+        except OSError:
+            break
+        source_companion = _find_saved_script_source_companion(name)
+
+    state = _load_project_state_payload()
+    input_path = os.path.abspath((state.get("input_file_path") or "").strip())
+    if not input_path or not os.path.exists(input_path) or not os.path.isfile(input_path):
+        return None
+
+    ext = os.path.splitext(input_path)[1]
+    companion_name = f"{_script_source_prefix(name)}{ext}"
+    companion_path = os.path.join(SCRIPTS_DIR, companion_name)
+    shutil.copy2(input_path, companion_path)
+    return companion_path
+
+
 def _delete_saved_script_artifacts(name: str):
     base = os.path.join(SCRIPTS_DIR, f"{name}.json")
     if os.path.exists(base):
@@ -120,6 +162,13 @@ def _delete_saved_script_artifacts(name: str):
         companion = os.path.join(SCRIPTS_DIR, f"{name}{suffix}")
         if os.path.exists(companion):
             os.remove(companion)
+    source_companion = _find_saved_script_source_companion(name)
+    while source_companion:
+        try:
+            os.remove(source_companion)
+        except OSError:
+            break
+        source_companion = _find_saved_script_source_companion(name)
 
 def _save_current_script_snapshot(name: str, *, purge_existing: bool = False):
     if not os.path.exists(SCRIPT_PATH):
@@ -142,6 +191,7 @@ def _save_current_script_snapshot(name: str, *, purge_existing: bool = False):
     paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
     if os.path.exists(paragraphs_path):
         shutil.copy2(paragraphs_path, os.path.join(SCRIPTS_DIR, f"{safe_name}.paragraphs.json"))
+    _save_script_source_companion(safe_name)
 
     state = _load_project_state_payload()
     state["loaded_script_name"] = safe_name
@@ -191,13 +241,36 @@ def _audio_generation_active_for_script_load() -> bool:
     This recomputes audio state from queue/current-job truth and heals stale
     `process_state["audio"]["running"]` after reset/cancel races.
     """
+    global audio_current_job, audio_recovery_request
     with audio_queue_lock:
         _refresh_audio_process_state_locked(persist=False)
-        return bool(
+        active = bool(
             process_state["audio"].get("merge_running")
             or audio_current_job is not None
             or audio_queue
         )
+        if not active:
+            return False
+
+        # Reset can race with background job completion, leaving stale queue/current
+        # pointers for a wiped project. If both script+chunks are gone, clear any
+        # leftover runtime audio state so script load can proceed immediately.
+        if not os.path.exists(SCRIPT_PATH) and not os.path.exists(CHUNKS_PATH):
+            if audio_queue or audio_current_job is not None or process_state["audio"].get("merge_running"):
+                audio_queue.clear()
+                audio_current_job = None
+                audio_recovery_request = None
+                process_state["audio"]["cancel"] = False
+                process_state["audio"]["merge_running"] = False
+                _append_audio_log_locked("[HEAL] Cleared stale audio runtime state after project reset.")
+                _refresh_audio_process_state_locked(persist=True)
+            return bool(
+                process_state["audio"].get("merge_running")
+                or audio_current_job is not None
+                or audio_queue
+            )
+
+        return True
 
 
 @router.post("/api/scripts/load")
@@ -223,6 +296,15 @@ async def load_script(request: ScriptLoadRequest):
     elif os.path.exists(paragraphs_path):
         os.remove(paragraphs_path)
 
+    source_companion = _find_saved_script_source_companion(request.name)
+    restored_input_path = None
+    if source_companion:
+        ext = os.path.splitext(source_companion)[1]
+        upload_name = f"{request.name}{ext}"
+        restored_input_path = os.path.join(UPLOADS_DIR, upload_name)
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        shutil.copy2(source_companion, restored_input_path)
+
     # Delete chunks so they regenerate from the loaded script
     if os.path.exists(CHUNKS_PATH):
         os.remove(CHUNKS_PATH)
@@ -230,6 +312,8 @@ async def load_script(request: ScriptLoadRequest):
     state = _load_project_state_payload()
     state["render_prep_complete"] = False
     state["loaded_script_name"] = request.name
+    if restored_input_path:
+        state["input_file_path"] = restored_input_path
     state[PROCESSING_STAGE_MARKERS_KEY] = {"script": {"completed_at": time.time()}}
     state[NEW_MODE_STAGE_MARKERS_KEY] = {
         "create_script": {"completed_at": time.time()},
@@ -246,11 +330,7 @@ async def delete_script(name: str):
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail=f"Saved script '{name}' not found.")
 
-    os.remove(filepath)
-    for suffix in (".voice_config.json", ".paragraphs.json"):
-        companion = os.path.join(SCRIPTS_DIR, f"{name}{suffix}")
-        if os.path.exists(companion):
-            os.remove(companion)
+    _delete_saved_script_artifacts(name)
 
     logger.info(f"Script '{name}' deleted")
     return {"status": "deleted", "name": name}

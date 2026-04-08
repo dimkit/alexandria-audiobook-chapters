@@ -251,6 +251,8 @@ def suggest_voice_description_sync(speaker: str):
         "voice": voice,
         "matched_paragraphs": len(prompt_payload["paragraphs"]),
         "context_chars": prompt_payload["context_chars"],
+        "warning": prompt_payload.get("warning"),
+        "context_source": prompt_payload.get("context_source"),
     }
 
 

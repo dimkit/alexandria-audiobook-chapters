@@ -17,6 +17,34 @@ module.exports = {
       message: "python -m venv env"
     }
   }, {
+    when: "{{platform === 'darwin' && arch === 'arm64' && exists('models')}}",
+    method: "fs.rm",
+    params: {
+      path: "models"
+    }
+  }, {
+    when: "{{platform === 'darwin' && arch === 'arm64' && exists('app/models')}}",
+    method: "fs.rm",
+    params: {
+      path: "app/models"
+    }
+  }, {
+    when: "{{platform === 'darwin' && arch === 'arm64'}}",
+    method: "shell.run",
+    params: {
+      venv: "env",
+      path: "app",
+      message: [
+        "uv pip uninstall google-genai",
+        "uv pip install -r requirements.txt",
+        "uv pip uninstall qwen-tts",
+        "uv pip install --prerelease=allow mlx==0.30.3 mlx-lm==0.30.5 mlx-metal==0.30.3",
+        "uv pip install git+https://github.com/Blaizzy/mlx-audio.git@9349644ccbd62eb10900852228f7b952c566def3",
+        "uv pip install sentencepiece tiktoken"
+      ]
+    }
+  }, {
+    when: "{{!(platform === 'darwin' && arch === 'arm64')}}",
     method: "shell.run",
     params: {
       venv: "env",
@@ -28,6 +56,7 @@ module.exports = {
       ]
     }
   }, {
+    when: "{{!(platform === 'darwin' && arch === 'arm64')}}",
     method: "script.start",
     params: {
       uri: "torch.js",

@@ -132,6 +132,7 @@ async def get_config():
         },
         "tts": {
             "mode": "local",
+            "local_backend": "auto",
             "url": "http://127.0.0.1:7860",
             "device": "auto",
             "auto_regenerate_bad_clips": False,
@@ -281,6 +282,12 @@ async def get_config():
         if config["proofread"].get("certainty_threshold") is None:
             config["proofread"]["certainty_threshold"] = 1.0
             config_changed = True
+    if "tts" not in config or not isinstance(config.get("tts"), dict):
+        config["tts"] = dict(default_config["tts"])
+        config_changed = True
+    elif not config["tts"].get("local_backend"):
+        config["tts"]["local_backend"] = "auto"
+        config_changed = True
 
     export_defaults = default_config["export"]
     if "export" not in config or not isinstance(config.get("export"), dict):

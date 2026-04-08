@@ -404,6 +404,7 @@ class LLMConfig(BaseModel):
 
 class TTSConfig(BaseModel):
     mode: str = "local"  # "local" or "external"
+    local_backend: str = "auto"  # local mode only: "auto", "qwen", "mlx"
     url: str = "http://127.0.0.1:7860"  # external mode only
     device: str = "auto"  # local mode: "auto", "cuda:0", "cpu", etc.
     language: str = "English"  # TTS language

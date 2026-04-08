@@ -1603,32 +1603,71 @@ class ProjectManager:
         return " ".join(selected).strip()
 
     def collect_voice_suggestion_context(self, speaker, target_chars=None):
-        source_document = self.load_source_document()
         generation_settings = self._load_generation_settings()
         chunk_size = int(generation_settings.get("chunk_size") or 3000)
         target_chars = max(int(target_chars or (chunk_size * 2)), 1)
 
+        source_error = None
         selected = []
         total_chars = 0
 
-        for paragraph in iter_document_paragraphs(source_document):
-            if not self._paragraph_mentions_speaker(paragraph["text"], speaker):
-                continue
-            selected.append(paragraph)
-            total_chars += len(paragraph["text"])
-            if total_chars >= target_chars:
-                break
+        try:
+            source_document = self.load_source_document()
+            for paragraph in iter_document_paragraphs(source_document):
+                if not self._paragraph_mentions_speaker(paragraph["text"], speaker):
+                    continue
+                selected.append(paragraph)
+                total_chars += len(paragraph["text"])
+                if total_chars >= target_chars:
+                    break
+            context_source = "source_document"
+        except Exception as e:
+            source_error = str(e)
+            context_source = "chunks_fallback"
+            chunks = self.load_chunks()
+            speaker_key = self._normalize_speaker_name(speaker)
+            fallback_items = []
+            for chunk in chunks:
+                text = (chunk.get("text") or "").strip()
+                if not text:
+                    continue
+                chunk_speaker = self._normalize_speaker_name(chunk.get("speaker"))
+                matches = chunk_speaker == speaker_key or self._paragraph_mentions_speaker(text, speaker)
+                if not matches:
+                    continue
+                fallback_items.append({
+                    "text": text,
+                    "chapter": (chunk.get("chapter") or "").strip(),
+                })
+                total_chars += len(text)
+                if total_chars >= target_chars:
+                    break
+            selected = fallback_items
+            if source_error:
+                print(
+                    f"Voice suggestion context fallback for '{speaker}': source unavailable ({source_error}); using generated chunks."
+                )
 
         return {
             "speaker": speaker,
             "target_chars": target_chars,
             "context_chars": total_chars,
             "paragraphs": selected,
+            "context_source": context_source,
+            "source_error": source_error,
+            "warning": (
+                f"Source document unavailable: {source_error}. Using generated chunks as fallback context."
+                if source_error
+                else None
+            ),
         }
 
     def build_voice_suggestion_prompt(self, speaker, prompt_template):
         context = self.collect_voice_suggestion_context(speaker)
         paragraphs = context["paragraphs"]
+        source_error = context.get("source_error")
+        context_source = context.get("context_source")
+        warning = context.get("warning")
 
         if paragraphs:
             context_blocks = []
@@ -1636,16 +1675,30 @@ class ProjectManager:
                 chapter = (item.get("chapter") or "").strip()
                 text = item["text"]
                 context_blocks.append(f"[{chapter}] {text}" if chapter else text)
-            context_prefix = (
-                f'Source paragraphs mentioning "{speaker}":\n\n' +
-                "\n\n".join(context_blocks)
-            )
+            if context_source == "chunks_fallback":
+                context_prefix = (
+                    f'Source document unavailable ({source_error}). '
+                    f'Fallback context from generated chunks mentioning "{speaker}":\n\n'
+                    + "\n\n".join(context_blocks)
+                )
+            else:
+                context_prefix = (
+                    f'Source paragraphs mentioning "{speaker}":\n\n' +
+                    "\n\n".join(context_blocks)
+                )
         else:
-            context_prefix = f'No source paragraphs mentioning "{speaker}" were found in the uploaded story.'
+            if context_source == "chunks_fallback":
+                context_prefix = (
+                    f'Source document unavailable ({source_error}). '
+                    f'No generated chunks mentioning "{speaker}" were found for fallback context.'
+                )
+            else:
+                context_prefix = f'No source paragraphs mentioning "{speaker}" were found in the uploaded story.'
 
         rendered_prompt = (prompt_template or "").replace("{character_name}", speaker)
         return {
             **context,
+            "warning": warning,
             "prompt": f"{context_prefix}\n\n{rendered_prompt}".strip(),
         }
 
@@ -1973,7 +2026,8 @@ class ProjectManager:
 
         try:
             self.engine = TTSEngine(self._load_app_config())
-            print(f"TTS engine initialized (mode={self.engine.mode})")
+            backend = self.engine.local_backend if self.engine.mode == "local" else "external"
+            print(f"TTS engine initialized (mode={self.engine.mode}, backend={backend})")
             return self.engine
         except Exception as e:
             print(f"Failed to initialize TTS engine: {e}")

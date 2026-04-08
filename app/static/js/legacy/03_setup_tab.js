@@ -4,6 +4,7 @@
             const mode = document.getElementById('tts-mode').value;
             document.getElementById('tts-url-group').style.display = mode === 'external' ? '' : 'none';
             document.getElementById('tts-device-group').style.display = mode === 'local' ? '' : 'none';
+            document.getElementById('tts-local-backend-group').style.display = mode === 'local' ? '' : 'none';
             document.getElementById('tts-local-options').style.display = mode === 'local' ? '' : 'none';
         }
 
@@ -110,6 +111,7 @@
                 document.getElementById('llm-key').value = config.llm.api_key;
                 document.getElementById('llm-model').value = config.llm.model_name;
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
+                document.getElementById('tts-local-backend').value = config.tts.local_backend || 'auto';
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
                 document.getElementById('tts-device').value = config.tts.device || 'auto';
                 document.getElementById('tts-language').value = config.tts.language || 'English';
@@ -384,6 +386,7 @@
                 },
                 tts: {
                     mode: document.getElementById('tts-mode').value,
+                    local_backend: document.getElementById('tts-local-backend').value,
                     url: document.getElementById('tts-url').value,
                     device: document.getElementById('tts-device').value,
                     language: document.getElementById('tts-language').value,

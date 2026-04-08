@@ -4,11 +4,14 @@ import os
 import re
 import json
 import base64
+import logging
 from urllib.parse import urlparse
 import urllib.parse
 import threading
 import shutil
 import time
+import tempfile
+import platform as py_platform
 import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
@@ -46,10 +49,10 @@ def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_M
 
 
 class TTSEngine:
-    """TTS engine supporting local (qwen-tts) and external (Gradio) backends.
+    """TTS engine supporting local (qwen/mlx) and external (Gradio/HTTP) backends.
 
     Mode is determined by config["tts"]["mode"]:
-      - "local": Loads Qwen3TTSModel directly. No external server needed.
+      - "local": Loads local backend (Qwen or MLX) directly. No external server needed.
       - "external": Connects via Gradio client to a running TTS server.
 
     Models and clients are lazily initialized on first use.
@@ -58,6 +61,10 @@ class TTSEngine:
     def __init__(self, config):
         tts_config = config.get("tts", {})
         self._mode = tts_config.get("mode", "external")
+        self._local_backend_preference = (tts_config.get("local_backend", "auto") or "auto").strip().lower()
+        if self._local_backend_preference not in {"auto", "qwen", "mlx"}:
+            self._local_backend_preference = "auto"
+        self._resolved_local_backend = None
         self._url = tts_config.get("url", "http://127.0.0.1:7860")
         self._api_key = tts_config.get("api_key") or config.get("llm", {}).get("api_key", "")
         self._device = tts_config.get("device", "auto")
@@ -90,6 +97,9 @@ class TTSEngine:
         self._external_backend = None
         self._external_http_base = None
 
+        # MLX local model cache
+        self._mlx_models = {}
+
         # Clone prompt cache: speaker_name -> (ref_audio_path, reusable voice_clone_prompt)
         self._clone_prompt_cache = {}
         # LoRA clone prompt cache: adapter_path -> reusable voice_clone_prompt
@@ -98,6 +108,12 @@ class TTSEngine:
     @property
     def mode(self):
         return self._mode
+
+    @property
+    def local_backend(self):
+        if self._mode != "local":
+            return None
+        return self._resolve_local_backend()
 
     @staticmethod
     def _normalize_external_url(url):
@@ -160,8 +176,12 @@ class TTSEngine:
         """Free GPU memory: garbage-collect Python objects, then clear CUDA cache."""
         import gc
         gc.collect()
-        import torch
-        torch.cuda.empty_cache()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            return
 
     @staticmethod
     def _reset_compile_cache():
@@ -174,8 +194,11 @@ class TTSEngine:
         guards; the next call pays a one-time recompilation cost (fast due
         to inductor disk cache) but prevents the slowdown from compounding.
         """
-        import torch
-        torch._dynamo.reset()
+        try:
+            import torch
+            torch._dynamo.reset()
+        except Exception:
+            return
 
     def _estimate_max_batch_size(self, model, clone_prompt_tokens=0,
                                 ref_text_chars=0, max_text_chars=0,
@@ -300,6 +323,121 @@ class TTSEngine:
             print(f"Warmup done in {time.time()-t0:.1f}s")
         except Exception as e:
             print(f"Warmup failed (non-fatal): {e}")
+
+    @staticmethod
+    def _host_platform():
+        return py_platform.system().lower(), py_platform.machine().lower()
+
+    @staticmethod
+    def _apply_mistral_regex_fix(tokenizer):
+        """Apply the corrected mistral split regex to HF tokenizers backend.
+
+        Newer transformers warns for some local tokenizer configs (including
+        qwen3_tts snapshots) but the explicit fix flag is currently unstable in
+        our pinned stack. Apply the same patch directly after load.
+        """
+        try:
+            import tokenizers
+        except Exception:
+            return False
+
+        if tokenizer is None or not hasattr(tokenizer, "backend_tokenizer"):
+            return False
+
+        split_pretokenizer = tokenizers.pre_tokenizers.Split(
+            pattern=tokenizers.Regex(
+                r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+            ),
+            behavior="isolated",
+        )
+
+        current = tokenizer.backend_tokenizer.pre_tokenizer
+        if isinstance(current, tokenizers.pre_tokenizers.Sequence):
+            tokenizer.backend_tokenizer.pre_tokenizer[0] = split_pretokenizer
+        else:
+            if isinstance(current, tokenizers.pre_tokenizers.Metaspace):
+                current = tokenizers.pre_tokenizers.ByteLevel(
+                    add_prefix_space=False, use_regex=False
+                )
+            tokenizer.backend_tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Sequence(
+                [split_pretokenizer, current]
+            )
+
+        setattr(tokenizer, "fix_mistral_regex", True)
+        return True
+
+    @contextlib.contextmanager
+    def _suppress_known_transformers_qwen3_warnings(self):
+        """Suppress known non-fatal transformers warnings for local qwen3_tts."""
+
+        class _DropMessages(logging.Filter):
+            def filter(self, record):
+                msg = record.getMessage()
+                blocked = (
+                    "incorrect regex pattern" in msg
+                    or "set the `fix_mistral_regex=True` flag" in msg
+                    or "using a model of type qwen3_tts to instantiate a model of type" in msg
+                )
+                return not blocked
+
+        logger_names = [
+            "transformers.tokenization_utils_tokenizers",
+            "transformers.configuration_utils",
+        ]
+        filt = _DropMessages()
+        loggers = [logging.getLogger(name) for name in logger_names]
+        for lg in loggers:
+            lg.addFilter(filt)
+        try:
+            yield
+        finally:
+            for lg in loggers:
+                lg.removeFilter(filt)
+
+    def _postprocess_mlx_qwen3_tokenizer(self, model):
+        """Patch tokenizer regex for mlx qwen3_tts models when available."""
+        try:
+            model_type = getattr(getattr(model, "config", None), "model_type", "")
+            if model_type != "qwen3_tts":
+                return
+            tokenizer = getattr(model, "tokenizer", None)
+            if self._apply_mistral_regex_fix(tokenizer):
+                print("Applied tokenizer regex fix for MLX qwen3_tts model.")
+        except Exception as e:
+            print(f"Tokenizer regex post-fix skipped (non-fatal): {e}")
+
+    def _resolve_local_backend(self):
+        if self._resolved_local_backend is not None:
+            return self._resolved_local_backend
+
+        if self._mode != "local":
+            self._resolved_local_backend = None
+            return self._resolved_local_backend
+
+        system_name, machine = self._host_platform()
+        is_apple_silicon = system_name == "darwin" and machine in {"arm64", "aarch64"}
+
+        backend = self._local_backend_preference
+        if backend == "auto":
+            backend = "mlx" if is_apple_silicon else "qwen"
+        elif backend == "mlx" and not is_apple_silicon:
+            print("Warning: local_backend=mlx requested on non-Apple-Silicon host. Falling back to qwen.")
+            backend = "qwen"
+
+        self._resolved_local_backend = backend
+        return backend
+
+    @staticmethod
+    def _mlx_voice_name(voice):
+        mapping = {
+            "ono_anna": "Ono_Anna",
+            "uncle_fu": "Uncle_Fu",
+        }
+        key = str(voice or "").strip()
+        if not key:
+            return "Ryan"
+        normalized = mapping.get(key.lower())
+        return normalized or key
 
     def _resolve_device(self):
         """Resolve 'auto' device to the best available."""
@@ -573,6 +711,56 @@ class TTSEngine:
             print(f"LoRA adapter loaded from {adapter_path}")
             return model
 
+    def _init_local_mlx_model(self, model_type):
+        """Load MLX model on demand for Apple Silicon local backend."""
+        model_ids = {
+            "custom_voice": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+            "voice_design": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
+            "base": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+        }
+        model_id = model_ids.get(model_type)
+        if not model_id:
+            raise ValueError(f"Unsupported MLX model type: {model_type}")
+
+        if model_type in self._mlx_models:
+            return self._mlx_models[model_type]
+
+        with self._model_lock:
+            if model_type in self._mlx_models:
+                return self._mlx_models[model_type]
+
+            try:
+                from mlx_audio.tts.utils import load_model
+            except ImportError as e:
+                raise RuntimeError(
+                    "MLX backend is not installed. Run Install on Apple Silicon to install mlx-audio dependencies."
+                ) from e
+
+            print(f"Loading MLX TTS model ({model_type}) from {model_id} ...")
+            with self._suppress_known_transformers_qwen3_warnings():
+                model = load_model(model_id)
+            self._postprocess_mlx_qwen3_tokenizer(model)
+            self._mlx_models[model_type] = model
+            print(f"MLX model loaded ({model_type}).")
+            return model
+
+    @staticmethod
+    def _mlx_generate_with_temp_dir(model, **kwargs):
+        try:
+            from mlx_audio.tts.generate import generate_audio
+        except ImportError as e:
+            raise RuntimeError("mlx-audio generation API unavailable in current environment.") from e
+
+        with tempfile.TemporaryDirectory(prefix="alex_mlx_tts_") as temp_dir:
+            generate_audio(model=model, output_path=temp_dir, **kwargs)
+            output_file = os.path.join(temp_dir, "audio_000.wav")
+            if not os.path.exists(output_file):
+                raise RuntimeError("MLX generation failed: output file not found")
+            audio, sr = sf.read(output_file)
+            if getattr(audio, "ndim", 1) > 1:
+                audio = audio.mean(axis=1)
+            return audio.astype(np.float32), int(sr)
+
     def _init_external(self):
         """Initialize external backend on demand."""
         if self._external_backend == "qwen_mlx_http":
@@ -733,6 +921,8 @@ class TTSEngine:
     def generate_custom_voice(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate audio using CustomVoice model. Returns True on success."""
         if self._mode == "local":
+            if self._resolve_local_backend() == "mlx":
+                return self._mlx_generate_custom(text, instruct_text, speaker, voice_config, output_path)
             return self._local_generate_custom(text, instruct_text, speaker, voice_config, output_path)
         else:
             return self._external_generate_custom(text, instruct_text, speaker, voice_config, output_path)
@@ -740,6 +930,8 @@ class TTSEngine:
     def generate_clone_voice(self, text, speaker, voice_config, output_path):
         """Generate audio using voice cloning. Returns True on success."""
         if self._mode == "local":
+            if self._resolve_local_backend() == "mlx":
+                return self._mlx_generate_clone(text, speaker, voice_config, output_path)
             return self._local_generate_clone(text, speaker, voice_config, output_path)
         else:
             return self._external_generate_clone(text, speaker, voice_config, output_path)
@@ -791,6 +983,21 @@ class TTSEngine:
                 sample_text=sample_text,
                 language=lang,
             )
+
+        if self._resolve_local_backend() == "mlx":
+            model = self._init_local_mlx_model("voice_design")
+            t_start = time.time()
+            audio, sr = self._mlx_generate_with_temp_dir(
+                model,
+                text=sample_text,
+                instruct=description,
+            )
+            gen_time = time.time() - t_start
+            duration = len(audio) / sr if sr else 0
+            print(f"VoiceDesign [local mlx] done in {gen_time:.1f}s -> {duration:.1f}s audio")
+            wav_path = self._new_voice_design_preview_path()
+            self._save_wav(audio, sr, wav_path)
+            return wav_path, sr
 
         import torch
 
@@ -862,6 +1069,10 @@ class TTSEngine:
 
         The LoRA weights refine voice identity beyond what the reference alone provides.
         """
+        if self._mode == "local" and self._resolve_local_backend() == "mlx":
+            print("LoRA voice generation is not supported by the local MLX backend yet.")
+            return False
+
         try:
             import torch
             import time
@@ -988,6 +1199,26 @@ class TTSEngine:
         if not chunks:
             return results
 
+        if self._mode == "local" and self._resolve_local_backend() == "mlx":
+            for chunk in chunks:
+                idx = chunk["index"]
+                output_path = os.path.join(output_dir, f"temp_batch_{idx}.wav")
+                try:
+                    success = self.generate_voice(
+                        chunk.get("text", ""),
+                        chunk.get("instruct", ""),
+                        chunk.get("speaker", ""),
+                        voice_config,
+                        output_path,
+                    )
+                    if success:
+                        results["completed"].append(idx)
+                    else:
+                        results["failed"].append((idx, "MLX local generation failed"))
+                except Exception as e:
+                    results["failed"].append((idx, str(e)))
+            return results
+
         # Reset torch.compile state to prevent progressive slowdown
         # from dynamo guard accumulation across batches
         if self._compile_codec_enabled:
@@ -1100,6 +1331,59 @@ class TTSEngine:
     # ── Connection test ──────────────────────────────────────────
 
     # ── Local backend methods ────────────────────────────────────
+
+    def _mlx_generate_custom(self, text, instruct_text, speaker, voice_config, output_path):
+        """Generate custom voice audio using local MLX backend."""
+        try:
+            voice_data = voice_config.get(speaker) or {}
+            voice_name = self._mlx_voice_name(voice_data.get("voice", "Ryan"))
+            default_style = voice_data.get("default_style", "")
+            instruct = instruct_text if instruct_text else (default_style if default_style else "Normal tone")
+            model = self._init_local_mlx_model("custom_voice")
+            audio, sr = self._mlx_generate_with_temp_dir(
+                model,
+                text=text,
+                voice=voice_name,
+                instruct=instruct,
+                speed=1.0,
+            )
+            self._save_wav(audio, sr, output_path)
+            return True
+        except Exception as e:
+            print(f"Error generating custom voice for '{speaker}' with MLX backend: {e}")
+            return False
+
+    def _mlx_generate_clone(self, text, speaker, voice_config, output_path):
+        """Generate clone voice audio using local MLX backend."""
+        try:
+            voice_data = voice_config.get(speaker, {})
+            ref_audio_path = voice_data.get("ref_audio")
+            ref_text = voice_data.get("generated_ref_text") or voice_data.get("ref_text") or "."
+
+            if not ref_audio_path:
+                print(f"Warning: Clone voice for '{speaker}' missing ref_audio. Skipping.")
+                return False
+
+            if not os.path.isabs(ref_audio_path):
+                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                ref_audio_path = os.path.join(root_dir, ref_audio_path)
+
+            if not os.path.exists(ref_audio_path):
+                print(f"Warning: Reference audio not found for '{speaker}': {ref_audio_path}")
+                return False
+
+            model = self._init_local_mlx_model("base")
+            audio, sr = self._mlx_generate_with_temp_dir(
+                model,
+                text=text,
+                ref_audio=ref_audio_path,
+                ref_text=ref_text,
+            )
+            self._save_wav(audio, sr, output_path)
+            return True
+        except Exception as e:
+            print(f"Error generating clone voice for '{speaker}' with MLX backend: {e}")
+            return False
 
     def _local_generate_custom(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate custom voice audio using local Qwen3-TTS model."""

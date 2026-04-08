@@ -483,6 +483,29 @@ class TranscriptionCacheTests(unittest.TestCase):
         self.assertIn('Source paragraphs mentioning "Alice"', payload["prompt"])
         self.assertTrue(payload["prompt"].endswith('Return {"voice":"for Alice"}'))
 
+    def test_voice_suggestion_falls_back_to_chunks_when_source_missing(self):
+        with open(os.path.join(self.root_dir, "state.json"), "w", encoding="utf-8") as f:
+            json.dump({"input_file_path": os.path.join(self.root_dir, "missing.txt")}, f)
+        chunks = [
+            {"id": 0, "speaker": "Alice", "text": "Alice took a careful breath.", "chapter": "Chapter 1"},
+            {"id": 1, "speaker": "Narrator", "text": "The room was silent."},
+            {"id": 2, "speaker": "Alice", "text": "Alice spoke in a calm, steady tone.", "chapter": "Chapter 1"},
+        ]
+        self.manager.save_chunks(chunks)
+
+        context = self.manager.collect_voice_suggestion_context("Alice", target_chars=30)
+        payload = self.manager.build_voice_suggestion_prompt(
+            "Alice",
+            'Return {"voice":"for {character_name}"}',
+        )
+
+        self.assertEqual(context["context_source"], "chunks_fallback")
+        self.assertIsNotNone(context["source_error"])
+        self.assertGreaterEqual(len(context["paragraphs"]), 1)
+        self.assertIn("Source document unavailable", payload["prompt"])
+        self.assertIn('Fallback context from generated chunks mentioning "Alice"', payload["prompt"])
+        self.assertTrue(payload["warning"])
+
     def test_render_prep_flag_persists_in_state(self):
         self.assertFalse(self.manager.is_render_prep_complete())
 

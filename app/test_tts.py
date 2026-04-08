@@ -140,5 +140,22 @@ class NormalizeExternalUrlTests(unittest.TestCase):
         )
 
 
+class LocalBackendResolutionTests(unittest.TestCase):
+    @mock.patch.object(TTSEngine, "_host_platform", return_value=("darwin", "arm64"))
+    def test_auto_selects_mlx_on_apple_silicon(self, _mock_platform):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "auto"}})
+        self.assertEqual(engine.local_backend, "mlx")
+
+    @mock.patch.object(TTSEngine, "_host_platform", return_value=("linux", "x86_64"))
+    def test_auto_selects_qwen_on_non_macos(self, _mock_platform):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "auto"}})
+        self.assertEqual(engine.local_backend, "qwen")
+
+    @mock.patch.object(TTSEngine, "_host_platform", return_value=("linux", "x86_64"))
+    def test_explicit_mlx_falls_back_to_qwen_off_apple_silicon(self, _mock_platform):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "mlx"}})
+        self.assertEqual(engine.local_backend, "qwen")
+
+
 if __name__ == "__main__":
     unittest.main()

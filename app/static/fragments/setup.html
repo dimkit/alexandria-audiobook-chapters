@@ -30,6 +30,15 @@
                                 </select>
                                 <div class="form-text">Local loads model in-process; External connects to a Gradio TTS server</div>
                             </div>
+                            <div class="col-md-3" id="tts-local-backend-group" style="display:none;">
+                                <label class="form-label">Local Backend</label>
+                                <select class="form-select" id="tts-local-backend">
+                                    <option value="auto">Auto (platform-aware)</option>
+                                    <option value="qwen">Qwen Local</option>
+                                    <option value="mlx">MLX (Apple Silicon)</option>
+                                </select>
+                                <div class="form-text">Auto uses MLX on Apple Silicon and Qwen elsewhere.</div>
+                            </div>
                             <div class="col-md-5" id="tts-url-group">
                                 <label class="form-label">TTS Server URL</label>
                                 <input type="text" class="form-control" id="tts-url" value="http://127.0.0.1:7860">
