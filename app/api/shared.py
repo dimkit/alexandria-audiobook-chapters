@@ -937,6 +937,41 @@ processing_workflow_thread = None
 new_mode_workflow_lock = threading.RLock()
 new_mode_workflow_thread = None
 TASK_PROGRESS_PREFIX = "__TASK_PROGRESS__:"
+NAV_TASK_TABS = {"script", "voices", "editor", "proofread", "audio"}
+nav_task_lock = threading.RLock()
+nav_task_state = {
+    "tab": None,
+    "updated_at": None,
+}
+
+
+def _serialize_nav_task_state_locked():
+    return {
+        "tab": nav_task_state.get("tab"),
+        "updated_at": nav_task_state.get("updated_at"),
+    }
+
+
+def _set_nav_task_tab(tab: str):
+    if tab not in NAV_TASK_TABS:
+        raise HTTPException(status_code=400, detail="Invalid navigation task tab")
+    with nav_task_lock:
+        nav_task_state["tab"] = tab
+        nav_task_state["updated_at"] = time.time()
+        return _serialize_nav_task_state_locked()
+
+
+def _release_nav_task_tab(tab: Optional[str] = None):
+    with nav_task_lock:
+        if tab is None or nav_task_state.get("tab") == tab:
+            nav_task_state["tab"] = None
+            nav_task_state["updated_at"] = time.time()
+        return _serialize_nav_task_state_locked()
+
+
+def _get_nav_task_state():
+    with nav_task_lock:
+        return _serialize_nav_task_state_locked()
 
 
 def _task_is_current(task_name: str, run_id: str) -> bool:
