@@ -116,13 +116,7 @@ async def read_index():
 
 @router.get("/favicon.ico")
 async def read_favicon():
-    favicon_path = os.path.join(ROOT_DIR, "favicon.ico")
-    if os.path.exists(favicon_path):
-        return FileResponse(favicon_path, media_type="image/x-icon")
-    favicon_path = os.path.join(ROOT_DIR, "icon.png")
-    if os.path.exists(favicon_path):
-        return FileResponse(favicon_path, media_type="image/png")
-    raise HTTPException(status_code=404, detail="Favicon not found")
+    return FileResponse(os.path.join(ROOT_DIR, "favicon.ico"), media_type="image/x-icon")
 
 @router.get("/api/config")
 async def get_config():
