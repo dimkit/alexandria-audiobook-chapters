@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 from fastapi import BackgroundTasks
 from fastapi import HTTPException
 
@@ -12,6 +13,93 @@ SPEC = importlib.util.spec_from_file_location("threadspeak_app_module_archive", 
 app_module = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(app_module)
+
+
+def _write_json(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+
+
+def _write_project_zip(path, files):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            app_module.PROJECT_ARCHIVE_MANIFEST_NAME,
+            json.dumps(
+                {
+                    "kind": "threadspeak_project_archive",
+                    "version": app_module.PROJECT_ARCHIVE_VERSION,
+                    "created_at": 1,
+                    "entries": sorted(files.keys()),
+                }
+            ),
+        )
+        for rel, payload in files.items():
+            if isinstance(payload, bytes):
+                zf.writestr(rel, payload)
+            else:
+                zf.writestr(rel, json.dumps(payload))
+
+
+class _StubProjectManager:
+    def __init__(self):
+        self.engine = object()
+        self.asr_engine = object()
+        self._transcription_cache_lock = app_module.threading.Lock()
+        self._transcription_cache = {"stale": True}
+
+    def recover_interrupted_generating_chunks(self):
+        pass
+
+    def reconcile_chunk_audio_states(self):
+        pass
+
+
+class _TempProjectRuntime:
+    def __init__(self, testcase, temp_root):
+        self.testcase = testcase
+        self.temp_root = temp_root
+        self.originals = {}
+
+    def __enter__(self):
+        for name in (
+            "ROOT_DIR",
+            "SCRIPTS_DIR",
+            "SAVED_PROJECTS_DIR",
+            "SCRIPT_PATH",
+            "VOICE_CONFIG_PATH",
+            "VOICES_PATH",
+            "CHUNKS_PATH",
+            "UPLOADS_DIR",
+            "CLONE_VOICES_MANIFEST",
+            "DESIGNED_VOICES_MANIFEST",
+            "project_manager",
+            "_any_project_task_running",
+        ):
+            self.originals[name] = getattr(app_module, name)
+
+        app_module.ROOT_DIR = self.temp_root
+        app_module.SCRIPTS_DIR = os.path.join(self.temp_root, "scripts")
+        app_module.SAVED_PROJECTS_DIR = os.path.join(self.temp_root, "saved_projects")
+        app_module.SCRIPT_PATH = os.path.join(self.temp_root, "annotated_script.json")
+        app_module.VOICE_CONFIG_PATH = os.path.join(self.temp_root, "voice_config.json")
+        app_module.VOICES_PATH = os.path.join(self.temp_root, "voices.json")
+        app_module.CHUNKS_PATH = os.path.join(self.temp_root, "chunks.json")
+        app_module.UPLOADS_DIR = os.path.join(self.temp_root, "uploads")
+        app_module.CLONE_VOICES_MANIFEST = os.path.join(self.temp_root, "clone_voices", "manifest.json")
+        app_module.DESIGNED_VOICES_MANIFEST = os.path.join(self.temp_root, "designed_voices", "manifest.json")
+        app_module.project_manager = _StubProjectManager()
+        app_module._any_project_task_running = lambda: None
+
+        for dirname in ("scripts", "saved_projects", "uploads", "voicelines", "clone_voices", "designed_voices"):
+            os.makedirs(os.path.join(self.temp_root, dirname), exist_ok=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for name, value in self.originals.items():
+            setattr(app_module, name, value)
+        return False
 
 
 class ProjectArchiveHelpersTests(unittest.TestCase):
@@ -109,12 +197,14 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
             original_workflow_state = dict(app_module.process_state["processing_workflow"])
             original_new_mode_workflow_state = dict(app_module.process_state["new_mode_workflow"])
             original_starter = app_module._start_processing_workflow_thread_locked
+            original_any_running = app_module._any_project_task_running
             try:
                 app_module.ROOT_DIR = temp_root
                 app_module.PROCESSING_WORKFLOW_STATE_PATH = os.path.join(temp_root, "processing_workflow_state.json")
                 app_module.process_state["processing_workflow"] = app_module._new_processing_workflow_state()
                 app_module.process_state["new_mode_workflow"] = app_module._new_mode_workflow_initial_state()
                 app_module._start_processing_workflow_thread_locked = lambda: None
+                app_module._any_project_task_running = lambda: None
 
                 result = asyncio.run(
                     app_module.start_processing_workflow(
@@ -131,6 +221,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 app_module.process_state["processing_workflow"] = original_workflow_state
                 app_module.process_state["new_mode_workflow"] = original_new_mode_workflow_state
                 app_module._start_processing_workflow_thread_locked = original_starter
+                app_module._any_project_task_running = original_any_running
 
     def test_run_generate_script_task_clears_downstream_markers_and_marks_script_complete(self):
         with tempfile.TemporaryDirectory() as temp_root:
@@ -465,6 +556,144 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 app_module.ROOT_DIR = original_root
                 app_module.UPLOADS_DIR = original_uploads
                 app_module.project_manager = original_project_manager
+
+    def test_project_has_generated_audio_requires_existing_chunk_audio(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            with _TempProjectRuntime(self, temp_root):
+                _write_json(
+                    app_module.CHUNKS_PATH,
+                    [
+                        {"id": 0, "audio_path": "voicelines/missing.mp3"},
+                        {"id": 1, "audio_path": None},
+                    ],
+                )
+                self.assertFalse(app_module._project_has_generated_audio())
+
+                audio_path = os.path.join(temp_root, "voicelines", "existing.mp3")
+                with open(audio_path, "wb") as f:
+                    f.write(b"audio")
+                _write_json(app_module.CHUNKS_PATH, [{"id": 0, "audio_path": "voicelines/existing.mp3"}])
+                self.assertTrue(app_module._project_has_generated_audio())
+
+    def test_unified_save_uses_script_snapshot_without_audio_and_removes_same_name_zip(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            with _TempProjectRuntime(self, temp_root):
+                _write_json(app_module.SCRIPT_PATH, {"entries": [], "dictionary": []})
+                _write_json(app_module.VOICE_CONFIG_PATH, {"Narrator": {}})
+                _write_json(app_module.CHUNKS_PATH, [{"id": 0, "audio_path": "voicelines/missing.mp3"}])
+                stale_zip = os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip")
+                _write_project_zip(stale_zip, {"state.json": {}})
+
+                result = asyncio.run(app_module.save_script(app_module.ScriptSaveRequest(name="Demo")))
+
+                self.assertEqual(result["kind"], "script")
+                self.assertTrue(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.json")))
+                self.assertTrue(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json")))
+                self.assertFalse(os.path.exists(stale_zip))
+
+    def test_unified_save_uses_project_zip_with_audio_and_removes_script_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            with _TempProjectRuntime(self, temp_root):
+                _write_json(app_module.SCRIPT_PATH, {"entries": [{"text": "hello"}], "dictionary": []})
+                _write_json(app_module.VOICE_CONFIG_PATH, {"Narrator": {}})
+                _write_json(app_module.VOICES_PATH, ["Narrator"])
+                _write_json(app_module.CHUNKS_PATH, [{"id": 0, "audio_path": "voicelines/live.mp3"}])
+                with open(os.path.join(temp_root, "voicelines", "live.mp3"), "wb") as f:
+                    f.write(b"audio")
+                for suffix, payload in (
+                    (".json", {"old": True}),
+                    (".voice_config.json", {"old": True}),
+                    (".paragraphs.json", {"old": True}),
+                ):
+                    _write_json(os.path.join(app_module.SCRIPTS_DIR, f"demo{suffix}"), payload)
+
+                result = asyncio.run(app_module.save_script(app_module.ScriptSaveRequest(name="Demo")))
+
+                archive_path = os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip")
+                self.assertEqual(result["kind"], "project")
+                self.assertTrue(os.path.exists(archive_path))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.json")))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json")))
+                with zipfile.ZipFile(archive_path, "r") as zf:
+                    self.assertIn(app_module.PROJECT_ARCHIVE_MANIFEST_NAME, zf.namelist())
+                    self.assertIn("voicelines/live.mp3", zf.namelist())
+
+    def test_unified_list_deduplicates_script_when_project_zip_exists(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            with _TempProjectRuntime(self, temp_root):
+                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.json"), {"entries": []})
+                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json"), {"Narrator": {}})
+                _write_json(os.path.join(app_module.SCRIPTS_DIR, "script_only.json"), {"entries": []})
+                _write_project_zip(
+                    os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip"),
+                    {"voice_config.json": {"Narrator": {}}, "chunks.json": []},
+                )
+
+                projects = asyncio.run(app_module.list_saved_scripts())
+                by_name = {item["name"]: item for item in projects}
+
+                self.assertEqual(by_name["demo"]["kind"], "project")
+                self.assertTrue(by_name["demo"]["has_audio"])
+                self.assertTrue(by_name["demo"]["has_voice_config"])
+                self.assertEqual(by_name["script_only"]["kind"], "script")
+                self.assertEqual(len([item for item in projects if item["name"] == "demo"]), 1)
+
+    def test_unified_load_prefers_project_zip_over_script_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            with _TempProjectRuntime(self, temp_root):
+                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.json"), {"entries": [{"text": "script"}]})
+                _write_project_zip(
+                    os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip"),
+                    {
+                        "annotated_script.json": {"entries": [{"text": "zip"}], "dictionary": []},
+                        "state.json": {"input_file_path": "uploads/story.txt"},
+                        "uploads/story.txt": b"story",
+                    },
+                )
+
+                result = asyncio.run(app_module.load_script(app_module.ScriptLoadRequest(name="Demo")))
+
+                self.assertEqual(result["kind"], "project")
+                with open(app_module.SCRIPT_PATH, "r", encoding="utf-8") as f:
+                    restored = json.load(f)
+                self.assertEqual(restored["entries"][0]["text"], "zip")
+
+    def test_unified_delete_removes_project_zip_and_script_companions(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            with _TempProjectRuntime(self, temp_root):
+                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.json"), {"entries": []})
+                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json"), {"Narrator": {}})
+                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.paragraphs.json"), [])
+                with open(os.path.join(app_module.SCRIPTS_DIR, "demo.source.txt"), "w", encoding="utf-8") as f:
+                    f.write("source")
+                _write_project_zip(os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip"), {"state.json": {}})
+
+                result = asyncio.run(app_module.delete_script("Demo"))
+
+                self.assertEqual(result["status"], "deleted")
+                self.assertFalse(os.path.exists(os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip")))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.json")))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json")))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.paragraphs.json")))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.source.txt")))
+
+    def test_named_project_archive_restores_through_zip_validation_path(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            with _TempProjectRuntime(self, temp_root):
+                archive_path = os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip")
+                _write_project_zip(
+                    archive_path,
+                    {
+                        "annotated_script.json": {"entries": [{"text": "restored"}], "dictionary": []},
+                        "state.json": {},
+                    },
+                )
+
+                app_module._restore_project_archive_zip(archive_path)
+
+                with open(app_module.SCRIPT_PATH, "r", encoding="utf-8") as f:
+                    restored = json.load(f)
+                self.assertEqual(restored["entries"][0]["text"], "restored")
 
     def test_generate_script_rejects_duplicate_start_while_running(self):
         with tempfile.TemporaryDirectory() as temp_root:

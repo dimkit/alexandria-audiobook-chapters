@@ -108,6 +108,16 @@
             border-color: rgba(255, 255, 255, 0.3);
         }
         .container-wide { max-width: 85%; margin-left: auto; margin-right: auto; padding-left: 12px; padding-right: 12px; padding-top: 1rem; }
+        @media (max-width: 922px) {
+            .container-wide {
+                max-width: none;
+                width: 100%;
+                margin-left: 0;
+                margin-right: 0;
+                padding-left: 0;
+                padding-right: 0;
+            }
+        }
         .tab-content > .card:last-child { margin-bottom: 0; }
         #voices-tab {
             padding-bottom: 0 !important;

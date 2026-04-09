@@ -63,6 +63,7 @@ M4B_PATH = os.path.join(ROOT_DIR, "audiobook.m4b")
 OPTIMIZED_EXPORT_PATH = os.path.join(ROOT_DIR, "optimized_audiobook.zip")
 UPLOADS_DIR = os.path.join(BASE_DIR, "uploads")
 SCRIPTS_DIR = os.path.join(ROOT_DIR, "scripts")
+SAVED_PROJECTS_DIR = os.path.join(ROOT_DIR, "saved_projects")
 CHUNKS_PATH = os.path.join(ROOT_DIR, "chunks.json")
 AUDIO_QUEUE_STATE_PATH = os.path.join(ROOT_DIR, "audio_queue_state.json")
 AUDIO_CANCEL_TOMBSTONE_PATH = os.path.join(ROOT_DIR, "audio_cancel_tombstone.json")
@@ -99,6 +100,7 @@ PROJECT_ARCHIVE_ALLOWED_DIRS = {
 
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(SCRIPTS_DIR, exist_ok=True)
+os.makedirs(SAVED_PROJECTS_DIR, exist_ok=True)
 os.makedirs(DESIGNED_VOICES_DIR, exist_ok=True)
 os.makedirs(CLONE_VOICES_DIR, exist_ok=True)
 os.makedirs(LORA_MODELS_DIR, exist_ok=True)
@@ -220,6 +222,48 @@ def _apply_project_dictionary(text):
     return apply_dictionary_to_text(text, _load_project_dictionary_entries())[0]
 
 
+def _script_source_prefix(name: str) -> str:
+    return f"{name}.source"
+
+
+def _find_saved_script_source_companion(name: str):
+    prefix = _script_source_prefix(name)
+    matches = []
+    if not os.path.isdir(SCRIPTS_DIR):
+        return None
+    for entry in os.listdir(SCRIPTS_DIR):
+        if not entry.startswith(prefix):
+            continue
+        full_path = os.path.join(SCRIPTS_DIR, entry)
+        if os.path.isfile(full_path):
+            matches.append(full_path)
+    if not matches:
+        return None
+    matches.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    return matches[0]
+
+
+def _save_script_source_companion(name: str):
+    source_companion = _find_saved_script_source_companion(name)
+    while source_companion:
+        try:
+            os.remove(source_companion)
+        except OSError:
+            break
+        source_companion = _find_saved_script_source_companion(name)
+
+    state = _load_project_state_payload()
+    input_path = os.path.abspath((state.get("input_file_path") or "").strip())
+    if not input_path or not os.path.exists(input_path) or not os.path.isfile(input_path):
+        return None
+
+    ext = os.path.splitext(input_path)[1]
+    companion_name = f"{_script_source_prefix(name)}{ext}"
+    companion_path = os.path.join(SCRIPTS_DIR, companion_name)
+    shutil.copy2(input_path, companion_path)
+    return companion_path
+
+
 def _delete_saved_script_artifacts(name: str):
     base = os.path.join(SCRIPTS_DIR, f"{name}.json")
     if os.path.exists(base):
@@ -228,6 +272,13 @@ def _delete_saved_script_artifacts(name: str):
         companion = os.path.join(SCRIPTS_DIR, f"{name}{suffix}")
         if os.path.exists(companion):
             os.remove(companion)
+    source_companion = _find_saved_script_source_companion(name)
+    while source_companion:
+        try:
+            os.remove(source_companion)
+        except OSError:
+            break
+        source_companion = _find_saved_script_source_companion(name)
 
 
 def _save_current_script_snapshot(name: str, *, purge_existing: bool = False):
@@ -251,6 +302,7 @@ def _save_current_script_snapshot(name: str, *, purge_existing: bool = False):
     paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
     if os.path.exists(paragraphs_path):
         shutil.copy2(paragraphs_path, os.path.join(SCRIPTS_DIR, f"{safe_name}.paragraphs.json"))
+    _save_script_source_companion(safe_name)
 
     state = _load_project_state_payload()
     state["loaded_script_name"] = safe_name
@@ -1699,6 +1751,70 @@ def _build_project_archive_manifest(entries):
     }
 
 
+def _saved_project_archive_path(name: str) -> str:
+    safe_name = _sanitize_name(name)
+    if not safe_name:
+        raise ValueError("Invalid project name.")
+    os.makedirs(SAVED_PROJECTS_DIR, exist_ok=True)
+    return os.path.join(SAVED_PROJECTS_DIR, f"{safe_name}.zip")
+
+
+def _project_has_generated_audio() -> bool:
+    if not os.path.exists(CHUNKS_PATH):
+        return False
+    try:
+        with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return False
+    if not isinstance(chunks, list):
+        return False
+
+    root = os.path.abspath(ROOT_DIR)
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        audio_path = (chunk.get("audio_path") or "").strip()
+        if not audio_path:
+            continue
+        try:
+            normalized = _normalize_archive_path(audio_path)
+        except ValueError:
+            continue
+        full_path = os.path.abspath(os.path.join(ROOT_DIR, normalized))
+        try:
+            if os.path.commonpath([root, full_path]) != root:
+                continue
+        except ValueError:
+            continue
+        if os.path.isfile(full_path):
+            return True
+    return False
+
+
+def _write_project_archive(zip_path: str):
+    entries = _project_archive_entries()
+    manifest = _build_project_archive_manifest(entries)
+    os.makedirs(os.path.dirname(zip_path), exist_ok=True)
+    temp_zip_path = f"{zip_path}.tmp"
+    if os.path.exists(temp_zip_path):
+        os.remove(temp_zip_path)
+
+    try:
+        with zipfile.ZipFile(temp_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(PROJECT_ARCHIVE_MANIFEST_NAME, json.dumps(manifest, indent=2, ensure_ascii=False))
+            for relative_path, absolute_path in entries:
+                if relative_path == "state.json":
+                    zf.writestr(relative_path, json.dumps(_archive_state_with_relative_paths(), indent=2, ensure_ascii=False))
+                else:
+                    zf.write(absolute_path, arcname=relative_path)
+        os.replace(temp_zip_path, zip_path)
+    finally:
+        if os.path.exists(temp_zip_path):
+            os.remove(temp_zip_path)
+    return {"entries": manifest["entries"], "path": zip_path}
+
+
 def _clear_project_archive_targets():
     removable_files = [
         "annotated_script.json",
@@ -1796,6 +1912,45 @@ def _restore_project_archive(extracted_dir: str):
         shutil.copytree(source_dir, target_dir)
 
     _reset_runtime_state_after_project_load()
+
+
+def _restore_project_archive_zip(zip_path: str):
+    temp_root = tempfile.mkdtemp(prefix="threadspeak_project_import_")
+    extract_root = os.path.join(temp_root, "extracted")
+    os.makedirs(extract_root, exist_ok=True)
+
+    try:
+        try:
+            zf_context = zipfile.ZipFile(zip_path, "r")
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Project archive is not a valid .zip file.")
+
+        with zf_context as zf:
+            names = zf.namelist()
+            if PROJECT_ARCHIVE_MANIFEST_NAME not in names:
+                raise HTTPException(status_code=400, detail="Archive is missing project archive manifest.")
+
+            try:
+                manifest = json.loads(zf.read(PROJECT_ARCHIVE_MANIFEST_NAME).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
+                raise HTTPException(status_code=400, detail=f"Archive manifest is invalid: {e}")
+            if manifest.get("kind") != "threadspeak_project_archive":
+                raise HTTPException(status_code=400, detail="Archive is not a valid Threadspeak project archive.")
+
+            for info in zf.infolist():
+                if info.is_dir() or info.filename == PROJECT_ARCHIVE_MANIFEST_NAME:
+                    continue
+                relative_path = _normalize_archive_path(info.filename)
+                if not _is_allowed_project_archive_path(relative_path):
+                    raise HTTPException(status_code=400, detail=f"Archive contains unsupported path: {relative_path}")
+                target_path = os.path.join(extract_root, relative_path)
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                with zf.open(info, "r") as source, open(target_path, "wb") as target:
+                    shutil.copyfileobj(source, target)
+
+        _restore_project_archive(extract_root)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def _persist_audio_queue_state_locked():

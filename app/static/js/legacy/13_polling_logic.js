@@ -252,7 +252,7 @@
             }
         });
 
-        // ── Saved Scripts ──────────────────────────────────────
+        // ── Projects ──────────────────────────────────────
 
         async function loadSavedScripts() {
             try {
@@ -261,7 +261,7 @@
                 const container = document.getElementById('saved-scripts-list');
 
                 if (!scripts.length) {
-                    container.innerHTML = '<p class="text-muted mb-0">No saved scripts yet.</p>';
+                    container.innerHTML = '<p class="text-muted mb-0">No saved projects yet.</p>';
                     return;
                 }
 
@@ -269,13 +269,15 @@
                     const date = new Date(s.created * 1000).toLocaleDateString('en-US', {
                         month: 'short', day: 'numeric', year: 'numeric'
                     });
-                    const voiceBadge = s.has_voice_config
+                    const badge = (s.kind === 'project' || s.has_audio)
+                        ? '<span class="badge bg-warning text-dark me-2" title="Includes generated audio">Audio</span>'
+                        : s.has_voice_config
                         ? '<span class="badge bg-info me-2" title="Includes voice configuration">Voices</span>'
                         : '';
                     return `
                         <div class="d-flex align-items-center py-2 border-bottom">
                             <div class="d-flex align-items-center flex-grow-1 overflow-hidden">
-                                ${voiceBadge}<strong class="text-truncate">${s.name}</strong>
+                                ${badge}<strong class="text-truncate">${s.name}</strong>
                             </div>
                             <div class="d-flex align-items-center gap-2 ms-3 flex-shrink-0">
                                 <small class="text-muted">${date}</small>
@@ -293,7 +295,7 @@
             const nameInput = document.getElementById('save-script-name');
             const name = nameInput.value.trim();
             if (!name) {
-                showToast('Please enter a name for the script.', 'warning');
+                showToast('Please enter a name for the project.', 'warning');
                 return;
             }
             try {
@@ -304,13 +306,13 @@
                 });
                 if (!res.ok) {
                     const err = await res.json();
-                    showToast(err.detail || 'Failed to save script.', 'error');
+                    showToast(err.detail || 'Failed to save project.', 'error');
                     return;
                 }
                 nameInput.value = '';
                 loadSavedScripts();
             } catch (e) {
-                showToast('Error saving script: ' + e.message, 'error');
+                showToast('Error saving project: ' + e.message, 'error');
             }
         }
 
@@ -398,7 +400,7 @@
         };
 
         async function loadScript(name) {
-            if (!await showConfirm(`Load "${name}"? This will replace your current script and chunks.`)) return;
+            if (!await showConfirm(`Load project "${name}"? This will replace your current project state.`)) return;
             try {
                 const res = await fetch('/api/scripts/load', {
                     method: 'POST',
@@ -407,28 +409,31 @@
                 });
                 if (!res.ok) {
                     const err = await res.json();
-                    showToast(err.detail || 'Failed to load script.', 'error');
+                    showToast(err.detail || 'Failed to load project.', 'error');
                     return;
                 }
+                await loadConfig();
                 loadSavedScripts();
-                loadChunks();
+                loadChunks(true);
                 loadVoices();
+                refreshProcessingWorkflowStatus();
+                refreshAudioQueueUI().catch(() => null);
             } catch (e) {
-                showToast('Error loading script: ' + e.message, 'error');
+                showToast('Error loading project: ' + e.message, 'error');
             }
         }
 
         async function deleteScript(name) {
-            if (!await showConfirm(`Delete saved script "${name}"? This cannot be undone.`)) return;
+            if (!await showConfirm(`Delete saved project "${name}"? This cannot be undone.`)) return;
             try {
                 const res = await fetch(`/api/scripts/${encodeURIComponent(name)}`, {method: 'DELETE'});
                 if (!res.ok) {
                     const err = await res.json();
-                    showToast(err.detail || 'Failed to delete script.', 'error');
+                    showToast(err.detail || 'Failed to delete project.', 'error');
                     return;
                 }
                 loadSavedScripts();
             } catch (e) {
-                showToast('Error deleting script: ' + e.message, 'error');
+                showToast('Error deleting project: ' + e.message, 'error');
             }
         }
