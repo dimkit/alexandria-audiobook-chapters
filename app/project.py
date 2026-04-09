@@ -1875,6 +1875,29 @@ class ProjectManager:
         self._save_state(state)
         return parsed
 
+    def get_narrator_overrides(self):
+        """Return dict of chapter_name -> voice_name for narrator substitution."""
+        return self._load_state().get("narrator_overrides", {})
+
+    def _apply_narrator_override(self, speaker, chapter, narrator_overrides):
+        """Return the effective speaker, substituting the chapter narrator override if applicable."""
+        if self._normalize_speaker_name(speaker) == self._normalize_speaker_name("NARRATOR"):
+            override = narrator_overrides.get(chapter)
+            if override and self._normalize_speaker_name(override) != self._normalize_speaker_name("NARRATOR"):
+                return override
+        return speaker
+
+    def set_narrator_override(self, chapter: str, voice: str):
+        """Set or clear the narrator voice for a specific chapter."""
+        state = self._load_state()
+        overrides = state.get("narrator_overrides", {})
+        if voice and self._normalize_speaker_name(voice) != self._normalize_speaker_name("NARRATOR"):
+            overrides[chapter] = voice
+        else:
+            overrides.pop(chapter, None)
+        state["narrator_overrides"] = overrides
+        self._save_state(state)
+
     @staticmethod
     def _count_speaker_lines(chunks, speaker):
         speaker_key = ProjectManager._normalize_speaker_name(speaker)
@@ -4965,6 +4988,11 @@ class ProjectManager:
                 return False, "TTS engine not initialized"
 
             speaker = chunk["speaker"]
+            # Apply per-chapter narrator override: if this is a NARRATOR line and the chapter
+            # has a custom narrator voice selected, substitute that voice for generation.
+            speaker = self._apply_narrator_override(
+                speaker, (chunk.get("chapter") or "").strip(), self.get_narrator_overrides()
+            )
             voice_config = self._load_voice_config()
             resolved_speaker = self.resolve_voice_speaker(speaker, voice_config, chunks=chunks)
             voice_config = self.prepare_runtime_voice_config(voice_config, [resolved_speaker])
@@ -6001,8 +6029,16 @@ class ProjectManager:
         }
         voice_config = {}
         voice_config = self._load_voice_config()
+        narrator_overrides = self.get_narrator_overrides()
         resolved_speakers = {
-            self.resolve_voice_speaker(chunks[idx].get("speaker", ""), voice_config, chunks=chunks)
+            self.resolve_voice_speaker(
+                self._apply_narrator_override(
+                    chunks[idx].get("speaker", ""),
+                    (chunks[idx].get("chapter") or "").strip(),
+                    narrator_overrides,
+                ),
+                voice_config, chunks=chunks,
+            )
             for idx in indices if 0 <= idx < len(chunks)
         }
         voice_config = self.prepare_runtime_voice_config(voice_config, resolved_speakers)
@@ -6045,7 +6081,12 @@ class ProjectManager:
                     chunk = chunks[idx]
                     transformed_text, _ = apply_dictionary_to_text(chunk.get("text", ""), dictionary_entries)
                     transformed_texts[idx] = transformed_text
-                    resolved_speaker = self.resolve_voice_speaker(chunk.get("speaker", ""), voice_config, chunks=chunks)
+                    effective_speaker = self._apply_narrator_override(
+                        chunk.get("speaker", ""),
+                        (chunk.get("chapter") or "").strip(),
+                        narrator_overrides,
+                    )
+                    resolved_speaker = self.resolve_voice_speaker(effective_speaker, voice_config, chunks=chunks)
                     batch_chunks.append({
                         "index": idx,
                         "text": transformed_text,

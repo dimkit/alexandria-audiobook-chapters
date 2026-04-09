@@ -37,6 +37,7 @@
                         .catch(err => console.error('Editor sync error', err));
                     refreshAudioQueueUI().catch(err => console.error('Audio queue refresh error', err));
                     ensureAudioQueuePolling();
+                    syncNarratorSelectionsFromBackend().catch(() => {});
                 } else if (nextTab === 'voices') {
                     loadVoices();
                 } else if (nextTab === 'dictionary') {

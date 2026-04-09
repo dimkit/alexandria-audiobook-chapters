@@ -2,6 +2,7 @@ import os
 import posixpath
 import re
 import zipfile
+from collections import Counter
 from html import unescape
 from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
@@ -142,6 +143,106 @@ def _load_text_document(path):
     }
 
 
+def _heading_level_from_style_name(style_name):
+    normalized = _normalize_text(style_name).lower()
+    match = re.match(r"^heading\s*([1-3])\b", normalized)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _extract_docx_chapters(path):
+    try:
+        from docx import Document
+    except ImportError as e:
+        raise RuntimeError("DOCX support requires python-docx to be installed.") from e
+
+    document = Document(path)
+    body = document.element.body
+
+    lines = []
+    heading_counts = Counter()
+
+    for paragraph in document.paragraphs:
+        # Ignore paragraphs inside tables/other non-body containers.
+        if paragraph._p.getparent() is not body:
+            continue
+        text = _normalize_text(paragraph.text)
+        if not text:
+            continue
+        level = _heading_level_from_style_name(getattr(paragraph.style, "name", ""))
+        if level is not None:
+            heading_counts[level] += 1
+        lines.append({
+            "text": text,
+            "heading_level": level,
+        })
+
+    if not lines:
+        raise ValueError("No readable text content found in DOCX")
+
+    selected_heading_level = None
+    if heading_counts:
+        selected_heading_level = min(
+            heading_counts.keys(),
+            key=lambda level: (-heading_counts[level], level),  # Most frequent; ties prefer H1 > H2 > H3.
+        )
+
+    chapters = []
+    current_title = None
+    current_parts = []
+
+    def _append_chapter():
+        chapter_text = "\n\n".join(current_parts).strip()
+        if not chapter_text:
+            return
+        chapters.append({
+            "title": current_title,
+            "text": chapter_text,
+        })
+
+    if selected_heading_level is None:
+        chapters = [{
+            "title": None,
+            "text": "\n\n".join(item["text"] for item in lines).strip(),
+        }]
+    else:
+        pending_intro_parts = []
+        has_started_selected_heading = False
+        for item in lines:
+            if item["heading_level"] == selected_heading_level:
+                if current_title is not None or current_parts:
+                    _append_chapter()
+                current_title = item["text"]
+                current_parts = []
+                if pending_intro_parts:
+                    current_parts.extend(pending_intro_parts)
+                    pending_intro_parts = []
+                has_started_selected_heading = True
+                continue
+            if has_started_selected_heading:
+                current_parts.append(item["text"])
+            else:
+                pending_intro_parts.append(item["text"])
+        _append_chapter()
+
+        # If no chapter body was collected (e.g. headings-only document), fall back to full text.
+        if not chapters:
+            chapters = [{
+                "title": None,
+                "text": "\n\n".join(item["text"] for item in lines).strip(),
+            }]
+
+    doc_title = _normalize_text(getattr(document.core_properties, "title", "")) or os.path.splitext(os.path.basename(path))[0]
+
+    return {
+        "type": "docx",
+        "title": os.path.splitext(os.path.basename(path))[0],
+        "book_title": doc_title,
+        "chapters": chapters,
+    }
+
+
 def _resolve_zip_path(base_path, relative_path):
     return posixpath.normpath(posixpath.join(posixpath.dirname(base_path), relative_path))
 
@@ -240,6 +341,8 @@ def load_source_document(path):
     extension = os.path.splitext(path)[1].lower()
     if extension == ".epub":
         return _extract_epub_chapters(path)
+    if extension == ".docx":
+        return _extract_docx_chapters(path)
     return _load_text_document(path)
 
 

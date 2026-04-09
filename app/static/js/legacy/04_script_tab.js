@@ -7,7 +7,7 @@
             statusEl.innerHTML = '<span class="text-info"><i class="fas fa-spinner fa-spin me-1"></i>Loading file...</span>';
             try {
                 const res = await API.upload(fileInput.files[0]);
-                const chapterSuffix = res.source_type === 'epub' && Number.isInteger(res.chapter_count)
+                const chapterSuffix = ['epub', 'docx'].includes(res.source_type) && Number.isInteger(res.chapter_count)
                     ? ` (${res.chapter_count} chapter${res.chapter_count === 1 ? '' : 's'} detected)`
                     : '';
                 statusEl.innerHTML = `<span class="text-success"><i class="fas fa-check me-1"></i>Loaded: ${res.filename}${chapterSuffix}</span>`;
@@ -24,7 +24,7 @@
             const hasLoadedFile = statusEl.innerHTML.includes('text-success');
 
             if (!hasLoadedFile && fileInput.files.length === 0) {
-                statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>Please select a text or EPUB file first using the file picker above.</span>';
+                statusEl.innerHTML = '<span class="text-danger"><i class="fas fa-exclamation-triangle me-1"></i>Please select a text, EPUB, or DOCX file first using the file picker above.</span>';
                 throw new Error('No input file selected');
             }
 
@@ -270,4 +270,3 @@
                 showToast('Pause request failed: ' + e.message, 'error');
             }
         });
-

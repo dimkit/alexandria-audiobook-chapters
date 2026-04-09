@@ -13,6 +13,7 @@
         let latestProofreadStatus = null;
         let renderPrepComplete = false;
         let _queueStatusToastShown = false;
+        const NARRATOR_SELECTION_KEY = 'alexandria-narrator-selection';
 
         // Check if any audio is currently playing
         function isAudioPlaying() {
@@ -156,6 +157,7 @@
             }
 
             updateDeleteChapterButtonVisibility();
+            updateNarratorSelector(chunks); // async, fire-and-forget
         }
 
         function updateChunkRow(chunk) {
@@ -234,10 +236,14 @@
             stopSequence();
             updateDeleteChapterButtonVisibility();
             await loadChunks(false);
+            updateNarratorSelector(cachedChunks); // syncEditorChapterState is skipped when cache is warm
         };
 
 
         window.changeEditorScope = () => {
+            const toggle = document.getElementById('editor-chapter-only');
+            const lbl = document.getElementById('editor-chapter-only-label');
+            if (lbl) lbl.textContent = toggle.checked ? 'Generate Chapter' : 'Generate Book';
             syncEditorChapterState(cachedChunks);
         };
 
@@ -595,10 +601,7 @@
                 return `
                     <tr data-proofread-id="${escapeHtml(chunkRef)}" data-proofread-fingerprint="${escapeHtml(getProofreadFingerprint(chunk, threshold))}" style="${getProofreadRowStyle(chunk, threshold)}">
                         <td>${escapeHtml(chunk.speaker || '')}</td>
-                        <td>
-                            <div class="fw-semibold small text-muted mb-1">${escapeHtml(getChunkChapterName(chunk) || 'No chapter')}</div>
-                            <div>${escapeHtml(chunk.text || '')}</div>
-                        </td>
+                        <td>${escapeHtml(chunk.text || '')}</td>
                         <td>
                             ${getProofreadBadge(chunk, threshold)}
                             <div class="small mt-1">Score: ${score}</div>
@@ -1115,6 +1118,125 @@
             document.getElementById('audio-merge-output-size').textContent = formatBytes(progress.output_file_size_bytes || 0);
         }
 
+        function getNarratorSelections() {
+            try { return JSON.parse(localStorage.getItem(NARRATOR_SELECTION_KEY) || '{}'); }
+            catch { return {}; }
+        }
+
+        window.onNarratorSelectorChange = async () => {
+            const select = document.getElementById('editor-narrator-select');
+            if (!select || selectedEditorChapter === WHOLE_PROJECT_CHAPTER_ID) return;
+
+            const newValue = select.value;
+            const oldValue = getNarratorSelections()[selectedEditorChapter] || null;
+            if (newValue === oldValue) return;
+
+            // Check for existing NARRATOR audio in this chapter
+            const withAudio = cachedChunks.filter(c =>
+                (c.speaker || '').trim().toUpperCase() === 'NARRATOR' &&
+                getChunkChapterName(c) === selectedEditorChapter &&
+                c.audio_path
+            );
+
+            if (withAudio.length > 0) {
+                const n = withAudio.length;
+                const confirmed = await showConfirm(
+                    `Changing the narrator for "${selectedEditorChapter}" will delete ${n} generated clip${n === 1 ? '' : 's'}. Continue?`
+                );
+                if (!confirmed) {
+                    select.value = oldValue || 'NARRATOR';
+                    return;
+                }
+                await API.post('/api/narrator_overrides', {
+                    chapter: selectedEditorChapter,
+                    voice: newValue,
+                    invalidate_audio: true,
+                });
+                await loadChunks(true);
+            } else {
+                await API.post('/api/narrator_overrides', {
+                    chapter: selectedEditorChapter,
+                    voice: newValue,
+                    invalidate_audio: false,
+                });
+            }
+
+            const selections = getNarratorSelections();
+            selections[selectedEditorChapter] = newValue;
+            localStorage.setItem(NARRATOR_SELECTION_KEY, JSON.stringify(selections));
+        };
+
+        async function syncNarratorSelectionsFromBackend() {
+            try {
+                const overrides = await API.get('/api/narrator_overrides');
+                const selections = getNarratorSelections();
+                // Backend is authoritative — merge, backend wins on conflict
+                Object.assign(selections, overrides);
+                localStorage.setItem(NARRATOR_SELECTION_KEY, JSON.stringify(selections));
+            } catch (e) {
+                // Non-fatal; localStorage remains as fallback
+            }
+        }
+
+        async function getNarratingVoices() {
+            if (window._narratingVoicesCache) return window._narratingVoicesCache;
+            try {
+                const voices = await API.get('/api/voices');
+                window._narratingVoicesCache = voices
+                    .filter(v => (v.name || '').trim().toUpperCase() === 'NARRATOR' || v.config?.narrates === true)
+                    .map(v => v.name);
+            } catch (e) {
+                window._narratingVoicesCache = ['NARRATOR'];
+            }
+            return window._narratingVoicesCache;
+        }
+
+        async function updateNarratorSelector(chunks) {
+            const group = document.getElementById('narrator-selector-group');
+            if (!group) return;
+
+            if (selectedEditorChapter === WHOLE_PROJECT_CHAPTER_ID) {
+                group.style.display = 'none';
+                return;
+            }
+
+            const narratingVoices = await getNarratingVoices();
+            const hasExtra = narratingVoices.some(v => v.trim().toUpperCase() !== 'NARRATOR');
+            if (!hasExtra) {
+                group.style.display = 'none';
+                return;
+            }
+
+            const sourceChunks = chunks || cachedChunks;
+            const chapterText = sourceChunks
+                .filter(c => getChunkChapterName(c) === selectedEditorChapter)
+                .map(c => c.text || '')
+                .join(' ');
+
+            const narratorName = narratingVoices.find(v => v.trim().toUpperCase() === 'NARRATOR') || 'NARRATOR';
+            const others = narratingVoices.filter(v => v.trim().toUpperCase() !== 'NARRATOR');
+
+            const countMentions = name => {
+                try {
+                    const re = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                    return (chapterText.match(re) || []).length;
+                } catch { return 0; }
+            };
+            others.sort((a, b) => countMentions(b) - countMentions(a));
+
+            const ordered = [narratorName, ...others];
+            const saved = getNarratorSelections()[selectedEditorChapter];
+            const selected = ordered.includes(saved) ? saved : narratorName;
+
+            const select = document.getElementById('editor-narrator-select');
+            if (!select) return;
+            select.innerHTML = ordered.map(v =>
+                `<option value="${escapeHtml(v)}"${v === selected ? ' selected' : ''}>${escapeHtml(v)}</option>`
+            ).join('');
+
+            group.style.display = 'flex';
+        }
+
         async function focusChunkInEditor(chunkId) {
             await loadChunks(false);
             const row = document.querySelector(`tr[data-id="${chunkId}"]`);
@@ -1152,6 +1274,44 @@
                 showToast(`Jumped to the first errored segment in ${scopeLabel}.`, 'info', 2500);
             } catch (e) {
                 showToast('Failed to jump to the first errored segment: ' + e.message, 'error');
+            }
+        };
+
+        window.jumpToFirstChunkForVoice = async (voiceName) => {
+            try {
+                const chunks = await API.get('/api/chunks/view');
+                const norm = s => (s || '').trim().toLowerCase();
+                const first = chunks.find(c => norm(c.speaker) === norm(voiceName));
+                if (!first) {
+                    showToast(`No lines found for "${voiceName}".`, 'warning');
+                    return;
+                }
+
+                // Switch to editor tab
+                document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+                const editorLink = document.querySelector('.nav-link[data-tab="editor"]');
+                if (editorLink) editorLink.classList.add('active');
+                document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
+                const editorTabEl = document.getElementById('editor-tab');
+                if (editorTabEl) editorTabEl.style.display = 'block';
+
+                // Scope to the chunk's chapter so only that chapter's rows are rendered
+                const chapter = getChunkChapterName(first);
+                const chapterToggle = document.getElementById('editor-chapter-only');
+                if (chapterToggle) chapterToggle.checked = true;
+                const lbl = document.getElementById('editor-chapter-only-label');
+                if (lbl) lbl.textContent = 'Generate Chapter';
+                selectedEditorChapter = chapter || WHOLE_PROJECT_CHAPTER_ID;
+                syncEditorChapterState(chunks);
+
+                ensureAudioQueuePolling();
+
+                const focused = await focusChunkInEditor(getChunkRef(first));
+                if (!focused) {
+                    showToast(`Found a line for "${voiceName}" but could not focus it in the editor.`, 'warning');
+                }
+            } catch (e) {
+                showToast('Failed to jump to voice: ' + e.message, 'error');
             }
         };
 

@@ -176,14 +176,14 @@
                     control.disabled = disabled;
                 });
 
-                const status = card.querySelector('.voice-alias-status');
-                if (status) {
+                const aliasInput = card.querySelector('.voice-alias-input');
+                if (aliasInput) {
                     if (manualAliasActive) {
-                        status.textContent = `Aliased to ${target}. Generation will use that character's voice settings.`;
+                        aliasInput.title = `Aliased to ${target}. Generation will use that character's voice settings.`;
                     } else if (narratorThresholdActive) {
-                        status.textContent = `Auto-aliased to ${thresholdTarget} because ${lineCount} line${lineCount === 1 ? '' : 's'} is below narrator threshold ${narratorThreshold}. Set AKA to override this.`;
+                        aliasInput.title = `Auto-aliased to ${thresholdTarget} because ${lineCount} line${lineCount === 1 ? '' : 's'} is below narrator threshold ${narratorThreshold}. Set AKA to override this.`;
                     } else {
-                        status.textContent = 'Match another visible character name here to disable this row and reuse that voice.';
+                        aliasInput.title = 'Match another visible character name here to disable this row and reuse that voice.';
                     }
                 }
             });
@@ -203,6 +203,8 @@
             const designLoaded = Boolean((config.ref_audio || '').trim()) && !!voice.design_clone_loaded;
             const lineCount = Number(voice.line_count || 0);
             const lineLabel = `${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`;
+            const isNarratorCard = normalizeVoiceName(voice.name) === normalizeVoiceName('NARRATOR');
+            const narratesChecked = isNarratorCard || config.narrates === true;
 
             return `
                 <div class="card voice-card mb-3" data-voice="${safeName}" data-line-count="${lineCount}" data-suggested-sample="${escapeHtml(voice.suggested_sample_text || '')}">
@@ -211,7 +213,11 @@
                             <div class="col-md-3">
                                 <h5 class="card-title voice-primary-content d-flex flex-wrap align-items-center gap-2">
                                     <span>${safeName}</span>
-                                    <span class="badge text-bg-secondary">${lineLabel}</span>
+                                    <span class="badge text-bg-secondary" style="cursor:pointer;" title="Jump to first line in Editor" onclick="jumpToFirstChunkForVoice('${safeName}')">${lineLabel}</span>
+                                    <div class="form-check form-check-inline mb-0">
+                                        <input class="form-check-input voice-narrates" type="checkbox" id="narrates_${index}" ${narratesChecked ? 'checked' : ''} ${isNarratorCard ? 'disabled' : ''} onchange="debouncedSaveVoices()">
+                                        <label class="form-check-label small" for="narrates_${index}">Narrates</label>
+                                    </div>
                                 </h5>
                                 <div class="voice-alias-box mt-2">
                                     <label class="form-label small text-muted mb-1">AKA</label>
@@ -219,8 +225,8 @@
                                         type="text"
                                         class="form-control form-control-sm voice-alias-input"
                                         value="${safeAlias}"
+                                        title="Match another visible character name here to disable this row and reuse that voice."
                                     >
-                                    <div class="voice-alias-status form-text mb-0">Match another visible character name here to disable this row and reuse that voice.</div>
                                 </div>
                             </div>
                             <div class="col-md-9 voice-primary-content">
@@ -358,7 +364,6 @@
                                     </div>
                                     <input type="hidden" class="design-ref-audio" value="${config.ref_audio || ''}">
                                     <input type="hidden" class="design-generated-ref-text" value="${config.generated_ref_text || ''}">
-                                    <span class="text-muted small">Generated once, then reused as a clone voice for all character lines.</span>
                                 </div>
                             </div>
                         </div>
@@ -398,6 +403,9 @@
             } catch (e) { /* ignore if no adapters */ }
 
             const voices = await API.get('/api/voices');
+            window._narratingVoicesCache = voices
+                .filter(v => (v.name || '').trim().toUpperCase() === 'NARRATOR' || v.config?.narrates === true)
+                .map(v => v.name);
             const container = document.getElementById('voices-list');
             if (voices.length === 0) {
                 container.innerHTML = '<div class="alert alert-info">No voices found. Generate a script first.</div>';
@@ -438,6 +446,8 @@
                 const name = card.dataset.voice;
                 const type = card.querySelector('.voice-type:checked').value;
                 const alias = (card.querySelector('.voice-alias-input')?.value || '').trim();
+                const narratesEl = card.querySelector('.voice-narrates');
+                const narrates = narratesEl ? narratesEl.checked : false;
 
                 if (type === 'custom') {
                     config[name] = {
@@ -445,6 +455,7 @@
                         voice: card.querySelector('.voice-select').value,
                         character_style: card.querySelector('.character-style').value,
                         alias,
+                        narrates,
                         seed: "-1"
                     };
                 } else if (type === 'clone') {
@@ -454,6 +465,7 @@
                         ref_audio: card.querySelector('.ref-audio').value,
                         generated_ref_text: '',
                         alias,
+                        narrates,
                         seed: "-1"
                     };
                 } else if (type === 'builtin_lora') {
@@ -465,6 +477,7 @@
                         adapter_path: adapterEntry?.adapter_path || '',
                         character_style: card.querySelector('.builtin-lora-style').value,
                         alias,
+                        narrates,
                         seed: "-1"
                     };
                 } else if (type === 'lora') {
@@ -476,6 +489,7 @@
                         adapter_path: adapterEntry?.adapter_path || (adapterId ? `lora_models/${adapterId}` : ''),
                         character_style: card.querySelector('.lora-character-style').value,
                         alias,
+                        narrates,
                         seed: "-1"
                     };
                 } else if (type === 'design') {
@@ -486,6 +500,7 @@
                         ref_audio: card.querySelector('.design-ref-audio').value,
                         generated_ref_text: card.querySelector('.design-generated-ref-text').value,
                         alias,
+                        narrates,
                         seed: "-1"
                     };
                 }
@@ -546,6 +561,7 @@
 
                     statusEl.innerHTML = '<i class="fas fa-check text-success me-1"></i>saved';
                     setTimeout(() => { statusEl.innerHTML = ''; }, 2000);
+                    window._narratingVoicesCache = null; // force refresh on next editor use
                     return result;
                 } catch (e) {
                     if (!String(e?.message || '').toLowerCase().includes('cancelled')) {

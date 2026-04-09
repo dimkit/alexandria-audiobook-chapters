@@ -494,6 +494,7 @@ class VoiceConfigItem(BaseModel):
     adapter_id: Optional[str] = None
     adapter_path: Optional[str] = None
     description: Optional[str] = ""  # voice description (for design type)
+    narrates: Optional[bool] = None  # True = this voice acts as a narrator
 
 class ChunkUpdate(BaseModel):
     text: Optional[str] = None

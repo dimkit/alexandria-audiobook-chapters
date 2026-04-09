@@ -503,7 +503,7 @@ async def upload_file(file: UploadFile = File(...)):
     try:
         source_document = load_source_document(file_path)
         source_type = source_document.get("type", "text")
-        if source_type == "epub":
+        if source_type in {"epub", "docx"}:
             chapter_count = len(source_document.get("chapters", []))
     except Exception as e:
         logger.warning("Source inspection failed for '%s': %s", file.filename, e)
@@ -514,6 +514,38 @@ async def upload_file(file: UploadFile = File(...)):
         "source_type": source_type,
         "chapter_count": chapter_count,
     }
+
+
+@router.get("/api/narrator_overrides")
+async def get_narrator_overrides():
+    return project_manager.get_narrator_overrides()
+
+
+class NarratorOverrideRequest(BaseModel):
+    chapter: str
+    voice: str
+    invalidate_audio: bool = False
+
+
+@router.post("/api/narrator_overrides")
+async def set_narrator_override(request: NarratorOverrideRequest):
+    project_manager.set_narrator_override(request.chapter, request.voice)
+    invalidated_clips = 0
+    deleted_files = 0
+    if request.invalidate_audio:
+        chunks = project_manager.load_chunks()
+        narrator_norm = project_manager._normalize_speaker_name("NARRATOR")
+        affected = [
+            i for i, c in enumerate(chunks)
+            if project_manager._normalize_speaker_name(c.get("speaker", "")) == narrator_norm
+            and (c.get("chapter") or "").strip() == request.chapter
+            and c.get("audio_path")
+        ]
+        if affected:
+            result = project_manager.invalidate_chunk_audio_indices(affected)
+            invalidated_clips = result.get("invalidated_clips", 0)
+            deleted_files = result.get("deleted_files", 0)
+    return {"status": "saved", "invalidated_clips": invalidated_clips, "deleted_files": deleted_files}
 
 
 @router.get("/api/script_ingestion/preflight")

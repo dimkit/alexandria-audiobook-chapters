@@ -35,8 +35,8 @@
                              </select>
                          </div>
                          <div class="form-check form-switch mb-0">
-                             <input class="form-check-input" type="checkbox" id="editor-chapter-only" checked onchange="changeEditorScope()">
-                             <label class="form-check-label fw-semibold" for="editor-chapter-only">Chapter Only</label>
+                             <input class="form-check-input" type="checkbox" id="editor-chapter-only" onchange="changeEditorScope()">
+                             <label class="form-check-label fw-semibold" for="editor-chapter-only" id="editor-chapter-only-label">Generate Book</label>
                          </div>
                          <button class="btn btn-outline-danger btn-sm" onclick="deleteChapter()" id="btn-delete-chapter" title="Delete entire chapter and all its clips" style="display:none;">
                              <i class="fas fa-book-dead me-1"></i>Delete Chapter
@@ -47,6 +47,10 @@
                          <button class="btn btn-outline-secondary btn-sm" id="btn-advanced-controls" onclick="toggleAdvancedControls()">
                              <i class="fas fa-sliders-h me-1"></i>Advanced Controls
                          </button>
+                         <div id="narrator-selector-group" class="d-flex align-items-center gap-2" style="display:none;">
+                             <label class="form-label mb-0 fw-semibold small">Narrator</label>
+                             <select id="editor-narrator-select" class="form-select form-select-sm" style="min-width: 150px;" onchange="onNarratorSelectorChange()"></select>
+                         </div>
                          <div id="legacy-only-buttons" style="display:none; gap:0.5rem;">
                              <button class="btn btn-outline-primary btn-sm" id="btn-merge-orphans" onclick="mergeOrphans()">
                                  <i class="fas fa-compress-alt me-1"></i>Merge Orphans
