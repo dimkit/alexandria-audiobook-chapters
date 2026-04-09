@@ -9,12 +9,18 @@
                     exportConfig = await window.persistExportConfigFromUI();
                 }
                 await API.post('/api/export_audacity', { export: exportConfig || undefined });
+                if (window.setNavTaskSpinner) {
+                    window.setNavTaskSpinner('audio');
+                }
 
                 const poll = setInterval(async () => {
                     try {
                         const status = await API.get('/api/status/audacity_export');
                         if (!status.running) {
                             clearInterval(poll);
+                            if (window.releaseNavTaskSpinner) {
+                                window.releaseNavTaskSpinner('audio');
+                            }
                             if (status.logs.some(l => l.includes("complete"))) {
                                 statusEl.innerHTML = '<span class="text-success"><i class="fas fa-check me-1"></i>Done!</span>';
                                 // Auto-download the zip
@@ -32,10 +38,16 @@
                         }
                     } catch (e) {
                         clearInterval(poll);
+                        if (window.releaseNavTaskSpinner) {
+                            window.releaseNavTaskSpinner('audio');
+                        }
                         statusEl.innerHTML = `<span class="text-danger">Poll error: ${e.message}</span>`;
                     }
                 }, 1000);
             } catch (e) {
+                if (window.releaseNavTaskSpinner) {
+                    window.releaseNavTaskSpinner('audio');
+                }
                 statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${e.message}</span>`;
             }
         };
@@ -77,12 +89,18 @@
                     description: document.getElementById('m4b-description').value,
                     export: exportConfig || undefined
                 });
+                if (window.setNavTaskSpinner) {
+                    window.setNavTaskSpinner('audio');
+                }
 
                 const poll = setInterval(async () => {
                     try {
                         const status = await API.get('/api/status/m4b_export');
                         if (!status.running) {
                             clearInterval(poll);
+                            if (window.releaseNavTaskSpinner) {
+                                window.releaseNavTaskSpinner('audio');
+                            }
                             if (status.logs.some(l => l.includes("complete"))) {
                                 statusEl.innerHTML = '<span class="text-success"><i class="fas fa-check me-1"></i>Done!</span>';
                                 const a = document.createElement('a');
@@ -99,10 +117,16 @@
                         }
                     } catch (e) {
                         clearInterval(poll);
+                        if (window.releaseNavTaskSpinner) {
+                            window.releaseNavTaskSpinner('audio');
+                        }
                         statusEl.innerHTML = `<span class="text-danger">Poll error: ${e.message}</span>`;
                     }
                 }, 1000);
             } catch (e) {
+                if (window.releaseNavTaskSpinner) {
+                    window.releaseNavTaskSpinner('audio');
+                }
                 statusEl.innerHTML = `<span class="text-danger"><i class="fas fa-times me-1"></i>${e.message}</span>`;
             }
         };

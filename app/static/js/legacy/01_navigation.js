@@ -1,6 +1,71 @@
         // --- Navigation ---
 
         const SCRIPT_GATED_TABS = ['voices', 'editor', 'proofread', 'audio'];
+        const NAV_TASK_TABS = new Set(['script', 'voices', 'editor', 'proofread', 'audio']);
+        let currentNavTaskTab = null;
+
+        function renderNavTaskSpinner(tab) {
+            currentNavTaskTab = NAV_TASK_TABS.has(tab) ? tab : null;
+            document.querySelectorAll('.nav-task-spinner').forEach(el => el.remove());
+            if (!currentNavTaskTab) return;
+            const link = document.querySelector(`.nav-link[data-tab="${currentNavTaskTab}"]`);
+            if (!link) return;
+            const spinner = document.createElement('span');
+            spinner.className = 'nav-task-spinner';
+            spinner.innerHTML = '<i class="fas fa-spinner fa-spin" aria-hidden="true"></i><span class="visually-hidden">Working</span>';
+            link.appendChild(spinner);
+        }
+
+        async function refreshNavTaskSpinner() {
+            try {
+                const res = await fetch('/api/nav_task');
+                if (!res.ok) return;
+                const state = await res.json();
+                renderNavTaskSpinner(state?.tab || null);
+            } catch (e) {
+                console.error('Failed to refresh navigation task spinner:', e);
+            }
+        }
+
+        window.setNavTaskSpinner = async function(tab) {
+            if (!NAV_TASK_TABS.has(tab)) return;
+            renderNavTaskSpinner(tab);
+            try {
+                const res = await fetch('/api/nav_task/set', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tab }),
+                });
+                if (!res.ok) throw new Error(res.statusText);
+                const state = await res.json();
+                renderNavTaskSpinner(state?.tab || tab);
+            } catch (e) {
+                console.error('Failed to set navigation task spinner:', e);
+            }
+        };
+
+        window.releaseNavTaskSpinner = async function(tab = null) {
+            if (tab && currentNavTaskTab && tab !== currentNavTaskTab) return;
+            if (!tab || tab === currentNavTaskTab) {
+                renderNavTaskSpinner(null);
+            }
+            try {
+                const res = await fetch('/api/nav_task/release', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tab }),
+                });
+                if (!res.ok) throw new Error(res.statusText);
+                const state = await res.json();
+                renderNavTaskSpinner(state?.tab || null);
+            } catch (e) {
+                console.error('Failed to release navigation task spinner:', e);
+            }
+        };
+        window.getNavTaskSpinnerTab = () => currentNavTaskTab;
+        window.refreshNavTaskSpinner = refreshNavTaskSpinner;
+
+        refreshNavTaskSpinner();
 
         function updateDictionaryNavVisibility(scriptReady) {
             const dictionaryNavItem = document.getElementById('dictionary-nav-item');

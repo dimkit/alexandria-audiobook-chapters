@@ -7,6 +7,7 @@
 
         let _voiceSettingsSaveTimer = null;
         let _voicesListResizeBound = false;
+        let _bulkVoiceGenerationActive = false;
 
         function layoutVoicesListContainer() {
             const list = document.getElementById('voices-list');
@@ -677,6 +678,9 @@
             btn.disabled = true;
             btn.textContent = loaded ? 'Retrying...' : 'Generating...';
             try {
+                if (!_bulkVoiceGenerationActive && window.setNavTaskSpinner) {
+                    window.setNavTaskSpinner('voices');
+                }
                 let sampleText = sampleTextInput.value.trim();
                 if (!sampleText) {
                     sampleText = card.closest('.voice-card')?.dataset.suggestedSample || '';
@@ -720,6 +724,9 @@
                 const activeCard = btn.closest('.card-body');
                 const hasAudio = Boolean((activeCard.querySelector('.design-ref-audio')?.value || '').trim());
                 syncDesignVoiceRow(activeCard, { loaded: hasAudio, refAudio: activeCard.querySelector('.design-ref-audio')?.value || '' });
+                if (!_bulkVoiceGenerationActive && window.releaseNavTaskSpinner) {
+                    window.releaseNavTaskSpinner('voices');
+                }
             }
         };
 
@@ -811,7 +818,11 @@
 
             bulkBtn.disabled = true;
             const originalText = bulkBtn.textContent;
+            _bulkVoiceGenerationActive = true;
             try {
+                if (window.setNavTaskSpinner) {
+                    window.setNavTaskSpinner('voices');
+                }
                 let generatedCount = 0;
                 const failedSpeakers = [];
                 for (let i = 0; i < eligibleSpeakers.length; i += 1) {
@@ -873,8 +884,12 @@
                     showToast(`Created ${generatedCount} outstanding voice${generatedCount === 1 ? '' : 's'}.`, 'success');
                 }
             } finally {
+                _bulkVoiceGenerationActive = false;
                 bulkBtn.disabled = false;
                 bulkBtn.textContent = originalText;
+                if (window.releaseNavTaskSpinner) {
+                    window.releaseNavTaskSpinner('voices');
+                }
             }
         };
 

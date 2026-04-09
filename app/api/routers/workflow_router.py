@@ -5,14 +5,32 @@ globals().update({k: v for k, v in vars(_shared).items() if not k.startswith("__
 
 router = APIRouter()
 
+class NavTaskRequest(BaseModel):
+    tab: Optional[str] = None
+
 def _ensure_new_mode_workflow_inactive(conflict_message: str = "Cannot run this step while Process Script is active. Pause or wait for new-mode workflow first."):
     state = process_state.get("new_mode_workflow") or {}
     if bool(state.get("running")) or bool(state.get("paused")):
         raise HTTPException(status_code=409, detail=conflict_message)
 
+@router.get("/api/nav_task")
+async def get_nav_task():
+    return _get_nav_task_state()
+
+@router.post("/api/nav_task/set")
+async def set_nav_task(request: NavTaskRequest):
+    if not request.tab:
+        raise HTTPException(status_code=400, detail="Missing navigation task tab")
+    return _set_nav_task_tab(request.tab)
+
+@router.post("/api/nav_task/release")
+async def release_nav_task(request: NavTaskRequest = NavTaskRequest()):
+    return _release_nav_task_tab(request.tab)
+
 @router.post("/api/reset_project")
 async def reset_project():
     global audio_current_job, audio_recovery_request
+    _release_nav_task_tab()
     # Hard-stop everything before nuking project artifacts.
     with task_state_lock:
         for task_name, process in list(task_processes.items()):

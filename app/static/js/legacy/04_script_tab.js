@@ -196,11 +196,21 @@
                 document.getElementById('script-logs').innerText = status.logs.join('\n');
             }
             const isActive = !!status.running || !!status.paused;
+            if (status.running && window.setNavTaskSpinner) {
+                window.setNavTaskSpinner('script');
+            } else if (!status.running && window.releaseNavTaskSpinner) {
+                window.releaseNavTaskSpinner('script');
+            }
             if (isActive && !processingWorkflowPollTimer) {
                 processingWorkflowPollTimer = setInterval(async () => {
                     try {
                         const current = await API.get('/api/status/processing_workflow');
                         renderProcessingWorkflowStatus(current);
+                        if (current.running && window.setNavTaskSpinner) {
+                            window.setNavTaskSpinner('script');
+                        } else if (!current.running && window.releaseNavTaskSpinner) {
+                            window.releaseNavTaskSpinner('script');
+                        }
                         const currentTaskName = workflowStageTaskNames[current.current_stage] || null;
                         if (current.running && currentTaskName) {
                             try {

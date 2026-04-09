@@ -13,6 +13,20 @@
             audio: 'audio-logs',
             lora_training: 'lora-train-logs',
         };
+        const taskNavTabs = {
+            script: 'script',
+            review: 'script',
+            sanity: 'script',
+            repair: 'script',
+            process_paragraphs: 'script',
+            assign_dialogue: 'script',
+            extract_temperament: 'script',
+            create_script: 'script',
+            new_mode_workflow: 'script',
+            voices: 'voices',
+            proofread: 'proofread',
+            audio: 'audio',
+        };
         const activeTaskPolls = new Map();
         const handledTaskCompletions = new Set();
         const taskCompletionStorage = (() => {
@@ -161,7 +175,12 @@
             }
         }
 
-        async function pollLogs(taskName, elementId) {
+        async function pollLogs(taskName, elementId, navTab) {
+            const resolvedNavTab = navTab === false ? null : (navTab || taskNavTabs[taskName] || null);
+            if (resolvedNavTab && window.setNavTaskSpinner) {
+                window.setNavTaskSpinner(resolvedNavTab);
+            }
+
             const existing = activeTaskPolls.get(taskName);
             if (existing && existing.elementId === elementId) {
                 return existing.promise;
@@ -178,12 +197,18 @@
                             if (interval) clearInterval(interval);
                             activeTaskPolls.delete(taskName);
                             finalizeTaskStatus(taskName, status);
+                            if (resolvedNavTab && window.releaseNavTaskSpinner) {
+                                window.releaseNavTaskSpinner(resolvedNavTab);
+                            }
                             resolve(status);
                         }
                     } catch (e) {
                         console.error("Poll error", e);
                         if (interval) clearInterval(interval);
                         activeTaskPolls.delete(taskName);
+                        if (resolvedNavTab && window.releaseNavTaskSpinner) {
+                            window.releaseNavTaskSpinner(resolvedNavTab);
+                        }
                         reject(e);
                     }
                 };
@@ -194,6 +219,7 @@
 
             activeTaskPolls.set(taskName, {
                 elementId,
+                navTab: resolvedNavTab,
                 promise,
             });
 
@@ -227,7 +253,8 @@
                     const status = await API.get(`/api/status/${taskName}`);
                     renderTaskLogs(taskName, status, elementId);
                     if (status.running) {
-                        pollLogs(taskName, elementId).catch(err => {
+                        const hasNavTask = Boolean(window.getNavTaskSpinnerTab && window.getNavTaskSpinnerTab());
+                        pollLogs(taskName, elementId, hasNavTask ? false : undefined).catch(err => {
                             console.error(`Polling failed for ${taskName}`, err);
                         });
                     } else {

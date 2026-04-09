@@ -1330,9 +1330,15 @@
                 const audioState = await refreshAudioQueueUI();
                 await loadChunks(false);
                 const hasAudioWork = Boolean(audioState?.running) || (audioState?.queue || []).length > 0;
+                if (hasAudioWork && window.setNavTaskSpinner && !window.getNavTaskSpinnerTab?.()) {
+                    window.setNavTaskSpinner('editor');
+                }
                 if (!hasAudioWork && audioQueuePollTimer) {
                     clearInterval(audioQueuePollTimer);
                     audioQueuePollTimer = null;
+                    if (window.releaseNavTaskSpinner) {
+                        window.releaseNavTaskSpinner('editor');
+                    }
                 }
                 // Auto Proofread: trigger every 25 completed clips while audio is running
                 if (autoProofreadEnabled && audioState?.running) {
@@ -2308,6 +2314,9 @@
                 } catch (e) { console.error('Cancel error:', e); }
             }
             await refreshAudioQueueUI().catch(err => console.error('Audio queue refresh error', err));
+            if (window.releaseNavTaskSpinner) {
+                window.releaseNavTaskSpinner('editor');
+            }
         };
 
         window.startRender = (regenerateAll = false) => {
@@ -2353,12 +2362,18 @@
                     label: regenerateAll ? `Regenerate ${getActionScopeLabel()}` : `Render pending in ${getActionScopeLabel()}`,
                     scope: getActionScopeLabel()
                 });
+                if (window.setNavTaskSpinner) {
+                    window.setNavTaskSpinner('editor');
+                }
                 console.log(`Batch generation queued: ${response.total_chunks} chunks with ${response.workers} workers`);
                 showToast(`Queued job #${response.job_id} for ${response.total_chunks} segment${response.total_chunks === 1 ? '' : 's'}.`, 'success');
                 ensureAudioQueuePolling();
 
             } catch (e) {
                 console.error("Render All error:", e);
+                if (window.releaseNavTaskSpinner) {
+                    window.releaseNavTaskSpinner('editor');
+                }
                 showToast("Error during batch rendering: " + e.message, 'error');
             }
         };
@@ -2392,12 +2407,18 @@
                     label: regenerateAll ? `Batch regenerate ${getActionScopeLabel()}` : `Batch render pending in ${getActionScopeLabel()}`,
                     scope: getActionScopeLabel()
                 });
+                if (window.setNavTaskSpinner) {
+                    window.setNavTaskSpinner('editor');
+                }
                 console.log(`Fast batch queued: ${response.total_chunks} chunks (batch_size=${response.batch_size}, seed=${response.batch_seed})`);
                 showToast(`Queued fast job #${response.job_id} for ${response.total_chunks} segment${response.total_chunks === 1 ? '' : 's'}.`, 'success');
                 ensureAudioQueuePolling();
 
             } catch (e) {
                 console.error("Batch Fast error:", e);
+                if (window.releaseNavTaskSpinner) {
+                    window.releaseNavTaskSpinner('editor');
+                }
                 showToast("Error during batch rendering: " + e.message, 'error');
             }
         };
