@@ -111,11 +111,11 @@
         @media (max-width: 922px) {
             .container-wide {
                 max-width: none;
-                width: 100%;
-                margin-left: 0;
-                margin-right: 0;
-                padding-left: 0;
-                padding-right: 0;
+                width: auto;
+                margin-left: max(0px, calc((100% - 674px) / 2));
+                margin-right: max(0px, calc((100% - 674px) / 2));
+                padding-left: clamp(0px, calc((100% - 650px) / 2), 12px);
+                padding-right: clamp(0px, calc((100% - 650px) / 2), 12px);
             }
         }
         .tab-content > .card:last-child { margin-bottom: 0; }
