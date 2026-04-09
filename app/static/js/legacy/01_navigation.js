@@ -2,7 +2,14 @@
 
         const SCRIPT_GATED_TABS = ['voices', 'editor', 'proofread', 'audio'];
 
+        function updateDictionaryNavVisibility(scriptReady) {
+            const dictionaryNavItem = document.getElementById('dictionary-nav-item');
+            if (!dictionaryNavItem) return;
+            dictionaryNavItem.style.display = scriptReady ? '' : 'none';
+        }
+
         window.updatePipelineTabLocks = function(isLegacy, scriptReady) {
+            updateDictionaryNavVisibility(scriptReady);
             SCRIPT_GATED_TABS.forEach(tab => {
                 const link = document.querySelector(`.nav-link[data-tab="${tab}"]`);
                 if (!link) return;
