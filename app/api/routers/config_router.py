@@ -116,6 +116,9 @@ async def read_index():
 
 @router.get("/favicon.ico")
 async def read_favicon():
+    favicon_path = os.path.join(ROOT_DIR, "favicon.ico")
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path, media_type="image/x-icon")
     favicon_path = os.path.join(ROOT_DIR, "icon.png")
     if os.path.exists(favicon_path):
         return FileResponse(favicon_path, media_type="image/png")

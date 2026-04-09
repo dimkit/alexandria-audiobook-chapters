@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="64" y="64" width="896" height="896" rx="220" fill="#0A1F5C"/>
+
+  <!-- Headband -->
+  <path d="M286 446C286 321.184 387.184 220 512 220C636.816 220 738 321.184 738 446" 
+        stroke="white" stroke-width="42" stroke-linecap="round"/>
+
+  <!-- Earpads -->
+  <rect x="242" y="436" width="84" height="196" rx="42" fill="white"/>
+  <rect x="698" y="436" width="84" height="196" rx="42" fill="white"/>
+
+  <!-- Open book -->
+  <path d="M512 670C470 624 395 598 304 598V714C389 714 462 741 512 786V670Z" fill="white"/>
+  <path d="M512 670C554 624 629 598 720 598V714C635 714 562 741 512 786V670Z" fill="white"/>
+
+  <!-- Book base curves -->
+  <path d="M286 747C390 747 465 778 512 824" stroke="white" stroke-width="18" stroke-linecap="round"/>
+  <path d="M738 747C634 747 559 778 512 824" stroke="white" stroke-width="18" stroke-linecap="round"/>
+
+  <!-- Audio waveform -->
+  <rect x="426" y="392" width="24" height="92" rx="12" fill="white"/>
+  <rect x="470" y="350" width="24" height="176" rx="12" fill="white"/>
+  <rect x="515" y="314" width="24" height="248" rx="12" fill="white"/>
+  <rect x="560" y="350" width="24" height="176" rx="12" fill="white"/>
+  <rect x="604" y="392" width="24" height="92" rx="12" fill="white"/>
+</svg>
