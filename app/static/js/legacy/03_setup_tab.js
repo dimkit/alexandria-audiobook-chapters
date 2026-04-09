@@ -40,6 +40,120 @@
             return Number.isNaN(value) ? fallback : value;
         }
 
+        let _llmToolCapabilityCache = null;
+        let _llmToolCapabilityTimer = null;
+        let _llmToolCapabilityRequestId = 0;
+
+        function _getLLMToolCapabilityElements() {
+            return {
+                status: document.getElementById('llm-tool-capability-status'),
+                model: document.getElementById('llm-model'),
+                url: document.getElementById('llm-url'),
+                key: document.getElementById('llm-key'),
+                legacy: document.getElementById('legacy-mode-toggle')
+            };
+        }
+
+        function _renderLLMToolCapabilityStatus(state, message = '') {
+            const { status } = _getLLMToolCapabilityElements();
+            if (!status) return;
+            status.title = message || '';
+            status.setAttribute('aria-label', message || state || 'Tool calling verification');
+            status.className = 'llm-tool-capability-status';
+            if (!state || state === 'hidden') {
+                status.style.display = 'none';
+                status.innerHTML = '';
+                return;
+            }
+            status.style.display = '';
+            if (state === 'checking') {
+                status.classList.add('text-muted');
+                status.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            } else if (state === 'supported') {
+                status.classList.add('text-success');
+                status.innerHTML = '<i class="fas fa-check-circle"></i>';
+            } else if (state === 'unsupported') {
+                status.classList.add('text-danger');
+                status.innerHTML = '<i class="fas fa-times-circle"></i>';
+            } else {
+                status.classList.add('text-warning');
+                status.innerHTML = '<i class="fas fa-question-circle"></i>';
+            }
+        }
+
+        function _clearLLMToolCapabilityCache() {
+            _llmToolCapabilityCache = null;
+            _llmToolCapabilityRequestId += 1;
+            if (_llmToolCapabilityTimer) {
+                clearTimeout(_llmToolCapabilityTimer);
+                _llmToolCapabilityTimer = null;
+            }
+        }
+
+        async function _verifyLLMToolCapabilityNow() {
+            const { model, url, key, legacy } = _getLLMToolCapabilityElements();
+            if (!model || !url || !key) return;
+            if (legacy?.checked) {
+                _renderLLMToolCapabilityStatus('hidden');
+                return;
+            }
+            const modelName = model.value.trim();
+            if (!modelName) {
+                _renderLLMToolCapabilityStatus('hidden');
+                return;
+            }
+            if (_llmToolCapabilityCache) {
+                _renderLLMToolCapabilityStatus(_llmToolCapabilityCache.status, _llmToolCapabilityCache.message);
+                return;
+            }
+            const requestId = ++_llmToolCapabilityRequestId;
+            _renderLLMToolCapabilityStatus('checking', 'Checking tool calling support...');
+            let result;
+            try {
+                result = await API.post('/api/config/verify_tool_capability', {
+                    base_url: url.value,
+                    api_key: key.value,
+                    model_name: modelName
+                });
+            } catch (e) {
+                result = {
+                    status: 'unknown',
+                    message: `Could not verify tool calling support: ${e?.message || e}`
+                };
+            }
+            if (requestId !== _llmToolCapabilityRequestId) return;
+            const status = ['supported', 'unsupported', 'unknown'].includes(result?.status)
+                ? result.status
+                : 'unknown';
+            _llmToolCapabilityCache = {
+                status,
+                message: result?.message || 'Tool calling support could not be verified.',
+                warned: false
+            };
+            _renderLLMToolCapabilityStatus(_llmToolCapabilityCache.status, _llmToolCapabilityCache.message);
+            if (_llmToolCapabilityCache.status === 'unsupported' && !_llmToolCapabilityCache.warned) {
+                _llmToolCapabilityCache.warned = true;
+                showToast('Tool calling ability is required for models to process text. Switch to a tool-capable model.', 'warning', 7000);
+            }
+        }
+
+        function scheduleLLMToolCapabilityVerification(delayMs = 450) {
+            const { legacy, model } = _getLLMToolCapabilityElements();
+            if (legacy?.checked || !model?.value.trim()) {
+                _renderLLMToolCapabilityStatus('hidden');
+                return;
+            }
+            if (_llmToolCapabilityCache) {
+                _renderLLMToolCapabilityStatus(_llmToolCapabilityCache.status, _llmToolCapabilityCache.message);
+                return;
+            }
+            if (_llmToolCapabilityTimer) clearTimeout(_llmToolCapabilityTimer);
+            _llmToolCapabilityTimer = setTimeout(() => {
+                _llmToolCapabilityTimer = null;
+                _verifyLLMToolCapabilityNow();
+            }, delayMs);
+        }
+
         function collectExportConfigFromUI() {
             return {
                 silence_between_speakers_ms: parseIntOrDefault('silence-between-speakers', 500),
@@ -328,6 +442,7 @@
                 console.error("Failed to load config", e);
             }
             _setupAutoSaveEnabled = true;
+            scheduleLLMToolCapabilityVerification(100);
         }
 
         // Reset prompts and generation settings to factory defaults
@@ -560,6 +675,30 @@
             }
         }
         wireSetupConfigAutoSave();
+
+        function wireLLMToolCapabilityVerification() {
+            const { model, legacy } = _getLLMToolCapabilityElements();
+            if (model && model.dataset.toolCapabilityBound !== '1') {
+                model.dataset.toolCapabilityBound = '1';
+                model.addEventListener('input', () => {
+                    _clearLLMToolCapabilityCache();
+                    _renderLLMToolCapabilityStatus('hidden');
+                    scheduleLLMToolCapabilityVerification(650);
+                });
+                model.addEventListener('blur', () => scheduleLLMToolCapabilityVerification(0));
+            }
+            if (legacy && legacy.dataset.toolCapabilityBound !== '1') {
+                legacy.dataset.toolCapabilityBound = '1';
+                legacy.addEventListener('change', () => {
+                    if (legacy.checked) {
+                        _renderLLMToolCapabilityStatus('hidden');
+                    } else {
+                        scheduleLLMToolCapabilityVerification(100);
+                    }
+                });
+            }
+        }
+        wireLLMToolCapabilityVerification();
 
         // Prevent form submission (Enter key in text fields)
         document.getElementById('config-form').addEventListener('submit', (e) => {

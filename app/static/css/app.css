@@ -221,6 +221,18 @@
         textarea.form-control::placeholder {
             color: var(--app-muted);
         }
+        .llm-tool-capability-status {
+            position: absolute;
+            top: 50%;
+            right: 0.85rem;
+            transform: translateY(-50%);
+            pointer-events: auto;
+            font-size: 0.95rem;
+            line-height: 1;
+        }
+        .llm-tool-capability-status.text-muted {
+            color: var(--app-muted) !important;
+        }
         .form-check-input {
             background-color: var(--app-input-bg);
             border-color: var(--app-input-border);

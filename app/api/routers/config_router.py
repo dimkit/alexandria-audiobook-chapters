@@ -1,3 +1,7 @@
+import asyncio
+from urllib.parse import urlparse
+
+import requests
 from fastapi import APIRouter
 from .. import shared as _shared
 from factory_prompt_defaults import load_factory_default_prompts
@@ -13,6 +17,129 @@ _ATTRIBUTION_PROMPTS_PATH = os.path.join(ROOT_DIR, "attribution_prompts.txt")
 _VOICE_PROMPT_PATH = os.path.join(ROOT_DIR, "voice_prompt.txt")
 _DIALOGUE_PROMPT_PATH = os.path.join(ROOT_DIR, "dialogue_identification_system_prompt.txt")
 _TEMPERAMENT_PROMPT_PATH = os.path.join(ROOT_DIR, "temperament_extraction_system_prompt.txt")
+_TOOL_CAPABILITY_TIMEOUT_SECONDS = 5
+
+
+class ToolCapabilityRequest(BaseModel):
+    base_url: str
+    api_key: str = ""
+    model_name: str
+
+
+def _tool_capability_result(status: str, provider: str, message: str):
+    return {
+        "status": status,
+        "supported": status == "supported",
+        "provider": provider,
+        "message": message,
+    }
+
+
+def _auth_headers(api_key: str):
+    key = (api_key or "").strip()
+    if not key or key.lower() == "local":
+        return {}
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _request_json(url: str, api_key: str):
+    headers = _auth_headers(api_key)
+    response = requests.get(url, headers=headers, timeout=_TOOL_CAPABILITY_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    return response.json()
+
+
+def _is_openrouter_url(base_url: str) -> bool:
+    try:
+        return "openrouter.ai" in (urlparse(base_url).netloc or "").lower()
+    except ValueError:
+        return False
+
+
+def _normalize_lm_studio_origin(base_url: str) -> str:
+    raw = (base_url or "").strip().rstrip("/")
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _model_name_matches_lm_studio(model: dict, model_name: str) -> bool:
+    wanted = (model_name or "").strip()
+    if not wanted:
+        return False
+    candidates = {
+        str(model.get("key") or "").strip(),
+        str(model.get("display_name") or "").strip(),
+    }
+    for instance in model.get("loaded_instances") or []:
+        if isinstance(instance, dict):
+            candidates.add(str(instance.get("id") or "").strip())
+    return wanted in candidates
+
+
+def _verify_openrouter_tool_capability(base_url: str, api_key: str, model_name: str):
+    model = (model_name or "").strip()
+    if not model:
+        return _tool_capability_result("unknown", "openrouter", "Enter a model name to verify tool calling.")
+
+    try:
+        payload = _request_json("https://openrouter.ai/api/v1/models?supported_parameters=tools", api_key)
+        models = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return _tool_capability_result("unknown", "openrouter", "OpenRouter returned an unexpected model list.")
+        tool_models = {
+            str(item.get("id") or "").strip()
+            for item in models
+            if isinstance(item, dict)
+        }
+        if model in tool_models:
+            return _tool_capability_result("supported", "openrouter", "This OpenRouter model supports tool calling.")
+        return _tool_capability_result(
+            "unsupported",
+            "openrouter",
+            "OpenRouter does not list this model as supporting tool calling.",
+        )
+    except Exception as exc:
+        return _tool_capability_result("unknown", "openrouter", f"Could not verify OpenRouter model: {exc}")
+
+
+def _verify_lm_studio_tool_capability(base_url: str, api_key: str, model_name: str):
+    model = (model_name or "").strip()
+    if not model:
+        return _tool_capability_result("unknown", "lmstudio", "Enter a model name to verify tool calling.")
+
+    origin = _normalize_lm_studio_origin(base_url)
+    if not origin:
+        return _tool_capability_result("unknown", "lmstudio", "Enter an LM Studio base URL to verify tool calling.")
+
+    try:
+        payload = _request_json(f"{origin}/api/v1/models", api_key)
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return _tool_capability_result("unknown", "lmstudio", "LM Studio returned an unexpected model list.")
+        for item in models:
+            if not isinstance(item, dict) or not _model_name_matches_lm_studio(item, model):
+                continue
+            capabilities = item.get("capabilities") or {}
+            if capabilities.get("trained_for_tool_use") is True:
+                return _tool_capability_result("supported", "lmstudio", "This LM Studio model is trained for tool use.")
+            if capabilities.get("trained_for_tool_use") is False:
+                return _tool_capability_result(
+                    "unsupported",
+                    "lmstudio",
+                    "LM Studio reports this model is not trained for tool use.",
+                )
+            return _tool_capability_result("unknown", "lmstudio", "LM Studio did not report tool-use capability for this model.")
+        return _tool_capability_result("unknown", "lmstudio", "LM Studio did not return a matching model.")
+    except Exception as exc:
+        return _tool_capability_result("unknown", "lmstudio", f"Could not verify LM Studio model: {exc}")
+
+
+def verify_tool_capability(base_url: str, api_key: str, model_name: str):
+    if _is_openrouter_url(base_url):
+        return _verify_openrouter_tool_capability(base_url, api_key, model_name)
+    return _verify_lm_studio_tool_capability(base_url, api_key, model_name)
 
 
 def _write_prompt_pair(path: str, system_prompt: str, user_prompt: str):
@@ -508,6 +635,16 @@ async def save_preferences(update: PreferencesUpdate):
         json.dump(existing_config, f, indent=2, ensure_ascii=False)
 
     return {"status": "saved"}
+
+
+@router.post("/api/config/verify_tool_capability")
+async def verify_model_tool_capability(request: ToolCapabilityRequest):
+    return await asyncio.to_thread(
+        verify_tool_capability,
+        request.base_url,
+        request.api_key,
+        request.model_name,
+    )
 
 @router.post("/api/generation_mode_lock")
 async def set_generation_mode_lock(update: GenerationModeLockUpdate):

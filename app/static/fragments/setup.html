@@ -20,7 +20,10 @@
                         <div class="row mb-3">
                             <div class="col-md-6">
                                 <label class="form-label">Model Name</label>
-                                <input type="text" class="form-control" id="llm-model" placeholder="local-model">
+                                <div class="position-relative">
+                                    <input type="text" class="form-control pe-5" id="llm-model" placeholder="local-model">
+                                    <span id="llm-tool-capability-status" class="llm-tool-capability-status" title="" aria-live="polite" style="display:none;"></span>
+                                </div>
                             </div>
                             <div class="col-md-3">
                                 <label class="form-label" title="Number of parallel LLM requests during script generation steps">LLM Workers</label>
