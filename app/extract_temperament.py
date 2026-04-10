@@ -28,6 +28,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
+from stdio_utils import configure_utf8_stdio
+
+configure_utf8_stdio()
 
 TASK_PROGRESS_PREFIX = "__TASK_PROGRESS__:"
 
@@ -258,6 +261,8 @@ def main():
     tone_errors: list[str] = []
     dialogue_mood_errors: list[str] = []
 
+    _checkpoint_write(paragraphs_path, paragraphs_doc, complete=False)
+
     # ══════════════════════════════════════════════════════════════════════════
     # PASS 1 — Narrator tone for narration-only paragraphs
     # ══════════════════════════════════════════════════════════════════════════
@@ -312,8 +317,7 @@ def main():
             if done1[0] % 10 == 0 or done1[0] == total1:
                 eta = _format_eta(pass1_start, done1[0], total1)
                 _progress(done1[0], total1, f"{_dots(done1[0], total1)} [Pass 1/3] Narrator tone: {done1[0]}/{total1}{eta}...")
-            if done1[0] % 10 == 0:
-                _atomic_write(paragraphs_path, paragraphs_doc)
+            _checkpoint_write(paragraphs_path, paragraphs_doc, complete=False)
 
     if total1 > 0:
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -322,7 +326,7 @@ def main():
                 future.result()
 
     _log(f"[Pass 1/3] Done. {total1 - len(tone_errors)}/{total1} succeeded.")
-    _atomic_write(paragraphs_path, paragraphs_doc)
+    _checkpoint_write(paragraphs_path, paragraphs_doc, complete=False)
 
     # ══════════════════════════════════════════════════════════════════════════
     # PASS 2 — Narrator tone for dialogue paragraphs (dialogue stripped out)
@@ -379,8 +383,7 @@ def main():
             if done2[0] % 10 == 0 or done2[0] == total2:
                 eta = _format_eta(pass2_start, done2[0], total2)
                 _progress(done2[0], total2, f"{_dots(done2[0], total2)} [Pass 2/3] Narrator tone (dialogue): {done2[0]}/{total2}{eta}...")
-            if done2[0] % 10 == 0:
-                _atomic_write(paragraphs_path, paragraphs_doc)
+            _checkpoint_write(paragraphs_path, paragraphs_doc, complete=False)
 
     if total2 > 0:
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -389,7 +392,7 @@ def main():
                 future.result()
 
     _log(f"[Pass 2/3] Done. {total2 - sum(1 for e in tone_errors if e in [p['id'] for _, p in dialogue_paras_p2])}/{total2} succeeded.")
-    _atomic_write(paragraphs_path, paragraphs_doc)
+    _checkpoint_write(paragraphs_path, paragraphs_doc, complete=False)
 
     # ══════════════════════════════════════════════════════════════════════════
     # PASS 3 — Dialogue mood per individual quote in dialogue paragraphs
@@ -428,8 +431,7 @@ def main():
                 if done3[0] % 10 == 0 or done3[0] == total3:
                     eta = _format_eta(pass3_start, done3[0], total3)
                     _progress(done3[0], total3, f"{_dots(done3[0], total3)} [Pass 3/3] Dialogue mood: {done3[0]}/{total3}{eta}...")
-                if done3[0] % 10 == 0:
-                    _atomic_write(paragraphs_path, paragraphs_doc)
+                _checkpoint_write(paragraphs_path, paragraphs_doc, complete=False)
             return
 
         moods = []
@@ -488,8 +490,7 @@ def main():
             if done3[0] % 10 == 0 or done3[0] == total3:
                 eta = _format_eta(pass3_start, done3[0], total3)
                 _progress(done3[0], total3, f"[Pass 3/3] Dialogue mood: {done3[0]}/{total3}{eta}...")
-            if done3[0] % 10 == 0:
-                _atomic_write(paragraphs_path, paragraphs_doc)
+            _checkpoint_write(paragraphs_path, paragraphs_doc, complete=False)
 
     if total3 > 0:
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -501,10 +502,7 @@ def main():
     # Collect errors from all paragraphs (includes any carried over from prior runs).
     all_tone_errors = [p["id"] for p in paragraphs if p.get("temperament_error")]
     all_dialogue_mood_errors = [p["id"] for p in paragraphs if p.get("dialogue_mood_error")]
-    paragraphs_doc["temperament_extraction_complete"] = True
-    paragraphs_doc["temperament_errors"] = all_tone_errors
-    paragraphs_doc["dialogue_mood_errors"] = all_dialogue_mood_errors
-    _atomic_write(paragraphs_path, paragraphs_doc)
+    _checkpoint_write(paragraphs_path, paragraphs_doc, complete=True)
 
     _log(f"[Pass 3/3] Done. {total3 - len(dialogue_mood_errors)}/{total3} succeeded.")
     _log(
@@ -523,6 +521,18 @@ def _atomic_write(path: str, data: dict):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def _checkpoint_write(path: str, paragraphs_doc: dict, complete: bool):
+    paragraphs = paragraphs_doc.get("paragraphs", [])
+    paragraphs_doc["temperament_extraction_complete"] = complete
+    paragraphs_doc["temperament_errors"] = [
+        p["id"] for p in paragraphs if p.get("temperament_error")
+    ]
+    paragraphs_doc["dialogue_mood_errors"] = [
+        p["id"] for p in paragraphs if p.get("dialogue_mood_error")
+    ]
+    _atomic_write(path, paragraphs_doc)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,10 @@
 import json
 import sys
 
+from stdio_utils import configure_utf8_stdio
 from project import ProjectManager
 
+configure_utf8_stdio()
 
 TASK_PROGRESS_PREFIX = "__TASK_PROGRESS__:"
 

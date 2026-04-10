@@ -1009,7 +1009,7 @@ class ProjectManager:
             "json",
             path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
             return {"ok": False, "error": err[-500:] if err else f"ffprobe exit {result.returncode}"}
@@ -1148,6 +1148,8 @@ class ProjectManager:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
         stderr_lines = []
@@ -5733,7 +5735,7 @@ class ProjectManager:
                 "-movflags", "+faststart",
                 output_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
             if result.returncode != 0:
                 print(f"FFmpeg stderr: {result.stderr[-500:]}")
                 return False, f"FFmpeg failed (exit {result.returncode})"

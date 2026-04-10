@@ -3,6 +3,7 @@ import sys
 import json
 import re
 from openai import OpenAI
+from stdio_utils import configure_utf8_stdio
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
 from script_store import load_script_document, save_script_document
 from task_checkpoint import (
@@ -14,6 +15,7 @@ from task_checkpoint import (
 )
 from source_document import load_source_document
 
+configure_utf8_stdio()
 
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "script_generation_checkpoint.json")
 OUTPUT_PATH = os.path.join("..", "annotated_script.json")

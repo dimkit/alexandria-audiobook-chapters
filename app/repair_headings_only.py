@@ -2,8 +2,10 @@ import json
 import os
 import sys
 
+from stdio_utils import configure_utf8_stdio
 from script_repair import repair_chapter_headings_only
 
+configure_utf8_stdio()
 
 def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

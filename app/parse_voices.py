@@ -1,6 +1,9 @@
 import json
 import os
+from stdio_utils import configure_utf8_stdio
 from script_store import load_script_document
+
+configure_utf8_stdio()
 
 def main():
     input_path = "../annotated_script.json"

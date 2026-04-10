@@ -4,11 +4,13 @@ import json
 import re
 import argparse
 from openai import OpenAI
+from stdio_utils import configure_utf8_stdio
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from generate_script import clean_json_string, repair_json_array, salvage_json_entries
 from script_store import load_script_document, save_script_document
 from task_checkpoint import build_signature, clear_checkpoint, load_checkpoint, save_checkpoint
 
+configure_utf8_stdio()
 
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "script_review_checkpoint.json")
 

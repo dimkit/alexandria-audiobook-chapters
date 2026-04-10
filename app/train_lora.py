@@ -28,6 +28,9 @@ import sys
 import time
 import traceback
 
+from stdio_utils import configure_utf8_stdio
+
+configure_utf8_stdio()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LoRA fine-tuning for Qwen3-TTS Base model")

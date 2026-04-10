@@ -2820,11 +2820,16 @@ def run_process(command: List[str], task_name: str, run_id: str, relay_fn=None):
 
     try:
         env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONUNBUFFERED", "1")
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=BASE_DIR,
             bufsize=1,
             universal_newlines=True,

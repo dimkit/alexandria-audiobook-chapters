@@ -108,6 +108,8 @@ def _start_isolated_test_server():
     env = os.environ.copy()
     env["PINOKIO_SHARE_LOCAL"] = "false"
     env["PINOKIO_SHARE_LOCAL_PORT"] = str(port)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
 
     _SERVER_PROC = subprocess.Popen(
@@ -117,6 +119,8 @@ def _start_isolated_test_server():
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
     base_url = f"http://127.0.0.1:{port}"

@@ -29,6 +29,10 @@ import re
 import sys
 import uuid
 
+from stdio_utils import configure_utf8_stdio
+
+configure_utf8_stdio()
+
 TASK_PROGRESS_PREFIX = "__TASK_PROGRESS__:"
 
 # Matches straight (") or curly (\u201c / \u201d) double-quotes enclosing ≥2 chars.

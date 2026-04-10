@@ -2,8 +2,10 @@ import json
 import os
 import sys
 
+from stdio_utils import configure_utf8_stdio
 from project import ProjectManager
 
+configure_utf8_stdio()
 
 def main():
     if len(sys.argv) < 3:

@@ -8,6 +8,9 @@ module.exports = {
         env: {
           PINOKIO_SHARE_LOCAL: "{{envs.PINOKIO_SHARE_LOCAL}}",
           PINOKIO_SHARE_LOCAL_PORT: "{{envs.PINOKIO_SHARE_LOCAL_PORT}}",
+          PYTHONIOENCODING: "utf-8",
+          PYTHONUTF8: "1",
+          PYTHONUNBUFFERED: "1",
         },
         path: "app",
         message: "python app.py",

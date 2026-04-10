@@ -19,6 +19,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
+from stdio_utils import configure_utf8_stdio
+
+configure_utf8_stdio()
 
 TASK_PROGRESS_PREFIX = "__TASK_PROGRESS__:"
 

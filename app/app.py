@@ -1,6 +1,10 @@
 import functools
 import os
 import sys
+from stdio_utils import configure_utf8_stdio
+
+configure_utf8_stdio()
+
 import types
 import api.shared as _shared
 import api.routers.config_router as _config_router

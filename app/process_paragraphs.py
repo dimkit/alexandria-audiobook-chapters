@@ -12,7 +12,10 @@ import re
 import sys
 import time
 
+from stdio_utils import configure_utf8_stdio
 from source_document import load_source_document, iter_document_paragraphs
+
+configure_utf8_stdio()
 
 TASK_PROGRESS_PREFIX = "__TASK_PROGRESS__:"
 
