@@ -68,8 +68,8 @@ Transform a source script into a production-ready audiobook with an end-to-end p
 | **NVIDIA** | Linux | Full support | Driver 550+ (CUDA 12.8) | Flash attention + triton included |
 | **AMD** | Linux | Full support | ROCm 6.3 | ROCm optimizations applied automatically |
 | **AMD** | Windows | CPU only | N/A | GPU acceleration is not supported — the app runs in CPU mode. For GPU acceleration with AMD, use Linux |
-| **Apple Silicon** | macOS | Full Support | N/A | Auto-detects Apple Silicon and grabs MPS versions of Qwen3 files. No Flash attention. |
-| **Intel** | macOS | CPU only | N/A | Fuctional, barely. |
+| **Apple Silicon** | macOS | Full support | N/A | Auto-detects Apple Silicon and uses MPS-compatible Qwen3 assets. |
+| **Intel** | macOS | CPU only | N/A | Functional, but slow. |
 
 > **Note:** No external TTS server is required. Threadspeak includes a built-in Qwen3-TTS engine that loads models directly. Model weights are downloaded automatically on first use (~3.5 GB per model variant).
 
@@ -230,7 +230,8 @@ The final export workflow is run from the export tab:
 ## License
 
 MIT
-> This project originated as a fork of [Alexandria Audiobook Generator](https://github.com/Finrandojin/alexandria-audiobook) by Finrandojin. Legacy mode code still exists for compatibility, but the supported workflow is Threadspeak's script-ingestion pipeline described below.
+
+> Threadspeak originated as a fork of [Alexandria Audiobook Generator](https://github.com/Finrandojin/alexandria-audiobook) by Finrandojin.
 
 ### Third-Party Licenses
 - [qwen_tts](https://github.com/Qwen/Qwen3-TTS) — Apache License 2.0, Copyright Alibaba Qwen Team
