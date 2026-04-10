@@ -1032,12 +1032,13 @@
             const hasActiveAudioWork = Boolean(audioState?.running) && currentJob && (currentJob.total_chunks || 0) > 0;
 
             if (hasActiveAudioWork) {
-                progressBar.style.width = `${percentage}%`;
-                progressBar.classList.add('progress-bar-animated', 'progress-bar-striped', 'bg-warning');
-                progressBar.classList.remove('bg-success');
-                progressBar.innerText = `${percentage}% (${completed}/${total})`;
                 const processed = Number(currentJob.processed_clips) || 0;
                 const jobTotal = Number(currentJob.total_chunks) || 0;
+                const jobPercentage = jobTotal > 0 ? Math.round((processed / jobTotal) * 100) : 0;
+                progressBar.style.width = `${jobPercentage}%`;
+                progressBar.classList.add('progress-bar-animated', 'progress-bar-striped', 'bg-warning');
+                progressBar.classList.remove('bg-success');
+                progressBar.innerText = `${jobPercentage}% (${processed}/${jobTotal})`;
                 progressBar.title = `${currentJob.label || 'Rendering audio'} • current job ${processed}/${jobTotal}`;
                 return;
             }
@@ -1191,19 +1192,23 @@
             return window._narratingVoicesCache;
         }
 
+        function setNarratorSelectorVisible(group, visible) {
+            group.style.display = visible ? 'flex' : 'none';
+        }
+
         async function updateNarratorSelector(chunks) {
             const group = document.getElementById('narrator-selector-group');
             if (!group) return;
 
             if (selectedEditorChapter === WHOLE_PROJECT_CHAPTER_ID) {
-                group.style.display = 'none';
+                setNarratorSelectorVisible(group, false);
                 return;
             }
 
             const narratingVoices = await getNarratingVoices();
             const hasExtra = narratingVoices.some(v => v.trim().toUpperCase() !== 'NARRATOR');
             if (!hasExtra) {
-                group.style.display = 'none';
+                setNarratorSelectorVisible(group, false);
                 return;
             }
 
@@ -1234,7 +1239,7 @@
                 `<option value="${escapeHtml(v)}"${v === selected ? ' selected' : ''}>${escapeHtml(v)}</option>`
             ).join('');
 
-            group.style.display = 'flex';
+            setNarratorSelectorVisible(group, true);
         }
 
         async function focusChunkInEditor(chunkId) {

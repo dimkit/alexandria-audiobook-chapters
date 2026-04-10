@@ -28,6 +28,7 @@ from audio_validation import estimate_expected_duration_seconds
 from asr import LocalASREngine, LocalASRUnavailableError
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
+from ffmpeg_utils import configure_pydub, get_ffmpeg_exe, get_ffprobe_exe
 from script_store import (
     apply_dictionary_to_text,
     load_script_document,
@@ -75,6 +76,8 @@ TRIM_CACHE_VERSION = 4
 TRIM_SILENCE_THRESHOLD_DBFS = -50.0
 TRIM_MIN_SILENCE_LEN_MS = 150
 TRIM_KEEP_PADDING_MS = 40
+
+configure_pydub(AudioSegment)
 
 def _coerce_bool(value, default=False):
     if isinstance(value, bool):
@@ -904,7 +907,7 @@ class ProjectManager:
 
     def _run_ffmpeg_concat(self, concat_path, output_path, codec_args, progress_tick=None):
         command = [
-            "ffmpeg",
+            get_ffmpeg_exe(),
             "-y",
             "-hide_banner",
             "-loglevel",
@@ -1000,7 +1003,7 @@ class ProjectManager:
     @staticmethod
     def _ffprobe_audio_summary(path):
         cmd = [
-            "ffprobe",
+            get_ffprobe_exe(),
             "-v",
             "error",
             "-show_entries",
@@ -1012,7 +1015,23 @@ class ProjectManager:
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
-            return {"ok": False, "error": err[-500:] if err else f"ffprobe exit {result.returncode}"}
+            try:
+                segment = AudioSegment.from_file(path)
+                ext = os.path.splitext(path)[1].lstrip(".").lower()
+                return {
+                    "ok": True,
+                    "codec": ext or "audio",
+                    "sample_rate": str(segment.frame_rate),
+                    "channels": segment.channels,
+                    "sample_fmt": None,
+                    "bits_per_sample": segment.sample_width * 8,
+                    "format_name": ext or None,
+                    "duration": str(segment.duration_seconds),
+                    "bit_rate": None,
+                    "size": str(os.path.getsize(path)) if os.path.exists(path) else None,
+                }
+            except Exception:
+                return {"ok": False, "error": err[-500:] if err else f"ffprobe exit {result.returncode}"}
         try:
             payload = json.loads(result.stdout or "{}")
         except json.JSONDecodeError:
@@ -1285,7 +1304,7 @@ class ProjectManager:
             )
             temp_output = f"{input_path}.normalized{ext}"
             cmd = [
-                "ffmpeg",
+                get_ffmpeg_exe(),
                 "-y",
                 "-hide_banner",
                 "-progress",
@@ -1331,7 +1350,7 @@ class ProjectManager:
             return True, input_path
 
         measure_cmd = [
-            "ffmpeg",
+            get_ffmpeg_exe(),
             "-y",
             "-hide_banner",
             "-progress",
@@ -1394,7 +1413,7 @@ class ProjectManager:
         )
         temp_output = f"{input_path}.normalized{ext}"
         normalize_cmd = [
-            "ffmpeg",
+            get_ffmpeg_exe(),
             "-y",
             "-hide_banner",
             "-progress",
@@ -5720,7 +5739,7 @@ class ProjectManager:
             cover_path = metadata.get("cover_path") or ""
             has_cover = cover_path and os.path.exists(cover_path)
 
-            cmd = ["ffmpeg", "-y", "-i", temp_wav]
+            cmd = [get_ffmpeg_exe(), "-y", "-i", temp_wav]
             if has_cover:
                 cmd += ["-i", cover_path]
             cmd += ["-i", meta_path, "-map_metadata", "2" if has_cover else "1"]

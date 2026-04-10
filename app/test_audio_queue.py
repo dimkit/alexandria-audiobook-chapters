@@ -1,4 +1,5 @@
 import copy
+import threading
 import unittest
 
 import app as app_module
@@ -119,6 +120,66 @@ class AudioQueueMetricsTests(unittest.TestCase):
                 self.assertIn("reset 3 generating chunk(s)", app_module.process_state["audio"]["logs"][-1])
         finally:
             app_module.project_manager.reset_generating_chunks = original_reset
+
+    def test_restored_audio_job_runs_only_pending_indices(self):
+        captured = {}
+
+        def fake_generate_chunks_batch(indices, batch_seed, batch_size, progress_callback=None,
+                                       batch_group_by_type=False, cancel_check=None,
+                                       item_callback=None, generation_token=None):
+            captured["indices"] = list(indices)
+            captured["generation_token"] = generation_token
+            return {"completed": [], "failed": [], "cancelled": 0}
+
+        original_generate = app_module.project_manager.generate_chunks_batch
+        app_module.project_manager.generate_chunks_batch = fake_generate_chunks_batch
+        done_event = threading.Event()
+        job = {
+            "id": 42,
+            "corr_id": "audio-00042-test",
+            "kind": "batch_fast",
+            "indices": [0, 1, 2, 3],
+            "pending_indices": [2, 3],
+            "total_chunks": 4,
+            "total_words": 40,
+            "remaining_words": 20,
+            "processed_clips": 2,
+            "error_clips": 0,
+            "status": "running",
+            "label": "Restored job",
+            "scope": "custom",
+            "run_token": "run-restored",
+        }
+        result_holder = {}
+
+        try:
+            with app_module.audio_queue_lock:
+                app_module.audio_current_job = job
+                app_module.process_state["audio"]["cancel"] = False
+                app_module.audio_cancel_event.clear()
+
+            app_module._audio_job_runner(
+                job,
+                {
+                    "batch_seed": -1,
+                    "batch_size": 2,
+                    "batch_group_by_type": False,
+                    "workers": 2,
+                },
+                "run-restored",
+                result_holder,
+                done_event,
+            )
+
+            self.assertTrue(done_event.is_set())
+            self.assertEqual(captured["indices"], [2, 3])
+            self.assertEqual(captured["generation_token"], "run-restored")
+        finally:
+            app_module.project_manager.generate_chunks_batch = original_generate
+            with app_module.audio_queue_lock:
+                app_module.audio_current_job = self._backup_audio_current_job
+                app_module.process_state["audio"]["cancel"] = False
+                app_module.audio_cancel_event.clear()
 
 if __name__ == "__main__":
     unittest.main()

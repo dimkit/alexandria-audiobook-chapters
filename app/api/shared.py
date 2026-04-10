@@ -1142,28 +1142,43 @@ def _serialize_audio_job(job):
     }
 
 
-def _atomic_json_write(path, data):
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=os.path.dirname(path) or ".",
-            prefix=f".{os.path.basename(path)}.",
-            suffix=".tmp",
-            delete=False,
-        ) as f:
-            tmp_path = f.name
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+def _is_transient_windows_file_error(exc):
+    if os.name != "nt":
+        return False
+    if getattr(exc, "winerror", None) in {5, 32}:
+        return True
+    text = str(exc)
+    return "Access is denied" in text or "being used by another process" in text
+
+
+def _atomic_json_write(path, data, max_retries=8):
+    for attempt in range(max_retries):
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=os.path.dirname(path) or ".",
+                prefix=f".{os.path.basename(path)}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_path = f.name
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+            return
+        except OSError as exc:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            if attempt < max_retries - 1 and _is_transient_windows_file_error(exc):
+                time.sleep(0.05 * (2 ** attempt))
+                continue
+            raise
 
 
 def _append_script_repair_trace(run_id: str, event_type: str, payload: Optional[dict] = None):
@@ -1997,7 +2012,10 @@ def _persist_audio_queue_state_locked():
         "heartbeat": _format_audio_heartbeat_locked(),
         "updated_at": time.time(),
     }
-    _atomic_json_write(AUDIO_QUEUE_STATE_PATH, payload)
+    try:
+        _atomic_json_write(AUDIO_QUEUE_STATE_PATH, payload)
+    except OSError as exc:
+        logger.warning(f"Failed to persist audio queue state: {exc}")
 
 
 def _refresh_audio_process_state_locked(persist=False):
@@ -2585,6 +2603,7 @@ def _abandon_audio_job_locked(job, run_token, reason, *, status="cancelled"):
 
 def _audio_job_runner(job, settings, run_token, result_holder, done_event):
     job_prefix = f"[JOB {job['id']}|{job.get('corr_id', 'no-cid')}]"
+    execution_indices = list(job.get("pending_indices") or job.get("indices") or [])
 
     def is_active():
         with audio_queue_lock:
@@ -2616,7 +2635,7 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
     try:
         if job["kind"] == "parallel":
             result_holder["results"] = project_manager.generate_chunks_parallel(
-                job["indices"],
+                execution_indices,
                 settings["workers"],
                 progress_callback,
                 cancel_check=cancel_check,
@@ -2625,7 +2644,7 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
             )
         else:
             result_holder["results"] = project_manager.generate_chunks_batch(
-                job["indices"],
+                execution_indices,
                 settings["batch_seed"],
                 settings["batch_size"],
                 progress_callback,

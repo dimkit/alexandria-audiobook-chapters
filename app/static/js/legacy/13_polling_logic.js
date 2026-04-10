@@ -40,6 +40,14 @@
             }
         })();
 
+        function resolveTaskNavTab(taskName, status, fallbackNavTab) {
+            if (taskName !== 'audio') return fallbackNavTab;
+            const hasEditorAudioWork = Boolean(status?.current_job) || (status?.queue || []).length > 0;
+            if (hasEditorAudioWork) return 'editor';
+            if (status?.merge_running || status?.merge_progress?.running) return 'audio';
+            return fallbackNavTab;
+        }
+
         function buildTaskCompletionKey(kind, taskName, action) {
             return `threadspeak:${kind}:${taskName}:${action}`;
         }
@@ -254,7 +262,8 @@
                     renderTaskLogs(taskName, status, elementId);
                     if (status.running) {
                         const hasNavTask = Boolean(window.getNavTaskSpinnerTab && window.getNavTaskSpinnerTab());
-                        pollLogs(taskName, elementId, hasNavTask ? false : undefined).catch(err => {
+                        const reconnectNavTab = hasNavTask ? false : resolveTaskNavTab(taskName, status, undefined);
+                        pollLogs(taskName, elementId, reconnectNavTab).catch(err => {
                             console.error(`Polling failed for ${taskName}`, err);
                         });
                     } else {
