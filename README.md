@@ -1,19 +1,11 @@
-> This project originated as a fork of [Alexandria Audiobook Generator](https://github.com/Finrandojin/alexandria-audiobook) by Finrandojin. The original code was released under the MIT License. See [`LICENSE-ORIGINAL`](LICENSE-ORIGINAL) for details.
+<img width="475" height="467" alt="Alexandria Logo" src="https://github.com/kristopher-miles/threadspeak-audiobook/blob/main/icon.png?raw=true"/>
+> This project originated as a fork of [Alexandria Audiobook Generator](https://github.com/Finrandojin/alexandria-audiobook) by Finrandojin. Aduio workflows and tools from that original source are preserved under legacy mode, but are not supported.
 
-<img width="475" height="467" alt="Alexandria Logo" src="https://github.com/user-attachments/assets/fa2c36d3-a5f3-49ab-9dfe-30933359dfbd" />
-
-# Alexandria Audiobook Generator
-
-> **A note to new users:** Alexandria has recently seen a sudden surge of attention and new users. As a small project, I may not be able to respond to every issue promptly. Before opening an issue, please read this README and the [Wiki](https://github.com/Finrandojin/alexandria-audiobook/wiki) thoroughly — most common questions are already answered there. Thank you for your patience!
+# Threadspeak Audiobook Generator
 
 Transform any book or novel into a fully-voiced audiobook using AI-powered script annotation and text-to-speech. Features a built-in Qwen3-TTS engine with batch processing and a browser-based editor for fine-tuning every line before final export.
 
 ## Example: [sample.mp3](https://github.com/user-attachments/files/25276110/sample.mp3)
-
-
-## Screenshots
-
-<img src="https://github.com/user-attachments/assets/874b5e30-56d2-4292-b754-4408fc53f5d6" width="30%"></img> <img src="https://github.com/user-attachments/assets/488cde02-6b93-47fa-874b-97a618ae482c" width="30%"></img> <img src="https://github.com/user-attachments/assets/4c0805a6-bb9d-42c1-a9ff-79bb29d0613c" width="30%"></img> <img src="https://github.com/user-attachments/assets/8e58a5bf-ed8f-4864-8545-1e3d9681b0cf" width="30%"></img> <img src="https://github.com/user-attachments/assets/531830da-8668-4189-a0dc-020e6661bfb6" width="30%"></img> 
 
 ## Features
 
@@ -93,14 +85,6 @@ Transform any book or novel into a fully-voiced audiobook using AI-powered scrip
    - Or manually: in Pinokio, click **Download** and paste `https://github.com/Finrandojin/alexandria-audiobook`
 3. Click **Install** to set up dependencies
 4. Click **Start** to launch the web interface
-
-### Option B: Google Colab (No Install Required)
-
-No GPU or wrong OS? Run Alexandria on a free T4 GPU in your browser:
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Finrandojin/alexandria-audiobook/blob/main/alexandria_colab.ipynb)
-
-Requires a free [ngrok account](https://dashboard.ngrok.com/signup) for the web UI tunnel. See the notebook for full instructions.
 
 ## First Launch — What to Expect
 
@@ -198,14 +182,6 @@ Each character detected in the script gets a voice card. For each speaker:
 **Step 5 — Result**
 - Listen to the finished audiobook in the browser
 - Download as MP3, or click **Export to Audacity** for per-speaker WAV tracks
-
-### Advanced Tools (Optional)
-
-These tabs are for power users who want more control over voice creation:
-
-- **Designer** — Create new voices from text descriptions (e.g., "A warm elderly woman with a gentle raspy voice"). Save them to use as clone references in the Voices tab
-- **Dataset** — Build LoRA training datasets interactively, one sample at a time with audio preview
-- **Training** — Train LoRA adapters on voice datasets to create persistent voice identities that follow instruct directions
 
 ## Web Interface
 
@@ -945,5 +921,4 @@ Alexandria/
 MIT
 
 ### Third-Party Licenses
-
 - [qwen_tts](https://github.com/Qwen/Qwen3-TTS) — Apache License 2.0, Copyright Alibaba Qwen Team
