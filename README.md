@@ -73,8 +73,6 @@ Transform a source script into a production-ready audiobook with an end-to-end p
 
 > **Note:** No external TTS server is required. Threadspeak includes a built-in Qwen3-TTS engine that loads models directly. Model weights are downloaded automatically on first use (~3.5 GB per model variant).
 
-> **Documentation:** Technical docs for this project live in the local `wiki/` folder and are linked in the **Technical Docs** section below.
-
 ## Installation
 
 ### Option A: Pinokio (Recommended)
@@ -215,9 +213,7 @@ The final export workflow is run from the export tab:
 
 > **Note:** Some Linux audiobook players (e.g. Cozy) have limited M4B support and may not detect the file. The M4B output has been tested with VLC, Haruna, and Audiobookshelf.
 
-## Technical Docs
-
-Deep technical docs moved to wiki-style pages in `wiki/`:
+## More Info
 
 - [Wiki Home](wiki/Home.md)
 - [API Reference](wiki/API-Reference.md)

@@ -4,15 +4,15 @@ Threadspeak uses LLMs in multiple stages (for example dialogue attribution, temp
 
 ## General guidance
 
-- Prefer reliable instruction-following models.
-- Avoid highly verbose reasoning output in stages that expect strict tool/format behavior.
+- Tool use required.
 - If a model emits unwanted control text, use banned-token controls in Setup.
 
 ## Common choices
 
-- Qwen family models
-- Gemma family models
-- Llama 3.x instruct variants
-- Mistral/Mixtral instruct variants
+- Qwen 3.5 
+- Gemma 4 
+- Llama instruct variants
+- GPT-OSS
 
+Longer context allows the model to extract speaker more accurately but increases runtime. Current implementation relies on explicit model tool use to provide output, so will fail on models without this capability.
 Model quality and behavior can vary by provider/runtime. Validate on a representative sample chapter before long runs.
