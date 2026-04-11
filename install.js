@@ -46,8 +46,7 @@ module.exports = {
       message: [
         ...basePackages,
         "uv pip uninstall qwen-tts",
-        "uv pip install --prerelease=allow mlx==0.30.3 mlx-lm==0.30.5 mlx-metal==0.30.3",
-        "uv pip install git+https://github.com/Blaizzy/mlx-audio.git@9349644ccbd62eb10900852228f7b952c566def3",
+        "uv pip install mlx-audio==0.4.2",
         "uv pip install sentencepiece tiktoken",
         ...verifyTestEnv,
       ]
