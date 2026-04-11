@@ -135,12 +135,11 @@
                 if (pollState.cancelled) return;
 
                 pollState.attempts += 1;
-                const updateOutcome = applyTrackedChunkUpdate(updatedChunk);
+                applyTrackedChunkUpdate(updatedChunk);
                 const reachedTerminalState = updatedChunk?.status !== 'generating';
-                const hasVisibleRow = updateOutcome.editorUpdated || updateOutcome.proofreadUpdated;
                 const timedOut = (Date.now() - pollState.startedAt) >= singleChunkPollTimeoutMs;
 
-                if (reachedTerminalState || timedOut || !hasVisibleRow) {
+                if (reachedTerminalState || timedOut) {
                     stopTrackedChunkStatusPolling(normalizedRef);
                     return;
                 }
