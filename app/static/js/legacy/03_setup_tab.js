@@ -16,6 +16,32 @@
             const mode = document.getElementById('tts-mode').value;
             document.getElementById('tts-url-group').style.display = mode === 'external' ? '' : 'none';
             document.getElementById('tts-local-options').style.display = mode === 'local' ? '' : 'none';
+            applyBatchSettingsVisibility();
+        }
+
+        function isMacHostUI() {
+            const uaPlatform = navigator.userAgentData?.platform || '';
+            const legacyPlatform = navigator.platform || '';
+            const userAgent = navigator.userAgent || '';
+            return /mac/i.test(uaPlatform) || /mac/i.test(legacyPlatform) || /mac os x/i.test(userAgent);
+        }
+
+        function applyBatchSettingsVisibility() {
+            const hideBatchControls = isMacHostUI();
+            const batchOnlyGroupIds = [
+                'batch-seed-group',
+                'batch-group-by-type-group',
+                'sub-batch-enabled-group',
+                'sub-batch-min-group',
+                'sub-batch-ratio-group',
+                'sub-batch-max-chars-group',
+                'sub-batch-max-items-group',
+            ];
+            batchOnlyGroupIds.forEach((id) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.style.display = hideBatchControls ? 'none' : '';
+            });
         }
 
         function coerceConfigBool(value, fallback = false) {
@@ -262,6 +288,7 @@
                 }
                 document.getElementById('script-max-length').value = config.tts.script_max_length ?? 100;
                 toggleTTSMode();
+                applyBatchSettingsVisibility();
 
                 // Load custom prompts if they exist and are non-empty
                 if (config.prompts) {

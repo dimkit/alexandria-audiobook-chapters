@@ -736,9 +736,11 @@ class TTSEngine:
                     "MLX backend is not installed. Run Install on Apple Silicon to install mlx-audio dependencies."
                 ) from e
 
-            print(f"Loading MLX TTS model ({model_type}) from {model_id} ...")
+            local_path = TTSEngine._resolve_local_model_path(model_id)
+            load_target = local_path if local_path else model_id
+            print(f"Loading MLX TTS model ({model_type}) from {load_target} ...")
             with self._suppress_known_transformers_qwen3_warnings():
-                model = load_model(model_id)
+                model = load_model(load_target)
             self._postprocess_mlx_qwen3_tokenizer(model)
             self._mlx_models[model_type] = model
             print(f"MLX model loaded ({model_type}).")

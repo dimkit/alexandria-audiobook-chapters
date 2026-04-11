@@ -30,11 +30,31 @@ class EditorTabChunkPollTests(unittest.TestCase):
             `;
 
             function createClassList() {{
+                const values = new Set();
                 return {{
-                    contains() {{ return false; }},
-                    add() {{}},
-                    remove() {{}},
-                    toggle() {{ return false; }},
+                    contains(name) {{ return values.has(name); }},
+                    add(...names) {{
+                        names.forEach((name) => values.add(name));
+                    }},
+                    remove(...names) {{
+                        names.forEach((name) => values.delete(name));
+                    }},
+                    toggle(name, force) {{
+                        if (force === true) {{
+                            values.add(name);
+                            return true;
+                        }}
+                        if (force === false) {{
+                            values.delete(name);
+                            return false;
+                        }}
+                        if (values.has(name)) {{
+                            values.delete(name);
+                            return false;
+                        }}
+                        values.add(name);
+                        return true;
+                    }},
                 }};
             }}
 
@@ -100,49 +120,54 @@ class EditorTabChunkPollTests(unittest.TestCase):
                 }};
             }}
 
-            function createNoAudioNode(container) {{
-                return {{
-                    className: 'text-muted small',
-                    set outerHTML(html) {{
-                        container.noAudio = null;
-                        container.audio = createAudioNode(html);
-                    }},
-                }};
-            }}
-
-            function createActionContainer(chunkRef) {{
-                const container = createGenericElement();
+            function createGenerateSlot(chunkRef) {{
+                const slot = createGenericElement();
                 const button = createGenericElement();
-                button.className = 'btn btn-sm btn-primary';
+                button.className = 'btn btn-primary btn-sm chunk-generate-btn';
                 button.innerHTML = '<i class="fas fa-play"></i> Gen';
                 button.onclick = null;
-                container.button = button;
-                container.progress = null;
-                container.audio = null;
-                container.noAudio = createNoAudioNode(container);
-                container.querySelector = (selector) => {{
-                    if (selector === 'button') return container.button;
-                    if (selector === '.progress') return container.progress;
-                    if (selector === 'audio') return container.audio;
-                    if (selector === '.text-muted.small') return container.noAudio;
+                slot.button = button;
+                slot.progress = null;
+                slot.querySelector = (selector) => {{
+                    if (selector === 'button') return slot.button;
+                    if (selector === '.progress') return slot.progress;
                     return null;
                 }};
-                container.replaceChild = (nextNode, previousNode) => {{
-                    if (previousNode === container.button) {{
-                        container.button = null;
-                        container.progress = nextNode;
-                        return previousNode;
-                    }}
-                    if (previousNode === container.progress) {{
-                        container.progress = null;
-                        container.button = nextNode;
-                        return previousNode;
-                    }}
-                    return previousNode;
+                Object.defineProperty(slot, 'innerHTML', {{
+                    get() {{
+                        return '';
+                    }},
+                    set(value) {{
+                        if (value.includes('chunk-generate-progress') || value.includes('progress-bar')) {{
+                            slot.button = null;
+                            slot.progress = createGenericElement();
+                            slot.progress.className = 'progress chunk-generate-progress';
+                        }} else if (value.includes('chunk-generate-btn') || value.includes('Gen')) {{
+                            slot.progress = null;
+                            const nextButton = createGenericElement();
+                            nextButton.className = 'btn btn-primary btn-sm chunk-generate-btn';
+                            nextButton.innerHTML = '<i class="fas fa-play"></i> Gen';
+                            nextButton.onclick = null;
+                            slot.button = nextButton;
+                        }} else {{
+                            slot.button = null;
+                            slot.progress = null;
+                        }}
+                    }},
+                }});
+                return slot;
+            }}
+
+            function createAudioContainer(chunkRef) {{
+                const container = createGenericElement();
+                container.audio = null;
+                container.querySelector = (selector) => {{
+                    if (selector === 'audio') return container.audio;
+                    return null;
                 }};
                 container.insertAdjacentHTML = (_position, html) => {{
-                    if (html.includes('No audio')) {{
-                        container.noAudio = createNoAudioNode(container);
+                    if (html.includes('<audio')) {{
+                        container.audio = createAudioNode(html);
                     }}
                 }};
                 return container;
@@ -151,12 +176,11 @@ class EditorTabChunkPollTests(unittest.TestCase):
             function createChunkRow(chunk) {{
                 const chunkRef = String(chunk.id);
                 const row = createGenericElement();
-                const statusBadge = createGenericElement();
-                statusBadge.className = 'badge bg-secondary';
-                statusBadge.innerText = chunk.status || 'pending';
-
-                const statusCell = createGenericElement();
-                statusCell.querySelector = (selector) => selector === '.badge' ? statusBadge : null;
+                if (chunk.status === 'done') {{
+                    row.classList.add('status-done');
+                }} else if (chunk.status === 'generating') {{
+                    row.classList.add('status-generating');
+                }}
 
                 const textArea = createGenericElement();
                 textArea.value = chunk.text || '';
@@ -171,14 +195,14 @@ class EditorTabChunkPollTests(unittest.TestCase):
                 instructInput.value = chunk.instruct || '';
                 instructInput.dataset.editorField = 'instruct';
 
-                const actionContainer = createActionContainer(chunkRef);
+                const generateSlot = createGenerateSlot(chunkRef);
+                const audioContainer = createAudioContainer(chunkRef);
 
                 row.dataset = {{ id: chunkRef }};
                 row.querySelector = (selector) => {{
                     if (selector === '.chunk-text') return textArea;
-                    if (selector === '.badge') return statusBadge;
-                    if (selector === '.chunk-status-cell') return statusCell;
-                    if (selector === '.d-flex') return actionContainer;
+                    if (selector === '.chunk-generate-slot') return generateSlot;
+                    if (selector === '.chunk-audio-slot') return audioContainer;
                     return null;
                 }};
                 row.querySelectorAll = (selector) => {{
@@ -187,9 +211,8 @@ class EditorTabChunkPollTests(unittest.TestCase):
                     }}
                     return [];
                 }};
-                row.__statusBadge = statusBadge;
-                row.__statusCell = statusCell;
-                row.__actionContainer = actionContainer;
+                row.__generateSlot = generateSlot;
+                row.__audioContainer = audioContainer;
                 row.__textArea = textArea;
                 row.__speakerInput = speakerInput;
                 row.__instructInput = instructInput;
@@ -363,14 +386,15 @@ class EditorTabChunkPollTests(unittest.TestCase):
                 await flushTicks();
 
                 assert.strictEqual(savePayloads.length, 1);
-                assert.strictEqual(row.__statusBadge.innerText, 'done');
+                assert.ok(row.classList.contains('status-done'));
+                assert.ok(!row.classList.contains('status-generating'));
                 assert.strictEqual(context.__editorTabTestHooks.getCachedChunks()[0].status, 'done');
                 assert.strictEqual(context.__editorTabTestHooks.getTrackedChunkPollCount(), 0);
                 assert.strictEqual(loadChunksCalls, 0, 'single-clip tracking should not trigger broad chunk reloads');
-                assert.ok(row.__actionContainer.button, 'generate button should be restored');
-                assert.strictEqual(row.__actionContainer.progress, null, 'progress bar should be removed');
-                assert.ok(row.__actionContainer.audio, 'audio player should be inserted after completion');
-                assert.strictEqual(row.__actionContainer.noAudio, null, '"No audio" placeholder should be replaced');
+                assert.ok(row.__generateSlot.button, 'generate button should be restored');
+                assert.strictEqual(row.__generateSlot.progress, null, 'progress bar should be removed');
+                assert.ok(row.__audioContainer.audio, 'audio player should be inserted after completion');
+                assert.strictEqual(row.__audioContainer.audio !== null, true);
             })().catch((error) => {{
                 console.error(error);
                 process.exit(1);
@@ -417,10 +441,74 @@ class EditorTabChunkPollTests(unittest.TestCase):
                 await context.window.generateChunk('2');
                 await flushTicks();
 
-                assert.strictEqual(row.__statusBadge.innerText, 'error');
-                assert.ok(row.__actionContainer.button, 'button should return after error');
-                assert.strictEqual(row.__actionContainer.progress, null);
+                assert.ok(!row.classList.contains('status-done'));
+                assert.ok(!row.classList.contains('status-generating'));
+                assert.ok(row.__generateSlot.button, 'button should return after error');
+                assert.strictEqual(row.__generateSlot.progress, null);
                 assert.strictEqual(context.__editorTabTestHooks.getCachedChunks()[0].status, 'error');
+                assert.strictEqual(context.__editorTabTestHooks.getTrackedChunkPollCount(), 0);
+            })().catch((error) => {{
+                console.error(error);
+                process.exit(1);
+            }});
+            """
+        )
+
+    def test_generate_chunk_keeps_generating_state_during_initial_pending_race(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                const row = context.__createChunkRow({
+                    id: 4,
+                    speaker: 'Narrator',
+                    text: 'Pending should not wipe the optimistic generating state.',
+                    instruct: '',
+                    status: 'pending',
+                    audio_path: null,
+                    audio_validation: null,
+                });
+                context.__rows.set('4', row);
+
+                let getCalls = 0;
+                const chunkStates = [
+                    { id: 4, speaker: 'Narrator', text: row.__textArea.value, instruct: '', status: 'pending', audio_path: null, audio_validation: null },
+                    { id: 4, speaker: 'Narrator', text: row.__textArea.value, instruct: '', status: 'generating', audio_path: null, audio_validation: null },
+                    { id: 4, speaker: 'Narrator', text: row.__textArea.value, instruct: '', status: 'done', audio_path: 'voicelines/race.wav', audio_validation: { file_size_bytes: 10, actual_duration_sec: 1.0 } },
+                ];
+
+                context.API.post = async (url, payload) => {
+                    if (url === '/api/chunks/4') {
+                        return { id: 4, speaker: payload.speaker, text: payload.text, instruct: payload.instruct, status: 'pending', audio_path: null, audio_validation: null };
+                    }
+                    if (url === '/api/chunks/4/generate') {
+                        return { status: 'started' };
+                    }
+                    throw new Error(`Unexpected POST ${url}`);
+                };
+                context.API.get = async (url) => {
+                    if (url === '/api/chunks/4') {
+                        getCalls += 1;
+                        return chunkStates.shift() || { id: 4, speaker: 'Narrator', text: row.__textArea.value, instruct: '', status: 'done', audio_path: 'voicelines/race.wav', audio_validation: { file_size_bytes: 10, actual_duration_sec: 1.0 } };
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+                context.__editorTabTestHooks.setCachedChunks([{ id: 4, speaker: 'Narrator', text: row.__textArea.value, instruct: '', status: 'pending', audio_path: null, audio_validation: null }]);
+
+                const generationPromise = context.window.generateChunk('4');
+                await flushTicks(1);
+                assert.ok(row.classList.contains('status-generating'), 'optimistic generating state should survive the initial pending poll response');
+                assert.ok(row.__generateSlot.progress, 'progress bar should remain visible while backend catches up');
+
+                await generationPromise;
+                await flushTicks();
+
+                assert.ok(getCalls >= 3, 'poller should continue past the stale pending response');
+                assert.ok(row.classList.contains('status-done'));
+                assert.strictEqual(context.__editorTabTestHooks.getCachedChunks()[0].status, 'done');
                 assert.strictEqual(context.__editorTabTestHooks.getTrackedChunkPollCount(), 0);
             })().catch((error) => {{
                 console.error(error);
@@ -470,6 +558,56 @@ class EditorTabChunkPollTests(unittest.TestCase):
                 assert.strictEqual(context.__editorTabTestHooks.getCachedChunks()[0].status, 'done');
                 assert.strictEqual(context.__editorTabTestHooks.getTrackedChunkPollCount(), 0);
                 assert.strictEqual(loadChunksCalls, 0, 'proofread regeneration should not trigger broad chunk reloads');
+            })().catch((error) => {{
+                console.error(error);
+                process.exit(1);
+            }});
+            """
+        )
+
+    def test_regenerate_proofread_chunk_keeps_generating_state_during_initial_pending_race(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                const proofreadUpdates = [];
+                const chunkStates = [
+                    { id: 5, speaker: 'Narrator', text: 'Proofread pending race', instruct: '', status: 'pending', audio_path: null, audio_validation: null },
+                    { id: 5, speaker: 'Narrator', text: 'Proofread pending race', instruct: '', status: 'generating', audio_path: null, audio_validation: null },
+                    { id: 5, speaker: 'Narrator', text: 'Proofread pending race', instruct: '', status: 'done', audio_path: 'voicelines/proofread-race.wav', audio_validation: { file_size_bytes: 10, actual_duration_sec: 1.0 } },
+                ];
+
+                context.API.post = async (url) => {
+                    if (url === '/api/chunks/5/regenerate') {
+                        return { status: 'started' };
+                    }
+                    throw new Error(`Unexpected POST ${url}`);
+                };
+                context.API.get = async (url) => {
+                    if (url === '/api/chunks/5') {
+                        return chunkStates.shift() || { id: 5, speaker: 'Narrator', text: 'Proofread pending race', instruct: '', status: 'done', audio_path: 'voicelines/proofread-race.wav', audio_validation: { file_size_bytes: 10, actual_duration_sec: 1.0 } };
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+                context.__editorTabTestHooks.setCachedChunks([{ id: 5, speaker: 'Narrator', text: 'Proofread pending race', instruct: '', status: 'pending', audio_path: null, audio_validation: null }]);
+                context.__editorTabTestHooks.setUpdateProofreadRow((chunk) => {
+                    proofreadUpdates.push(chunk.status);
+                    return true;
+                });
+
+                const regenerationPromise = context.window.regenerateProofreadChunk('5');
+                await flushTicks(1);
+                assert.strictEqual(context.__editorTabTestHooks.getCachedChunks()[0].status, 'generating');
+
+                await regenerationPromise;
+                await flushTicks();
+
+                assert.deepStrictEqual(proofreadUpdates.slice(-2), ['generating', 'done']);
+                assert.strictEqual(context.__editorTabTestHooks.getCachedChunks()[0].status, 'done');
+                assert.strictEqual(context.__editorTabTestHooks.getTrackedChunkPollCount(), 0);
             })().catch((error) => {{
                 console.error(error);
                 process.exit(1);

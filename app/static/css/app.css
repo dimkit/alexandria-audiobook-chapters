@@ -14,6 +14,8 @@
             --app-table-hover: rgba(13, 110, 253, 0.08);
             --app-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
             --app-divider: rgba(15, 23, 42, 0.08);
+            --editor-row-done-bg: rgba(25, 135, 84, 0.18);
+            --editor-row-generating-bg: rgba(255, 193, 7, 0.24);
             --proofread-pass-bg: rgba(25, 135, 84, 0.14);
             --proofread-fail-rgb: 150, 20, 20;
             --proofread-mismatch-bg: rgba(110, 12, 18, 0.92);
@@ -34,6 +36,8 @@
             --app-table-hover: rgba(96, 165, 250, 0.12);
             --app-shadow: 0 18px 48px rgba(2, 6, 23, 0.4);
             --app-divider: rgba(148, 163, 184, 0.14);
+            --editor-row-done-bg: rgba(22, 163, 74, 0.22);
+            --editor-row-generating-bg: rgba(245, 158, 11, 0.28);
             --proofread-pass-bg: rgba(22, 163, 74, 0.22);
             --proofread-fail-rgb: 190, 38, 38;
             --proofread-mismatch-bg: rgba(127, 29, 29, 0.94);
@@ -157,6 +161,26 @@
             top: 0;
             z-index: 1;
             background-color: var(--app-card-bg);
+        }
+        #editor-tab .chunk-row.status-done,
+        #editor-tab .chunk-row.status-done > td,
+        #editor-tab .chunk-row.status-done > th {
+            background-color: var(--editor-row-done-bg) !important;
+        }
+        #editor-tab .chunk-row.status-generating,
+        #editor-tab .chunk-row.status-generating > td,
+        #editor-tab .chunk-row.status-generating > th {
+            background-color: var(--editor-row-generating-bg) !important;
+        }
+        #editor-tab .chunk-row.status-done:hover,
+        #editor-tab .chunk-row.status-done:hover > td,
+        #editor-tab .chunk-row.status-done:hover > th {
+            background-color: var(--editor-row-done-bg) !important;
+        }
+        #editor-tab .chunk-row.status-generating:hover,
+        #editor-tab .chunk-row.status-generating:hover > td,
+        #editor-tab .chunk-row.status-generating:hover > th {
+            background-color: var(--editor-row-generating-bg) !important;
         }
         .nav-link { cursor: pointer; }
         .log-window {
@@ -437,6 +461,74 @@
         }
         .chunk-row.expanded .chunk-expand-btn {
             transform: rotate(180deg);
+        }
+        #editor-tab .chunk-controls-cell {
+            min-width: 96px;
+            white-space: nowrap;
+            vertical-align: middle;
+            padding: 0.18rem 0.22rem !important;
+        }
+        #editor-tab .chunk-row-actions {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.18rem;
+        }
+        #editor-tab .chunk-generate-slot {
+            width: 100%;
+            max-width: 72px;
+        }
+        #editor-tab .chunk-generate-btn {
+            width: 100%;
+            padding: 0.05rem 0.35rem;
+            line-height: 1.1;
+            min-height: 22px;
+            font-size: 0.72rem;
+        }
+        #editor-tab .chunk-edit-controls {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.05rem;
+            width: 100%;
+            line-height: 1;
+        }
+        #editor-tab .chunk-audio-cell {
+            width: 1%;
+            white-space: nowrap;
+        }
+        #editor-tab .chunk-audio-slot {
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            min-height: 30px;
+        }
+        #editor-tab .chunk-audio-slot .chunk-audio {
+            width: 200px;
+            max-width: 100%;
+        }
+        #editor-tab .chunk-field-cell {
+            padding: 0 !important;
+            vertical-align: stretch;
+        }
+        #editor-tab .chunk-field-input {
+            width: 100%;
+            height: 100%;
+            min-height: 100%;
+            margin: 0;
+            border-radius: 0;
+            border-width: 0;
+            box-shadow: none;
+        }
+        #editor-tab .chunk-speaker-input {
+            min-height: 100%;
+        }
+        #editor-tab .chunk-text,
+        #editor-tab .chunk-instruct {
+            resize: vertical;
+        }
+        #editor-tab .chunk-field-cell .form-control:focus {
+            box-shadow: inset 0 0 0 1px rgba(59, 130, 246, 0.55);
         }
         /* Core pipeline tabs - green */
         .nav-link.nav-pipeline { color: rgba(125, 227, 161, 0.7); }

@@ -49,6 +49,24 @@
             return { statusColor, statusDetail };
         }
 
+        function getEditorRowStatusClass(chunk) {
+            if (chunk?.status === 'done') return 'status-done';
+            if (chunk?.status === 'generating') return 'status-generating';
+            return '';
+        }
+
+        function buildGenerateButtonHtml(chunkRef) {
+            return `<button class="btn btn-primary btn-sm chunk-generate-btn" onclick='generateChunk(${JSON.stringify(chunkRef)})'><i class="fas fa-play"></i> Gen</button>`;
+        }
+
+        function buildGeneratingProgressHtml() {
+            return `
+                <div class="progress chunk-generate-progress" style="width: 100%; height: 16px;">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated bg-warning" role="progressbar" style="width: 100%"></div>
+                </div>
+            `;
+        }
+
         function getChunkChapterName(chunk) {
             if (!chunk || typeof chunk.chapter !== 'string') return '';
             return chunk.chapter.trim();
@@ -135,9 +153,29 @@
                 if (pollState.cancelled) return;
 
                 pollState.attempts += 1;
+                const elapsedMs = Date.now() - pollState.startedAt;
+                const timedOut = elapsedMs >= singleChunkPollTimeoutMs;
+                const waitingForGeneratingTransition = Boolean(pollState.preserveGeneratingWhilePending) && !pollState.sawGenerating;
+                const pendingWithinGrace = waitingForGeneratingTransition
+                    && updatedChunk?.status === 'pending'
+                    && elapsedMs < pollState.pendingGraceMs;
+
+                if (updatedChunk?.status === 'generating') {
+                    pollState.sawGenerating = true;
+                }
+
+                if (pendingWithinGrace) {
+                    pollState.timer = setTimeout(() => {
+                        pollTrackedChunkStatus(normalizedRef).catch((error) => {
+                            console.warn(`Single-chunk status poll failed for ${normalizedRef}`, error);
+                            stopTrackedChunkStatusPolling(normalizedRef);
+                        });
+                    }, singleChunkPollIntervalMs);
+                    return;
+                }
+
                 applyTrackedChunkUpdate(updatedChunk);
                 const reachedTerminalState = updatedChunk?.status !== 'generating';
-                const timedOut = (Date.now() - pollState.startedAt) >= singleChunkPollTimeoutMs;
 
                 if (reachedTerminalState || timedOut) {
                     stopTrackedChunkStatusPolling(normalizedRef);
@@ -165,6 +203,11 @@
                 startedAt: Date.now(),
                 timer: null,
                 cancelled: false,
+                preserveGeneratingWhilePending: Boolean(options.preserveGeneratingWhilePending),
+                pendingGraceMs: Number.isFinite(Number(options.pendingGraceMs))
+                    ? Math.max(0, Number(options.pendingGraceMs))
+                    : 0,
+                sawGenerating: false,
             };
             activeChunkStatusPolls.set(normalizedRef, pollState);
 
@@ -284,53 +327,38 @@
             const tr = document.querySelector(`tr[data-id="${chunkRef}"]`);
             if (!tr) return false;
 
-            const { statusColor, statusDetail } = getChunkStatusMeta(chunk);
-
-            // Update status badge
-            const statusCell = tr.querySelector('.chunk-status-cell');
-            const badge = statusCell ? statusCell.querySelector('.badge') : tr.querySelector('.badge');
-            if (badge && statusCell) {
-                badge.className = `badge bg-${statusColor}`;
-                badge.innerText = chunk.status;
-                statusCell.innerHTML = `<span class="badge bg-${statusColor}">${chunk.status}</span>${statusDetail}`;
+            tr.classList.remove('status-done', 'status-generating');
+            const rowStatusClass = getEditorRowStatusClass(chunk);
+            if (rowStatusClass) {
+                tr.classList.add(rowStatusClass);
             }
 
-            // Update action area (button/progress)
-            const actionContainer = tr.querySelector('.d-flex');
-            if (actionContainer) {
-                const existingBtn = actionContainer.querySelector('button');
-                const existingProgress = actionContainer.querySelector('.progress');
+            const generateSlot = tr.querySelector('.chunk-generate-slot');
+            if (generateSlot) {
+                const existingBtn = generateSlot.querySelector('button');
+                const existingProgress = generateSlot.querySelector('.progress');
 
                 if (chunk.status === 'generating') {
-                    if (existingBtn && !existingProgress) {
-                        const progressBar = document.createElement('div');
-                        progressBar.className = 'progress';
-                        progressBar.style.width = '100px';
-                        progressBar.style.height = '20px';
-                        progressBar.innerHTML = '<div class="progress-bar progress-bar-striped progress-bar-animated bg-warning" role="progressbar" style="width: 100%"></div>';
-                        actionContainer.replaceChild(progressBar, existingBtn);
+                    if (!existingProgress) {
+                        generateSlot.innerHTML = buildGeneratingProgressHtml();
                     }
-                } else {
-                    if (existingProgress && !existingBtn) {
-                        const btn = document.createElement('button');
-                        btn.className = 'btn btn-sm btn-primary';
-                        btn.onclick = () => generateChunk(chunkRef);
-                        btn.innerHTML = '<i class="fas fa-play"></i> Gen';
-                        actionContainer.replaceChild(btn, existingProgress);
-                    }
+                } else if (!existingBtn || existingProgress) {
+                    generateSlot.innerHTML = buildGenerateButtonHtml(chunkRef);
                 }
+            }
 
+            const audioSlot = tr.querySelector('.chunk-audio-slot');
+            if (audioSlot) {
                 // Update audio player whenever an audio file exists. If the clip
-                // was invalidated, swap back to the "No audio" placeholder right away.
-                const existingAudio = actionContainer.querySelector('audio');
-                const existingNoAudio = actionContainer.querySelector('.text-muted.small');
+                // was invalidated, remove the player right away.
+                const existingAudio = audioSlot.querySelector('audio');
                 if (chunk.audio_path) {
                     const newSrc = buildChunkAudioSrc(chunk, Date.now().toString());
                     const nextFingerprint = getChunkAudioFingerprint(chunk);
 
-                    if (existingNoAudio) {
+                    if (!existingAudio) {
                         const audioHtml = `<audio class="chunk-audio" data-id="${escapeHtml(chunkRef)}" data-audio-path="${escapeHtml(chunk.audio_path)}" data-audio-fingerprint="${escapeHtml(nextFingerprint)}" controls preload="none" src="${newSrc}" style="width: 200px; height: 30px;" onplay='stopOthers(${JSON.stringify(chunkRef)})'></audio>`;
-                        existingNoAudio.outerHTML = audioHtml;
+                        audioSlot.insertAdjacentHTML('beforeend', audioHtml);
                     } else if (existingAudio) {
                         const currentFingerprint = existingAudio.dataset.audioFingerprint || '';
                         if (currentFingerprint !== nextFingerprint || existingAudio.dataset.audioPath !== chunk.audio_path) {
@@ -341,9 +369,7 @@
                         }
                     }
                 } else if (existingAudio) {
-                    existingAudio.outerHTML = '<span class="text-muted small">No audio</span>';
-                } else if (!existingNoAudio) {
-                    actionContainer.insertAdjacentHTML('beforeend', '<span class="text-muted small">No audio</span>');
+                    existingAudio.remove();
                 }
             }
             return true;
@@ -1013,7 +1039,10 @@
             try {
                 await API.post(`/api/chunks/${encodeURIComponent(chunkRef)}/regenerate`, {});
                 markChunkGeneratingLocally(chunkRef);
-                startTrackedChunkStatusPolling(chunkRef);
+                startTrackedChunkStatusPolling(chunkRef, {
+                    preserveGeneratingWhilePending: true,
+                    pendingGraceMs: 5000,
+                });
                 showToast('Regeneration started for the selected clip.', 'success', 3000);
             } catch (e) {
                 showToast('Failed to regenerate clip: ' + e.message, 'error');
@@ -1507,7 +1536,6 @@
                         <span class="text-muted small ms-1">seconds</span>
                     </td>
                     <td></td>
-                    <td></td>
                 </tr>
             `;
         }
@@ -1516,34 +1544,31 @@
             if (chunk.type === 'silence') return buildSilenceRowHtml(chunk);
             const chunkRef = getChunkRef(chunk);
             const quotedChunkRef = JSON.stringify(chunkRef);
-            const { statusColor, statusDetail } = getChunkStatusMeta(chunk);
             const audioFingerprint = getChunkAudioFingerprint(chunk);
+            const rowStatusClass = getEditorRowStatusClass(chunk);
 
-            const audioPlayer = chunk.audio_path ?
-                `<audio class="chunk-audio" data-id="${escapeHtml(chunkRef)}" data-audio-path="${escapeHtml(chunk.audio_path)}" data-audio-fingerprint="${escapeHtml(audioFingerprint)}" controls preload="none" src="${buildChunkAudioSrc(chunk, Date.now().toString())}" style="width: 200px; height: 30px;" onplay='stopOthers(${quotedChunkRef})'></audio>` :
-                '<span class="text-muted small">No audio</span>';
+            const audioPlayer = chunk.audio_path
+                ? `<audio class="chunk-audio" data-id="${escapeHtml(chunkRef)}" data-audio-path="${escapeHtml(chunk.audio_path)}" data-audio-fingerprint="${escapeHtml(audioFingerprint)}" controls preload="none" src="${buildChunkAudioSrc(chunk, Date.now().toString())}" style="width: 200px; height: 30px;" onplay='stopOthers(${quotedChunkRef})'></audio>`
+                : '';
 
             const actionArea = chunk.status === 'generating' ?
-                `<div class="progress" style="width: 100px; height: 20px;">
-                    <div class="progress-bar progress-bar-striped progress-bar-animated bg-warning" role="progressbar" style="width: 100%"></div>
-                 </div>` :
-                `<button class="btn btn-sm btn-primary" onclick='generateChunk(${quotedChunkRef})'><i class="fas fa-play"></i> Gen</button>`;
+                buildGeneratingProgressHtml() :
+                buildGenerateButtonHtml(chunkRef);
 
             return `
-                <tr data-id="${escapeHtml(chunkRef)}" data-chapter="${escapeHtml(getChunkChapterName(chunk) || '')}" class="chunk-row">
-                    <td class="text-center align-middle" style="white-space:nowrap;">
-                        <button class="chunk-expand-btn" onclick="toggleChunkExpand(this)" title="Expand/collapse"><i class="fas fa-chevron-down"></i></button><button class="chunk-expand-btn" onclick='insertChunkAfter(${quotedChunkRef})' title="Insert line below"><i class="fas fa-plus"></i></button><button class="chunk-expand-btn" onclick='insertSilenceAfter(${quotedChunkRef})' title="Insert silence below"><i class="fas fa-asterisk"></i></button><button class="chunk-expand-btn" onclick='deleteChunk(${quotedChunkRef})' title="Delete line"><i class="fas fa-trash" style="color:#dc3545;"></i></button>
-                    </td>
-                    <td><input type="text" class="form-control form-control-sm" value="${escapeHtml(chunk.speaker)}" data-editor-field="speaker" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})'></td>
-                    <td><textarea class="form-control form-control-sm chunk-text" rows="2" data-editor-field="text" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})'>${escapeHtml(chunk.text)}</textarea></td>
-                    <td><textarea class="form-control form-control-sm chunk-instruct" rows="2" data-editor-field="instruct" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})' title="Short TTS direction (3-8 words)">${escapeHtml(chunk.instruct || '')}</textarea></td>
-                    <td class="chunk-status-cell"><span class="badge bg-${statusColor}">${chunk.status}</span>${statusDetail}</td>
-                    <td>
-                        <div class="d-flex align-items-center gap-2">
-                            ${actionArea}
-                            ${audioPlayer}
+                <tr data-id="${escapeHtml(chunkRef)}" data-chapter="${escapeHtml(getChunkChapterName(chunk) || '')}" class="chunk-row${rowStatusClass ? ` ${rowStatusClass}` : ''}">
+                    <td class="text-center align-middle chunk-controls-cell">
+                        <div class="chunk-row-actions">
+                            <div class="chunk-generate-slot">${actionArea}</div>
+                            <div class="chunk-edit-controls">
+                                <button class="chunk-expand-btn" onclick="toggleChunkExpand(this)" title="Expand/collapse"><i class="fas fa-chevron-down"></i></button><button class="chunk-expand-btn" onclick='insertChunkAfter(${quotedChunkRef})' title="Insert line below"><i class="fas fa-plus"></i></button><button class="chunk-expand-btn" onclick='insertSilenceAfter(${quotedChunkRef})' title="Insert silence below"><i class="fas fa-asterisk"></i></button><button class="chunk-expand-btn" onclick='deleteChunk(${quotedChunkRef})' title="Delete line"><i class="fas fa-trash" style="color:#dc3545;"></i></button>
+                            </div>
                         </div>
                     </td>
+                    <td class="chunk-field-cell chunk-speaker-cell"><input type="text" class="form-control form-control-sm chunk-field-input chunk-speaker-input" value="${escapeHtml(chunk.speaker)}" data-editor-field="speaker" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})'></td>
+                    <td class="chunk-field-cell chunk-text-cell"><textarea class="form-control form-control-sm chunk-field-input chunk-text" rows="2" data-editor-field="text" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})'>${escapeHtml(chunk.text)}</textarea></td>
+                    <td class="chunk-field-cell chunk-instruct-cell"><textarea class="form-control form-control-sm chunk-field-input chunk-instruct" rows="2" data-editor-field="instruct" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})' title="Short TTS direction (3-8 words)">${escapeHtml(chunk.instruct || '')}</textarea></td>
+                    <td class="chunk-audio-cell"><div class="chunk-audio-slot">${audioPlayer}</div></td>
                 </tr>
             `;
         }
@@ -1553,7 +1578,7 @@
 
             // Show loading only if empty
             if (tbody.children.length === 0 || (tbody.children.length === 1 && tbody.children[0].children.length === 1)) {
-                tbody.innerHTML = '<tr><td colspan="6" class="text-center">Loading chunks...</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center">Loading chunks...</td></tr>';
                 forceFullRedraw = true;
             }
 
@@ -1572,7 +1597,7 @@
                     ? rawMerged.filter(c => !pendingDeleteRefs.has(getChunkRef(c)))
                     : rawMerged;
                 if (mergedChunks.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="text-center">No chunks found. Please generate script first.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="5" class="text-center">No chunks found. Please generate script first.</td></tr>';
                     cachedChunks = [];
                     cachedVisibleChunkIds = [];
                     cachedProofreadVisibleChunkIds = [];
@@ -1648,7 +1673,7 @@
                 } else {
                     // Full redraw needed
                     tbody.innerHTML = visibleChunks.length === 0
-                        ? '<tr><td colspan="6" class="text-center text-muted">No segments in this chapter yet.</td></tr>'
+                        ? '<tr><td colspan="5" class="text-center text-muted">No segments in this chapter yet.</td></tr>'
                         : visibleChunks.map(buildChunkRowHtml).join('');
                 }
 
@@ -2402,26 +2427,21 @@
 
                 // Optimistic UI update
                 if (tr) {
-                    const statusBadge = tr.querySelector('.badge');
-                    statusBadge.className = 'badge bg-warning';
-                    statusBadge.innerText = 'generating';
+                    tr.classList.remove('status-done');
+                    tr.classList.add('status-generating');
 
-                    // Replace button with progress bar
-                    const container = tr.querySelector('.d-flex');
-                    const btn = container.querySelector('button');
-                    if (btn) {
-                         const progressBar = document.createElement('div');
-                         progressBar.className = 'progress';
-                         progressBar.style.width = '100px';
-                         progressBar.style.height = '20px';
-                         progressBar.innerHTML = '<div class="progress-bar progress-bar-striped progress-bar-animated bg-warning" role="progressbar" style="width: 100%"></div>';
-                         container.replaceChild(progressBar, btn);
+                    const generateSlot = tr.querySelector('.chunk-generate-slot');
+                    if (generateSlot) {
+                        generateSlot.innerHTML = buildGeneratingProgressHtml();
                     }
                 }
 
                 await API.post(`/api/chunks/${id}/generate`, {});
                 markChunkGeneratingLocally(id);
-                startTrackedChunkStatusPolling(id);
+                startTrackedChunkStatusPolling(id, {
+                    preserveGeneratingWhilePending: true,
+                    pendingGraceMs: 5000,
+                });
             } catch (e) {
                 showToast("Failed to start generation: " + e.message, 'error');
                 loadChunks(true); // Revert UI with full redraw

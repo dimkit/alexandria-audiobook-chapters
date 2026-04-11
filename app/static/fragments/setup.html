@@ -191,7 +191,7 @@
                                 <label class="form-label" title="Concurrent TTS requests">Parallel Workers</label>
                                 <input type="number" class="form-control" id="parallel-workers" value="2" min="1" title="Concurrent TTS requests">
                             </div>
-                            <div class="col-md-2">
+                            <div class="col-md-2" id="batch-seed-group">
                                 <label class="form-label" title="Seed for reproducibility">Batch Seed</label>
                                 <input type="number" class="form-control" id="batch-seed" placeholder="-1 (random)" title="Seed for reproducibility">
                             </div>
@@ -216,13 +216,13 @@
                                     <label class="form-check-label" for="compile-codec" title="torch.compile the audio codec (~3-4x batch speed, slow first run)">Compile Codec</label>
                                 </div>
                             </div>
-                            <div class="col-md-2">
+                            <div class="col-md-2" id="batch-group-by-type-group">
                                 <div class="form-check form-switch mt-4">
                                     <input class="form-check-input" type="checkbox" id="batch-group-by-type" title="Group by voice type for GPU efficiency (disables sequential order)">
                                     <label class="form-check-label" for="batch-group-by-type" title="Group by voice type for GPU efficiency (disables sequential order)">Optimize Batch Order</label>
                                 </div>
                             </div>
-                            <div class="col-md-2">
+                            <div class="col-md-2" id="sub-batch-enabled-group">
                                 <div class="form-check form-switch mt-4">
                                     <input class="form-check-input" type="checkbox" id="sub-batch-enabled" checked title="Split batches by text length to reduce padding waste">
                                     <label class="form-check-label" for="sub-batch-enabled" title="Split batches by text length to reduce padding waste">Sub-batching</label>
