@@ -246,15 +246,26 @@
             for (const [taskName, elementId] of Object.entries(taskLogTargets)) {
                 const el = document.getElementById(elementId);
                 if (!el) continue;
+                const legacyModeActive = !!document.getElementById('legacy-mode-toggle')?.checked;
                 const isNewModeStageTask = (
                     taskName === 'process_paragraphs'
                     || taskName === 'assign_dialogue'
                     || taskName === 'extract_temperament'
                     || taskName === 'create_script'
                 );
-                if (newModeWorkflowActive && isNewModeStageTask) {
+                const isLegacyScriptPaneTask = (
+                    taskName === 'script'
+                    || taskName === 'review'
+                    || taskName === 'sanity'
+                    || taskName === 'repair'
+                );
+                if (newModeWorkflowActive && (isNewModeStageTask || isLegacyScriptPaneTask)) {
                     // Avoid multiple pollers writing to the same script log pane
                     // while the new-mode workflow is orchestrating these stages.
+                    continue;
+                }
+                if (!legacyModeActive && isLegacyScriptPaneTask) {
+                    // Legacy script-stage logs should only be restored when legacy mode is active.
                     continue;
                 }
                 try {

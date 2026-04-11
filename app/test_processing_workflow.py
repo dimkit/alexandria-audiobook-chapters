@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -61,6 +62,62 @@ class ProcessingWorkflowTests(unittest.TestCase):
         self.assertEqual(state["completed_stages"], ["script"])
         self.assertEqual(state["current_stage"], "script")
         self.assertTrue(any("Generate Annotated Script completed." in line for line in state["logs"]))
+
+    def test_restore_sanitizes_stale_legacy_pause_snapshot(self):
+        stale_payload = app_module._new_processing_workflow_state() | {
+            "running": False,
+            "paused": True,
+            "pause_requested": False,
+            "current_stage": None,
+            "logs": [
+                "Starting Generate Annotated Script...",
+                "Pause pressed: hard-killed all active tasks.",
+                "Debug pause probe: hard-killed all active tasks.",
+            ],
+        }
+        with open(self._workflow_state_path, "w", encoding="utf-8") as f:
+            json.dump(stale_payload, f)
+
+        app_module._restore_processing_workflow_state()
+
+        with app_module.processing_workflow_lock:
+            state = copy.deepcopy(app_module.process_state["processing_workflow"])
+
+        self.assertFalse(state["running"])
+        self.assertFalse(state["paused"])
+        self.assertIsNone(state["current_stage"])
+        self.assertEqual(state["logs"], [])
+
+        with open(self._workflow_state_path, "r", encoding="utf-8") as f:
+            persisted = json.load(f)
+        self.assertFalse(persisted["running"])
+        self.assertFalse(persisted["paused"])
+        self.assertIsNone(persisted["current_stage"])
+        self.assertEqual(persisted["logs"], [])
+
+    def test_restore_keeps_valid_paused_processing_state(self):
+        paused_payload = app_module._new_processing_workflow_state() | {
+            "running": False,
+            "paused": True,
+            "pause_requested": False,
+            "current_stage": "voices",
+            "logs": [
+                "Pause requested. Waiting for the current stage to stop safely.",
+                "Processing paused. Resume to continue from the current stage.",
+            ],
+        }
+        with open(self._workflow_state_path, "w", encoding="utf-8") as f:
+            json.dump(paused_payload, f)
+
+        app_module._restore_processing_workflow_state()
+
+        with app_module.processing_workflow_lock:
+            state = copy.deepcopy(app_module.process_state["processing_workflow"])
+
+        self.assertFalse(state["running"])
+        self.assertTrue(state["paused"])
+        self.assertEqual(state["current_stage"], "voices")
+        self.assertEqual(state["logs"], paused_payload["logs"])
 
 
 if __name__ == "__main__":

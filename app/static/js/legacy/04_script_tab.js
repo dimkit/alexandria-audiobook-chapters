@@ -181,8 +181,17 @@
         async function refreshProcessingWorkflowStatus() {
             const status = await API.get('/api/status/processing_workflow');
             renderProcessingWorkflowStatus(status);
+            let newModeStatus = null;
+            try {
+                newModeStatus = await API.get('/api/status/new_mode_workflow');
+            } catch (e) {
+                console.warn('Could not fetch new_mode_workflow status while refreshing legacy workflow', e);
+            }
+            const newModeActive = !!newModeStatus?.running || !!newModeStatus?.paused;
+            const legacyModeActive = !!document.getElementById('legacy-mode-toggle')?.checked;
+            const canWriteLegacyScriptLogs = legacyModeActive && !newModeActive;
             const activeTaskName = workflowStageTaskNames[status.current_stage] || null;
-            if (status.running && activeTaskName) {
+            if (canWriteLegacyScriptLogs && status.running && activeTaskName) {
                 try {
                     const activeTaskStatus = await API.get(`/api/status/${activeTaskName}`);
                     renderTaskLogs(activeTaskName, activeTaskStatus, 'script-logs');
@@ -192,7 +201,7 @@
                         document.getElementById('script-logs').innerText = status.logs.join('\n');
                     }
                 }
-            } else if (Array.isArray(status.logs) && status.logs.length) {
+            } else if (canWriteLegacyScriptLogs && Array.isArray(status.logs) && status.logs.length) {
                 document.getElementById('script-logs').innerText = status.logs.join('\n');
             }
             const isActive = !!status.running || !!status.paused;
@@ -204,7 +213,13 @@
             if (isActive && !processingWorkflowPollTimer) {
                 processingWorkflowPollTimer = setInterval(async () => {
                     try {
-                        const current = await API.get('/api/status/processing_workflow');
+                        const [current, currentNewModeStatus] = await Promise.all([
+                            API.get('/api/status/processing_workflow'),
+                            API.get('/api/status/new_mode_workflow').catch(() => null),
+                        ]);
+                        const currentNewModeActive = !!currentNewModeStatus?.running || !!currentNewModeStatus?.paused;
+                        const currentLegacyModeActive = !!document.getElementById('legacy-mode-toggle')?.checked;
+                        const canWriteCurrentLegacyScriptLogs = currentLegacyModeActive && !currentNewModeActive;
                         renderProcessingWorkflowStatus(current);
                         if (current.running && window.setNavTaskSpinner) {
                             window.setNavTaskSpinner('script');
@@ -212,7 +227,7 @@
                             window.releaseNavTaskSpinner('script');
                         }
                         const currentTaskName = workflowStageTaskNames[current.current_stage] || null;
-                        if (current.running && currentTaskName) {
+                        if (canWriteCurrentLegacyScriptLogs && current.running && currentTaskName) {
                             try {
                                 const currentTaskStatus = await API.get(`/api/status/${currentTaskName}`);
                                 renderTaskLogs(currentTaskName, currentTaskStatus, 'script-logs');
@@ -222,7 +237,7 @@
                                     document.getElementById('script-logs').innerText = current.logs.join('\n');
                                 }
                             }
-                        } else if (Array.isArray(current.logs) && current.logs.length) {
+                        } else if (canWriteCurrentLegacyScriptLogs && Array.isArray(current.logs) && current.logs.length) {
                             document.getElementById('script-logs').innerText = current.logs.join('\n');
                         }
                         if (!current.running && !current.paused && processingWorkflowPollTimer) {

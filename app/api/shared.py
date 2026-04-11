@@ -1214,6 +1214,37 @@ def _new_processing_workflow_state():
     }
 
 
+def _has_retired_processing_pause_text(logs):
+    for line in logs if isinstance(logs, list) else []:
+        text = str(line or "").lower()
+        if "hard-killed all active tasks" in text or "debug pause probe" in text:
+            return True
+    return False
+
+
+def _sanitize_restored_processing_workflow_state(restored):
+    """Normalize stale legacy workflow snapshots that should not be resumed/rendered."""
+    current_stage = str(restored.get("current_stage") or "").strip()
+    stale_retired_pause_snapshot = (
+        bool(restored.get("paused"))
+        and not bool(restored.get("running"))
+        and not current_stage
+        and _has_retired_processing_pause_text(restored.get("logs"))
+    )
+    if not stale_retired_pause_snapshot:
+        return False
+
+    options = restored.get("options")
+    resume_count = int(restored.get("resume_count", 0) or 0)
+    sanitized = _new_processing_workflow_state()
+    if isinstance(options, dict):
+        sanitized["options"] = options
+    sanitized["resume_count"] = resume_count
+    restored.clear()
+    restored.update(sanitized)
+    return True
+
+
 def _load_project_state_payload():
     state_path = os.path.join(ROOT_DIR, "state.json")
     if not os.path.exists(state_path):
@@ -3551,6 +3582,11 @@ def _restore_processing_workflow_state():
     restored = _new_processing_workflow_state()
     restored.update(payload)
     process_state["processing_workflow"] = restored
+    if _sanitize_restored_processing_workflow_state(process_state["processing_workflow"]):
+        logger.info("Discarded stale legacy processing workflow pause snapshot during restore.")
+        with processing_workflow_lock:
+            _refresh_processing_workflow_updated_at_locked()
+            _persist_processing_workflow_state_locked()
 
     if restored.get("running") and not restored.get("paused"):
         with processing_workflow_lock:
