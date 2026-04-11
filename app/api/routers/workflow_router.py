@@ -8,6 +8,10 @@ router = APIRouter()
 class NavTaskRequest(BaseModel):
     tab: Optional[str] = None
 
+
+class ResetNewModeRequest(BaseModel):
+    preserve_voices: bool = False
+
 def _ensure_new_mode_workflow_inactive(conflict_message: str = "Cannot run this step while Process Script is active. Pause or wait for new-mode workflow first."):
     state = process_state.get("new_mode_workflow") or {}
     if bool(state.get("running")) or bool(state.get("paused")):
@@ -235,15 +239,73 @@ async def start_extract_temperament(background_tasks: BackgroundTasks):
 async def get_script_info():
     """Return a lightweight summary of the current script state."""
     script_path = os.path.join(ROOT_DIR, "annotated_script.json")
+    voice_count = 0
+    has_voice_config = False
+    if os.path.exists(VOICE_CONFIG_PATH):
+        try:
+            with open(VOICE_CONFIG_PATH, "r", encoding="utf-8") as f:
+                voice_config = json.load(f)
+            if isinstance(voice_config, dict):
+                voice_count = len(voice_config)
+                has_voice_config = voice_count > 0
+        except Exception:
+            pass
+
+    has_voicelines = False
+    if os.path.isdir(VOICELINES_DIR):
+        try:
+            for entry in os.listdir(VOICELINES_DIR):
+                if not entry.startswith("."):
+                    has_voicelines = True
+                    break
+        except Exception:
+            pass
+
     if not os.path.exists(script_path):
-        return {"entry_count": 0}
+        return {
+            "entry_count": 0,
+            "has_voice_config": has_voice_config,
+            "voice_count": voice_count,
+            "has_voicelines": has_voicelines,
+        }
     try:
         with open(script_path, "r", encoding="utf-8") as f:
             doc = json.load(f)
         entries = doc.get("entries", []) if isinstance(doc, dict) else doc
-        return {"entry_count": len(entries) if isinstance(entries, list) else 0}
+        return {
+            "entry_count": len(entries) if isinstance(entries, list) else 0,
+            "has_voice_config": has_voice_config,
+            "voice_count": voice_count,
+            "has_voicelines": has_voicelines,
+        }
     except Exception:
-        return {"entry_count": 0}
+        return {
+            "entry_count": 0,
+            "has_voice_config": has_voice_config,
+            "voice_count": voice_count,
+            "has_voicelines": has_voicelines,
+        }
+
+
+def _run_create_script_task_with_new_mode_state(
+    run_id: str,
+    paragraphs_path: str,
+    voice_config_path: str,
+    script_output_path: str,
+    chunks_output_path: str,
+):
+    _run_create_script_task(
+        run_id,
+        paragraphs_path,
+        voice_config_path,
+        script_output_path,
+        chunks_output_path,
+    )
+    _mark_new_mode_stage_completed_marker("create_script")
+    with new_mode_workflow_lock:
+        options = process_state["new_mode_workflow"].get("options") or {}
+        process_state["new_mode_workflow"]["completed_stages"] = _derived_new_mode_completed_stages(options)
+        _persist_new_mode_workflow_state_locked()
 
 
 @router.get("/api/pipeline_step_status")
@@ -325,17 +387,24 @@ async def get_pipeline_step_status():
 
 
 @router.post("/api/reset_new_mode")
-async def reset_new_mode():
-    """Clear the script, chunks, and voice config so Create Script can start fresh."""
+async def reset_new_mode(request: ResetNewModeRequest = ResetNewModeRequest()):
+    """Clear script artifacts so Create Script can start fresh."""
     removed = []
-    for path in (
+    files_to_remove = [
         os.path.join(ROOT_DIR, "annotated_script.json"),
         CHUNKS_PATH,
-        VOICE_CONFIG_PATH,
-    ):
+    ]
+    if not request.preserve_voices:
+        files_to_remove.append(VOICE_CONFIG_PATH)
+
+    for path in files_to_remove:
         if os.path.exists(path):
             os.remove(path)
             removed.append(os.path.basename(path))
+
+    _clear_directory_contents(VOICELINES_DIR)
+    removed.append("voicelines/*")
+
     # Also reset the in-memory task state so _ensure_task_not_running won't block
     with task_state_lock:
         state = process_state.get("create_script")
@@ -347,7 +416,11 @@ async def reset_new_mode():
     with new_mode_workflow_lock:
         process_state["new_mode_workflow"]["completed_stages"] = []
         _persist_new_mode_workflow_state_locked()
-    return {"status": "reset", "removed": removed}
+    return {
+        "status": "reset",
+        "removed": removed,
+        "preserved_voices": bool(request.preserve_voices),
+    }
 
 
 @router.post("/api/create_script")
@@ -378,7 +451,7 @@ async def start_create_script(background_tasks: BackgroundTasks):
 
     run_id = _start_task_run("create_script")
     background_tasks.add_task(
-        _run_create_script_task, run_id,
+        _run_create_script_task_with_new_mode_state, run_id,
         paragraphs_path, voice_config_path, script_output_path, chunks_output_path,
     )
     return {"status": "started", "run_id": run_id}

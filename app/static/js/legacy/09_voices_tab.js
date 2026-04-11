@@ -11,6 +11,12 @@
         let _voiceSaveRetryTimer = null;
         let _voicePageUnloading = false;
         let _voiceAliasesPrimedForScript = false;
+        let _voiceSaveFlushPromise = null;
+        let _voiceSavePending = false;
+        let _voiceSavePendingOptions = {
+            promptConfirmation: false,
+            retryOnNetworkFailure: false,
+        };
 
         function isVoiceSaveNetworkError(error) {
             const message = String(error?.message || '').toLowerCase();
@@ -573,11 +579,26 @@
         let _voiceSaveTimer = null;
         let _voiceSaveInFlight = null;
 
-        async function saveVoicesNow(options = {}) {
-            const { promptConfirmation = true, retryOnNetworkFailure = false } = options;
+        function mergeVoiceSaveOptions(options = {}) {
+            return {
+                promptConfirmation: Boolean(options.promptConfirmation),
+                retryOnNetworkFailure: Boolean(options.retryOnNetworkFailure),
+            };
+        }
+
+        function queueVoiceSaveOptions(options = {}) {
+            const merged = mergeVoiceSaveOptions(options);
+            _voiceSavePending = true;
+            _voiceSavePendingOptions = {
+                promptConfirmation: _voiceSavePendingOptions.promptConfirmation || merged.promptConfirmation,
+                retryOnNetworkFailure: _voiceSavePendingOptions.retryOnNetworkFailure || merged.retryOnNetworkFailure,
+            };
+        }
+
+        async function performVoiceSave(options = {}) {
+            const { promptConfirmation = false, retryOnNetworkFailure = false } = options;
             const cards = document.querySelectorAll('.voice-card');
             if (cards.length === 0) return;
-            if (_voiceSaveInFlight) return _voiceSaveInFlight;
 
             const statusEl = document.getElementById('voice-save-status');
             statusEl.innerHTML = '<i class="fas fa-circle text-warning" style="font-size:0.5em;"></i> unsaved';
@@ -644,6 +665,34 @@
             })();
 
             return _voiceSaveInFlight;
+        }
+
+        async function saveVoicesNow(options = {}) {
+            const cards = document.querySelectorAll('.voice-card');
+            if (cards.length === 0) return;
+
+            queueVoiceSaveOptions(options);
+            if (_voiceSaveFlushPromise) {
+                return _voiceSaveFlushPromise;
+            }
+
+            _voiceSaveFlushPromise = (async () => {
+                try {
+                    while (_voiceSavePending) {
+                        const nextOptions = { ..._voiceSavePendingOptions };
+                        _voiceSavePending = false;
+                        _voiceSavePendingOptions = {
+                            promptConfirmation: false,
+                            retryOnNetworkFailure: false,
+                        };
+                        await performVoiceSave(nextOptions);
+                    }
+                } finally {
+                    _voiceSaveFlushPromise = null;
+                }
+            })();
+
+            return _voiceSaveFlushPromise;
         }
 
         function debouncedSaveVoices() {
@@ -836,6 +885,8 @@
             const results = Array.isArray(result?.results) ? result.results : [];
             const failures = Array.isArray(result?.failures) ? result.failures : [];
 
+            clearTimeout(_voiceSaveTimer);
+
             results.forEach((item, index) => {
                 const speaker = item?.speaker;
                 const voiceCard = getVoiceCardByName(speaker);
@@ -848,7 +899,7 @@
             });
 
             if (results.length > 0) {
-                await saveVoicesNow();
+                await saveVoicesNow({ promptConfirmation: false, retryOnNetworkFailure: true });
             }
 
             return { results, failures };

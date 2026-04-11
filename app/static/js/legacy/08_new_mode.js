@@ -86,11 +86,28 @@
             await lockGenerationMode('create_script_v2');
             try {
                 const info = await API.get('/api/script_info');
-                if (info.entry_count > 0) {
-                    if (!confirm(`An existing script with ${info.entry_count} lines was found.\n\nThis will permanently erase the current script and all voice assignments.\n\nContinue?`)) {
+                const hasExistingScriptState = (info.entry_count || 0) > 0;
+                const hasExistingVoiceState = !!info.has_voice_config;
+                const hasExistingAudioState = !!info.has_voicelines;
+                if (hasExistingScriptState || hasExistingVoiceState || hasExistingAudioState) {
+                    const existingParts = [];
+                    if (hasExistingScriptState) existingParts.push(`script with ${info.entry_count} lines`);
+                    if (hasExistingVoiceState) existingParts.push(`voice assignments (${info.voice_count || 0})`);
+                    if (hasExistingAudioState) existingParts.push('generated voice clips');
+                    const summary = existingParts.length ? existingParts.join(', ') : 'existing generated content';
+                    if (!confirm(`Existing ${summary} found.\n\nThis will permanently erase the current script and all generated voice clips.\n\nContinue?`)) {
                         return;
                     }
-                    await API.post('/api/reset_new_mode', {});
+                    let preserveVoices = false;
+                    if (hasExistingVoiceState) {
+                        const deleteVoices = confirm(
+                            'Delete saved voice assignments too?\n\n'
+                            + 'Click OK to delete voice assignments.\n'
+                            + 'Click Cancel to keep them and skip voice re-import.'
+                        );
+                        preserveVoices = !deleteVoices;
+                    }
+                    await API.post('/api/reset_new_mode', { preserve_voices: preserveVoices });
                     // Clear the editor display immediately so the old chunks don't linger
                     const tbody = document.getElementById('chunks-table-body');
                     if (tbody) tbody.innerHTML = '';

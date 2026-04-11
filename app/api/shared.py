@@ -3303,9 +3303,10 @@ def _run_create_script_task(run_id: str, paragraphs_path: str, voice_config_path
         tts = cfg.get("tts", {})
         if tts.get("auto_regenerate_bad_clips", False):
             retry_attempts = max(0, int(tts.get("auto_regenerate_bad_clip_attempts", 3) or 0))
-        script_max_length = int(tts.get("script_max_length", 100))
     except Exception:
-        script_max_length = 100
+        pass
+
+    script_max_length = _load_script_max_length()
 
     if dialogue_errors and retry_attempts > 0:
         run_process(
@@ -3323,6 +3324,16 @@ def _run_create_script_task(run_id: str, paragraphs_path: str, voice_config_path
         "create_script",
         run_id,
     )
+
+
+def _load_script_max_length() -> int:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        tts = cfg.get("tts", {})
+        return int(tts.get("script_max_length", 100))
+    except Exception:
+        return 100
 
 
 def _run_process_paragraphs_task(run_id: str, input_file: str, output_path: str):
@@ -3857,9 +3868,11 @@ def _run_new_mode_workflow_stage(stage_name: str):
             )
         elif stage_name == "create_script":
             script_path = os.path.join(ROOT_DIR, "annotated_script.json")
+            script_max_length = _load_script_max_length()
             success = run_process(
                 [sys.executable, "-u", "create_script.py",
-                 paragraphs_path, VOICE_CONFIG_PATH, script_path, CHUNKS_PATH],
+                 paragraphs_path, VOICE_CONFIG_PATH, script_path, CHUNKS_PATH,
+                 "--max-length", str(script_max_length)],
                 stage_name, run_id, relay_fn=relay,
             )
         elif stage_name == "proofread":

@@ -107,6 +107,49 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
         app_module._maybe_autosave_after_new_mode_stage("create_script")
         app_module._maybe_autosave_after_new_mode_stage("process_voices")
 
+    def test_new_mode_create_script_stage_passes_saved_script_max_length(self):
+        captured = {}
+
+        def fake_run_process(cmd, stage_name, run_id, relay_fn=None):
+            captured["cmd"] = cmd
+            captured["stage_name"] = stage_name
+            captured["run_id"] = run_id
+            return True
+
+        self._patch("_start_task_run", lambda _task_name: "run-1")
+        self._patch("run_process", fake_run_process)
+        self._patch("_new_mode_workflow_is_pause_requested", lambda: False)
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            config_path = os.path.join(temp_root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"tts": {"script_max_length": 250}}, f)
+
+            original_root = app_module.ROOT_DIR
+            original_config = app_module.CONFIG_PATH
+            original_voice = app_module.VOICE_CONFIG_PATH
+            original_chunks = app_module.CHUNKS_PATH
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.CONFIG_PATH = config_path
+                app_module.VOICE_CONFIG_PATH = os.path.join(temp_root, "voice_config.json")
+                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
+
+                app_module._run_new_mode_workflow_stage("create_script")
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.CONFIG_PATH = original_config
+                app_module.VOICE_CONFIG_PATH = original_voice
+                app_module.CHUNKS_PATH = original_chunks
+
+        self.assertEqual(captured["stage_name"], "create_script")
+        self.assertEqual(captured["run_id"], "run-1")
+        self.assertIn("--max-length", captured["cmd"])
+        self.assertEqual(
+            captured["cmd"][captured["cmd"].index("--max-length") + 1],
+            "250",
+        )
+
     def test_manual_stage_start_is_blocked_while_new_mode_workflow_active(self):
         with app_module.new_mode_workflow_lock:
             app_module.process_state["new_mode_workflow"] = app_module._new_mode_workflow_initial_state() | {
@@ -117,6 +160,146 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             asyncio.run(app_module.start_create_script(BackgroundTasks()))
         self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_reset_new_mode_can_preserve_voice_config_while_clearing_script_and_clips(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            script_path = os.path.join(temp_root, "annotated_script.json")
+            chunks_path = os.path.join(temp_root, "chunks.json")
+            voice_config_path = os.path.join(temp_root, "voice_config.json")
+            voicelines_dir = os.path.join(temp_root, "voicelines")
+            os.makedirs(voicelines_dir, exist_ok=True)
+            os.makedirs(os.path.join(voicelines_dir, "discarded"), exist_ok=True)
+
+            for path in (script_path, chunks_path, voice_config_path):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump({"ok": True}, f)
+            with open(os.path.join(voicelines_dir, "clip.wav"), "w", encoding="utf-8") as f:
+                f.write("audio")
+            with open(os.path.join(voicelines_dir, "discarded", "old.wav"), "w", encoding="utf-8") as f:
+                f.write("audio")
+
+            original_root = app_module.ROOT_DIR
+            original_chunks = app_module.CHUNKS_PATH
+            original_voice = app_module.VOICE_CONFIG_PATH
+            original_voicelines = app_module.VOICELINES_DIR
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.CHUNKS_PATH = chunks_path
+                app_module.VOICE_CONFIG_PATH = voice_config_path
+                app_module.VOICELINES_DIR = voicelines_dir
+
+                result = asyncio.run(
+                    app_module.reset_new_mode(app_module.ResetNewModeRequest(preserve_voices=True))
+                )
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.CHUNKS_PATH = original_chunks
+                app_module.VOICE_CONFIG_PATH = original_voice
+                app_module.VOICELINES_DIR = original_voicelines
+
+            self.assertEqual(result["status"], "reset")
+            self.assertTrue(result["preserved_voices"])
+            self.assertFalse(os.path.exists(script_path))
+            self.assertFalse(os.path.exists(chunks_path))
+            self.assertTrue(os.path.exists(voice_config_path))
+            self.assertEqual(os.listdir(voicelines_dir), [])
+
+    def test_reset_new_mode_deletes_voice_config_when_not_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            voice_config_path = os.path.join(temp_root, "voice_config.json")
+            voicelines_dir = os.path.join(temp_root, "voicelines")
+            os.makedirs(voicelines_dir, exist_ok=True)
+
+            with open(voice_config_path, "w", encoding="utf-8") as f:
+                json.dump({"Narrator": {"alias": "kept"}}, f)
+            with open(os.path.join(voicelines_dir, "clip.wav"), "w", encoding="utf-8") as f:
+                f.write("audio")
+
+            original_root = app_module.ROOT_DIR
+            original_voice = app_module.VOICE_CONFIG_PATH
+            original_voicelines = app_module.VOICELINES_DIR
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.VOICE_CONFIG_PATH = voice_config_path
+                app_module.VOICELINES_DIR = voicelines_dir
+
+                result = asyncio.run(app_module.reset_new_mode())
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.VOICE_CONFIG_PATH = original_voice
+                app_module.VOICELINES_DIR = original_voicelines
+
+            self.assertEqual(result["status"], "reset")
+            self.assertFalse(result["preserved_voices"])
+            self.assertFalse(os.path.exists(voice_config_path))
+            self.assertEqual(os.listdir(voicelines_dir), [])
+
+    def test_script_info_reports_voice_state_without_script_file(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            voice_config_path = os.path.join(temp_root, "voice_config.json")
+            voicelines_dir = os.path.join(temp_root, "voicelines")
+            os.makedirs(voicelines_dir, exist_ok=True)
+
+            with open(voice_config_path, "w", encoding="utf-8") as f:
+                json.dump({"Narrator": {}, "Alice": {}}, f)
+            with open(os.path.join(voicelines_dir, "clip.wav"), "w", encoding="utf-8") as f:
+                f.write("audio")
+
+            original_root = app_module.ROOT_DIR
+            original_voice = app_module.VOICE_CONFIG_PATH
+            original_voicelines = app_module.VOICELINES_DIR
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.VOICE_CONFIG_PATH = voice_config_path
+                app_module.VOICELINES_DIR = voicelines_dir
+
+                result = asyncio.run(app_module.get_script_info())
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.VOICE_CONFIG_PATH = original_voice
+                app_module.VOICELINES_DIR = original_voicelines
+
+            self.assertEqual(result["entry_count"], 0)
+            self.assertTrue(result["has_voice_config"])
+            self.assertEqual(result["voice_count"], 2)
+            self.assertTrue(result["has_voicelines"])
+
+    def test_standalone_create_script_marks_new_mode_stage_complete(self):
+        captured = {"calls": 0}
+
+        def fake_run_create_script_task(run_id, paragraphs_path, voice_config_path, script_output_path, chunks_output_path):
+            captured["calls"] += 1
+            captured["args"] = (run_id, paragraphs_path, voice_config_path, script_output_path, chunks_output_path)
+
+        self._patch("_run_create_script_task", fake_run_create_script_task)
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            state_path = os.path.join(temp_root, "state.json")
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+
+            original_root = app_module.ROOT_DIR
+            try:
+                app_module.ROOT_DIR = temp_root
+                with app_module.new_mode_workflow_lock:
+                    app_module.process_state["new_mode_workflow"] = app_module._new_mode_workflow_initial_state()
+
+                app_module._run_create_script_task_with_new_mode_state(
+                    "run-1",
+                    os.path.join(temp_root, "paragraphs.json"),
+                    os.path.join(temp_root, "voice_config.json"),
+                    os.path.join(temp_root, "annotated_script.json"),
+                    os.path.join(temp_root, "chunks.json"),
+                )
+
+                markers = app_module._load_new_mode_stage_markers()
+                completed = app_module.process_state["new_mode_workflow"]["completed_stages"]
+            finally:
+                app_module.ROOT_DIR = original_root
+
+        self.assertEqual(captured["calls"], 1)
+        self.assertIn("create_script", markers)
+        self.assertIn("create_script", completed)
 
     def test_restore_new_mode_workflow_ignores_stale_completed_list_when_markers_show_complete(self):
         with tempfile.TemporaryDirectory() as temp_root:
