@@ -2972,6 +2972,80 @@ class ProjectManager:
     def load_chunks(self):
         return self.load_chunks_raw()
 
+    @staticmethod
+    def _chunk_has_generated_work(chunk):
+        if not isinstance(chunk, dict):
+            return False
+        if str(chunk.get("audio_path") or "").strip():
+            return True
+        if chunk.get("status") in {"done", "generating", "error"}:
+            return True
+        if chunk.get("audio_validation"):
+            return True
+        if int(chunk.get("auto_regen_count") or 0) > 0:
+            return True
+        return False
+
+    @classmethod
+    def _script_sync_match_key(cls, chunk):
+        if not isinstance(chunk, dict):
+            return None
+        paragraph_id = str(chunk.get("paragraph_id") or "").strip()
+        chapter = (chunk.get("chapter") or "").strip()
+        speaker = cls._normalize_speaker_name(chunk.get("speaker"))
+        text = str(chunk.get("text") or "").strip()
+        instruct = str(chunk.get("instruct") or "").strip()
+        if paragraph_id:
+            return ("paragraph", paragraph_id, chapter, speaker, text, instruct)
+        if not text:
+            return None
+        return ("content", chapter, speaker, text, instruct)
+
+    def _preserve_chunk_state_for_script_sync(self, existing_chunks, rebuilt_chunks):
+        lookup = defaultdict(list)
+        for chunk in existing_chunks or []:
+            key = self._script_sync_match_key(chunk)
+            if key is not None:
+                lookup[key].append(chunk)
+
+        preserved = []
+        preserved_audio = 0
+        for index, chunk in enumerate(rebuilt_chunks or []):
+            merged = copy.deepcopy(chunk)
+            source = None
+            key = self._script_sync_match_key(chunk)
+            if key is not None:
+                matches = lookup.get(key) or []
+                if matches:
+                    source = matches.pop(0)
+
+            if source:
+                merged["uid"] = source.get("uid") or merged.get("uid") or self._new_chunk_uid()
+                for field in (
+                    "status",
+                    "audio_path",
+                    "audio_validation",
+                    "auto_regen_count",
+                    "proofread",
+                    "silence_duration_s",
+                    "type",
+                ):
+                    if field in source:
+                        merged[field] = copy.deepcopy(source[field])
+                if source.get("generation_token"):
+                    merged["generation_token"] = source["generation_token"]
+                else:
+                    merged.pop("generation_token", None)
+                if str(merged.get("audio_path") or "").strip():
+                    preserved_audio += 1
+            else:
+                merged["uid"] = merged.get("uid") or self._new_chunk_uid()
+
+            merged["id"] = index
+            preserved.append(merged)
+
+        return preserved, preserved_audio
+
     def sync_chunks_from_script_if_stale(self):
         """Rebuild chunks from annotated_script.json when the script is newer.
 
@@ -2991,21 +3065,31 @@ class ProjectManager:
         if script_mtime <= chunks_mtime:
             return {"synced": False, "reason": "chunks_current"}
 
+        existing_chunks = self.load_chunks_raw()
+        if any(self._chunk_has_generated_work(chunk) for chunk in existing_chunks):
+            return {
+                "synced": False,
+                "reason": "generated_audio_present",
+                "chunk_count": len(existing_chunks),
+            }
+
         script = load_script_document(self.script_path)["entries"]
-        chunks = script_entries_to_chunks(script)
+        rebuilt_chunks = script_entries_to_chunks(script)
+        chunks, preserved_audio = self._preserve_chunk_state_for_script_sync(existing_chunks, rebuilt_chunks)
         for i, chunk in enumerate(chunks):
             chunk["id"] = i
             chunk["uid"] = chunk.get("uid") or self._new_chunk_uid()
-            chunk["status"] = "pending"
-            chunk["audio_path"] = None
-            chunk["audio_validation"] = None
-            chunk["auto_regen_count"] = 0
+            chunk.setdefault("status", "pending")
+            chunk.setdefault("audio_path", None)
+            chunk.setdefault("audio_validation", None)
+            chunk.setdefault("auto_regen_count", 0)
 
         self.save_chunks(chunks)
         return {
             "synced": True,
             "reason": "script_newer_than_chunks",
             "chunk_count": len(chunks),
+            "preserved_audio": preserved_audio,
             "script_mtime": script_mtime,
             "chunks_mtime": chunks_mtime,
         }

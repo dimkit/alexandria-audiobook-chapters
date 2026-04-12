@@ -108,6 +108,7 @@
                         preserveVoices = !deleteVoices;
                     }
                     await API.post('/api/reset_new_mode', { preserve_voices: preserveVoices });
+                    window.resetPipelineTabLocks?.();
                     // Clear the editor display immediately so the old chunks don't linger
                     const tbody = document.getElementById('chunks-table-body');
                     if (tbody) tbody.innerHTML = '';

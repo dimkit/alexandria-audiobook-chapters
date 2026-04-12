@@ -5,6 +5,7 @@
             if (!confirmed) return;
             try {
                 await API.post('/api/reset_project', {});
+                window.resetPipelineTabLocks?.();
                 showToast('Project reset. Reloading...', 'success', 1500);
                 setTimeout(() => window.location.reload(), 500);
             } catch (e) {

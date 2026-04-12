@@ -334,6 +334,19 @@ async def get_pipeline_step_status():
         "create_script": "not_started",
     }
 
+    # A durable script project should keep the pipeline unlocked even if
+    # migration-era intermediates like paragraphs.json are absent.
+    if _project_script_complete_detected():
+        result.update(
+            {
+                "process_paragraphs": "complete",
+                "assign_dialogue": "complete",
+                "extract_temperament": "complete",
+                "create_script": "complete",
+            }
+        )
+        return result
+
     if not os.path.exists(paragraphs_path):
         return result
 

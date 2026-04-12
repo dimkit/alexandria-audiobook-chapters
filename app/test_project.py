@@ -467,9 +467,9 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
             "speaker": "NARRATOR",
             "text": "Old stale chunk.",
             "instruct": "",
-            "status": "done",
-            "audio_path": "voicelines/old.mp3",
-            "audio_validation": {"is_valid": True},
+            "status": "pending",
+            "audio_path": None,
+            "audio_validation": None,
             "auto_regen_count": 0,
             "chapter": "Old Chapter",
         }]
@@ -521,6 +521,83 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
         self.assertEqual(synced[0]["uid"], "currentchunk")
         self.assertEqual(synced[0]["status"], "done")
 
+    def test_sync_chunks_from_script_if_stale_refuses_to_discard_generated_audio(self):
+        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "entries": [
+                    {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
+                    {"speaker": "NARRATOR", "text": "Current chunk text.", "instruct": "", "chapter": "Chapter 1"},
+                ],
+                "dictionary": [],
+            }, f)
+
+        current_chunks = [{
+            "id": 0,
+            "uid": "currentchunk",
+            "speaker": "NARRATOR",
+            "text": "Current chunk text.",
+            "instruct": "",
+            "status": "done",
+            "audio_path": "voicelines/current.mp3",
+            "audio_validation": {"is_valid": True},
+            "auto_regen_count": 0,
+            "chapter": "Chapter 1",
+        }]
+        self.manager.save_chunks(current_chunks)
+        os.utime(self.manager.chunks_path, (time.time() - 10, time.time() - 10))
+        os.utime(self.manager.script_path, None)
+
+        result = self.manager.sync_chunks_from_script_if_stale()
+        synced = self.manager.load_chunks()
+
+        self.assertFalse(result["synced"])
+        self.assertEqual(result["reason"], "generated_audio_present")
+        self.assertEqual(synced[0]["uid"], "currentchunk")
+        self.assertEqual(synced[0]["status"], "done")
+        self.assertEqual(synced[0]["audio_path"], "voicelines/current.mp3")
+
+    def test_sync_chunks_from_script_if_stale_preserves_matching_chunk_uid_state(self):
+        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "entries": [
+                    {
+                        "speaker": "NARRATOR",
+                        "text": "Sentence one.",
+                        "instruct": "",
+                        "chapter": "Chapter 1",
+                        "paragraph_id": "p_0001",
+                    },
+                ],
+                "dictionary": [],
+            }, f)
+
+        current_chunks = [{
+            "id": 0,
+            "uid": "preserved-uid",
+            "speaker": "NARRATOR",
+            "text": "Sentence one.",
+            "instruct": "",
+            "status": "pending",
+            "audio_path": None,
+            "audio_validation": None,
+            "auto_regen_count": 0,
+            "chapter": "Chapter 1",
+            "paragraph_id": "p_0001",
+        }]
+        self.manager.save_chunks(current_chunks)
+        os.utime(self.manager.chunks_path, (time.time() - 10, time.time() - 10))
+        os.utime(self.manager.script_path, None)
+
+        result = self.manager.sync_chunks_from_script_if_stale()
+        synced = self.manager.load_chunks()
+
+        self.assertTrue(result["synced"])
+        self.assertEqual(result["reason"], "script_newer_than_chunks")
+        self.assertEqual(result["preserved_audio"], 0)
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0]["uid"], "preserved-uid")
+        self.assertEqual(synced[0]["text"], "Sentence one.")
+
     def test_sync_chunks_from_script_if_stale_preserves_sentence_level_entries_with_paragraph_ids(self):
         with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
             json.dump({
@@ -549,9 +626,9 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
             "speaker": "NARRATOR",
             "text": "Old stale chunk.",
             "instruct": "",
-            "status": "done",
-            "audio_path": "voicelines/old.mp3",
-            "audio_validation": {"is_valid": True},
+            "status": "pending",
+            "audio_path": None,
+            "audio_validation": None,
             "auto_regen_count": 0,
             "chapter": "Old Chapter",
         }]

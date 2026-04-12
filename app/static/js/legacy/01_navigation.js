@@ -3,6 +3,7 @@
         const SCRIPT_GATED_TABS = ['voices', 'editor', 'proofread', 'audio'];
         const NAV_TASK_TABS = new Set(['script', 'voices', 'editor', 'proofread', 'audio']);
         let currentNavTaskTab = null;
+        let stickyScriptReady = false;
 
         function renderNavTaskSpinner(tab) {
             currentNavTaskTab = NAV_TASK_TABS.has(tab) ? tab : null;
@@ -73,17 +74,31 @@
             dictionaryNavItem.style.display = scriptReady ? '' : 'none';
         }
 
-        window.updatePipelineTabLocks = function(isLegacy, scriptReady) {
-            updateDictionaryNavVisibility(scriptReady);
+        function applyPipelineTabLocks(isLegacy, scriptReady, { persist = true } = {}) {
+            if (persist && scriptReady) {
+                stickyScriptReady = true;
+            }
+            const effectiveScriptReady = !!isLegacy || !!scriptReady || stickyScriptReady;
+            updateDictionaryNavVisibility(effectiveScriptReady);
             SCRIPT_GATED_TABS.forEach(tab => {
                 const link = document.querySelector(`.nav-link[data-tab="${tab}"]`);
                 if (!link) return;
-                if (isLegacy || scriptReady) {
+                if (effectiveScriptReady) {
                     link.classList.remove('nav-locked');
                 } else {
                     link.classList.add('nav-locked');
                 }
             });
+        }
+
+        window.updatePipelineTabLocks = function(isLegacy, scriptReady) {
+            applyPipelineTabLocks(isLegacy, scriptReady);
+        };
+
+        window.resetPipelineTabLocks = function() {
+            stickyScriptReady = false;
+            const isLegacy = !!document.getElementById('legacy-mode-toggle')?.checked;
+            applyPipelineTabLocks(isLegacy, false, { persist: false });
         };
 
         document.querySelectorAll('.nav-link').forEach(link => {

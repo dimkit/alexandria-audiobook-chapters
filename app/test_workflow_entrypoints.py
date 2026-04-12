@@ -405,6 +405,38 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                 app_module.NEW_MODE_WORKFLOW_STATE_PATH = original_new_mode_path
                 app_module._start_new_mode_workflow_thread_locked = original_starter
 
+    def test_pipeline_step_status_treats_existing_script_project_as_complete_without_paragraphs(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            script_path = os.path.join(temp_root, "annotated_script.json")
+            chunks_path = os.path.join(temp_root, "chunks.json")
+            with open(script_path, "w", encoding="utf-8") as f:
+                json.dump({"entries": [{"speaker": "Narrator", "text": "Hello world."}]}, f)
+            with open(chunks_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    [{"id": 0, "speaker": "Narrator", "text": "Hello world.", "status": "done"}],
+                    f,
+                )
+
+            original_root = app_module.ROOT_DIR
+            original_script = app_module.SCRIPT_PATH
+            original_chunks = app_module.CHUNKS_PATH
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.SCRIPT_PATH = script_path
+                app_module.CHUNKS_PATH = chunks_path
+
+                result = asyncio.run(app_module.get_pipeline_step_status())
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.SCRIPT_PATH = original_script
+                app_module.CHUNKS_PATH = original_chunks
+
+            self.assertFalse(result["has_input_file"])
+            self.assertEqual(result["process_paragraphs"], "complete")
+            self.assertEqual(result["assign_dialogue"], "complete")
+            self.assertEqual(result["extract_temperament"], "complete")
+            self.assertEqual(result["create_script"], "complete")
+
     def test_start_new_mode_workflow_uses_stage_markers_to_skip_script_pipeline(self):
         with tempfile.TemporaryDirectory() as temp_root:
             with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
