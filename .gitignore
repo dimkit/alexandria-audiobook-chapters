@@ -98,3 +98,4 @@ data/state_store.db/mem%3Ahealth.bin
 data/state_store.db/mem%3Aindex%3Abm25.bin
 package-lock.json
 package.json
+voice_state.audit.jsonl

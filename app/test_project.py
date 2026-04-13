@@ -506,7 +506,16 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
                 "entries": [
                     {"speaker": "NARRATOR", "text": "Narration line."},
                     {"speaker": "Bob", "text": "Hi."},
-                    {"speaker": "Alice", "text": "Hello there."},
+                    {"speaker": "Alice", "text": "Line 1"},
+                    {"speaker": "Alice", "text": "Line 2"},
+                    {"speaker": "Alice", "text": "Line 3"},
+                    {"speaker": "Alice", "text": "Line 4"},
+                    {"speaker": "Alice", "text": "Line 5"},
+                    {"speaker": "Alice", "text": "Line 6"},
+                    {"speaker": "Alice", "text": "Line 7"},
+                    {"speaker": "Alice", "text": "Line 8"},
+                    {"speaker": "Alice", "text": "Line 9"},
+                    {"speaker": "Alice", "text": "Line 10"},
                 ],
                 "dictionary": [],
             }, f)
@@ -520,6 +529,30 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
         self.assertEqual(
             self.manager.resolve_voice_speaker("Bob", voice_config),
             "Alice",
+        )
+
+    def test_resolve_voice_speaker_manual_alias_to_thresholded_target_uses_stored_narrator_alias(self):
+        self.manager.set_narrator_threshold(10)
+        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "entries": [
+                    {"speaker": "NARRATOR", "text": "Narration line."},
+                    {"speaker": "Bob", "text": "Hi."},
+                    {"speaker": "Alice", "text": "Hello there."},
+                ],
+                "dictionary": [],
+            }, f)
+        voice_config = {
+            "NARRATOR": {},
+            "Bob": {"alias": "Alice"},
+            "Alice": {},
+        }
+        self.manager.refresh_auto_narrator_aliases(voice_config=voice_config)
+
+        self.assertEqual(self.manager.get_auto_narrator_aliases().get("Alice"), "NARRATOR")
+        self.assertEqual(
+            self.manager.resolve_voice_speaker("Bob", voice_config),
+            "NARRATOR",
         )
 
     def test_resolve_generation_speaker_routes_thresholded_lines_to_chapter_narrator_override(self):

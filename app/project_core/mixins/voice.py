@@ -876,8 +876,6 @@ class ProjectVoiceMixin:
                 current = target
 
             resolved = current or original
-            if manual_alias_used:
-                return resolved
 
             alias_lookup = {}
             for raw_speaker, raw_target in (
@@ -892,6 +890,9 @@ class ProjectVoiceMixin:
             stored_alias_target = alias_lookup.get(resolved_key)
             if stored_alias_target and self._normalize_speaker_name(stored_alias_target) != resolved_key:
                 return stored_alias_target
+
+            if manual_alias_used:
+                return resolved
 
             if speaker_line_counts is None and not chunks:
                 return resolved

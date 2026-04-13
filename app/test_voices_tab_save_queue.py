@@ -20,7 +20,7 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
             const vm = require('vm');
 
             const source = fs.readFileSync({str(VOICES_TAB_JS)!r}, 'utf8')
-                + '\\nthis.__voicesTabTestHooks = {{ saveVoicesNow, suggestVoiceDescriptionsBulk, collectVoiceConfig, flushPendingVoiceSavesOnUnload }};';
+                + '\\nthis.__voicesTabTestHooks = {{ saveVoicesNow, suggestVoiceDescriptionsBulk, collectVoiceConfig, flushPendingVoiceSavesOnUnload, updateVoiceAliasStates }};';
 
             function createControl(initial = '', classNames = []) {{
                 return {{
@@ -225,6 +225,7 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
                         suggestedSample: options.suggestedSample || '',
                         lineCount: String(options.lineCount || 10),
                         paragraphCount: String(options.paragraphCount || 10),
+                        autoAliasTarget: options.autoAliasTarget || '',
                     }},
                     classList: createClassList(state.classes),
                     querySelector(selector) {{
@@ -497,6 +498,37 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
                 assert.ok(
                     context.__toasts.some((entry) => entry.message.includes('Enable narration on another character before disabling the narrator.') && entry.level === 'warning'),
                     'expected warning toast'
+                );
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_threshold_alias_state_uses_backend_auto_alias_target(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const narrator = createVoiceCard('NARRATOR', { type: 'custom', narrates: false, lineCount: 100 });
+                const aerial = createVoiceCard('Aerial', {
+                    type: 'custom',
+                    narrates: false,
+                    lineCount: 1,
+                    autoAliasTarget: 'NARRATOR',
+                });
+                const context = createContext([narrator, aerial], async () => ({ status: 'ok' }));
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                context.__voicesTabTestHooks.updateVoiceAliasStates();
+
+                assert.strictEqual(aerial.card.classList.contains('narrator-threshold-active'), true);
+                assert.strictEqual(aerial.controls.aliasInput.disabled, false);
+                assert.ok(
+                    aerial.controls.aliasInput.title.includes('Auto-aliased to NARRATOR'),
+                    'expected narrator threshold tooltip from stored backend alias'
                 );
             })().catch((error) => {
                 console.error(error);

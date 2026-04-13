@@ -103,7 +103,7 @@
             clearTimeout(_voiceSettingsSaveTimer);
             _voiceSettingsSaveTimer = setTimeout(() => {
                 saveVoiceSettingsNow().then(() => {
-                    updateVoiceAliasStates();
+                    return loadVoices();
                 }).catch((e) => {
                     showToast(`Failed to save narrator threshold: ${e.message}`, 'error');
                 });
@@ -238,9 +238,13 @@
                 const target = getVoiceAliasTarget(card, nameMap);
                 const lineCount = Number(card.dataset.lineCount || 0);
                 const isNarrator = normalizeVoiceName(card.dataset.voice) === normalizeVoiceName('NARRATOR');
-                const thresholdTarget = (!target && narratorName && !isNarrator && lineCount < narratorThreshold)
+                const storedAutoAliasTarget = (!target && normalizeVoiceName(card.dataset.autoAliasTarget) !== normalizeVoiceName(card.dataset.voice))
+                    ? String(card.dataset.autoAliasTarget || '').trim()
+                    : '';
+                const computedThresholdTarget = (!target && narratorName && !isNarrator && lineCount < narratorThreshold)
                     ? narratorName
                     : '';
+                const thresholdTarget = computedThresholdTarget || storedAutoAliasTarget;
                 const disabled = Boolean(target || thresholdTarget);
                 const manualAliasActive = Boolean(target);
                 const narratorThresholdActive = Boolean(thresholdTarget);
@@ -278,6 +282,7 @@
             const voiceType = config.type || 'design';
             const safeName = escapeHtml(voice.name);
             const safeAlias = escapeHtml(config.alias || '');
+            const safeAutoAliasTarget = escapeHtml(voice.auto_alias_target || '');
             const designSampleText = config.ref_text || voice.suggested_sample_text || '';
             const designLoaded = Boolean((config.ref_audio || '').trim()) && !!voice.design_clone_loaded;
             const lineCount = Number(voice.line_count || 0);
@@ -286,7 +291,7 @@
             const narratesChecked = isNarratorCard ? config.narrates !== false : config.narrates === true;
 
             return `
-                <div class="card voice-card mb-3" data-voice="${safeName}" data-line-count="${lineCount}" data-paragraph-count="${Number(voice.paragraph_count || 0)}" data-suggested-sample="${escapeHtml(voice.suggested_sample_text || '')}">
+                <div class="card voice-card mb-3" data-voice="${safeName}" data-line-count="${lineCount}" data-paragraph-count="${Number(voice.paragraph_count || 0)}" data-suggested-sample="${escapeHtml(voice.suggested_sample_text || '')}" data-auto-alias-target="${safeAutoAliasTarget}">
                     <div class="card-body">
                         <div class="row">
                             <div class="col-md-3">
