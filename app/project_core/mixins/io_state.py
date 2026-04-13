@@ -41,7 +41,6 @@ from pydub.silence import detect_nonsilent
 from ffmpeg_utils import configure_pydub, get_ffmpeg_exe, get_ffprobe_exe
 from script_store import (
     apply_dictionary_to_text,
-    load_script_document,
 )
 from source_document import load_source_document, iter_document_paragraphs
 from project_core.constants import *
@@ -58,18 +57,18 @@ class ProjectIOStateMixin:
             return payload
 
         def load_paragraphs(self):
-            """Return the paragraphs.json document, or None if it does not exist yet."""
-            if not os.path.exists(self.paragraphs_path):
-                return None
-            with open(self.paragraphs_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            """Return the persisted paragraphs document, or None if absent."""
+            script_store = getattr(self, "script_store", None)
+            if script_store is None:
+                raise RuntimeError("Paragraphs require the SQLite script store")
+            return script_store.load_project_document("paragraphs")
 
         def save_paragraphs(self, data: dict):
-            """Atomically write paragraphs data to paragraphs.json."""
-            tmp = self.paragraphs_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, self.paragraphs_path)
+            """Persist paragraphs document to the SQLite project store."""
+            script_store = getattr(self, "script_store", None)
+            if script_store is None:
+                raise RuntimeError("Paragraphs require the SQLite script store")
+            script_store.replace_project_document("paragraphs", dict(data or {}), reason="save_paragraphs", wait=True)
 
         def _load_voice_config(self):
             script_store = getattr(self, "script_store", None)
@@ -119,28 +118,16 @@ class ProjectIOStateMixin:
             if self._transcription_cache is not None:
                 return self._transcription_cache
 
-            cache = {}
-            if os.path.exists(self.transcription_cache_path):
-                try:
-                    with open(self.transcription_cache_path, "r", encoding="utf-8") as f:
-                        payload = json.load(f)
-                    entries = payload.get("entries", []) if isinstance(payload, dict) else payload
-                    for entry in entries or []:
-                        if not isinstance(entry, dict):
-                            continue
-                        key = str(entry.get("key") or "").strip()
-                        if not key:
-                            continue
-                        cache[key] = dict(entry)
-                except (json.JSONDecodeError, ValueError, OSError):
-                    cache = {}
-
-            self._transcription_cache = cache
+            self._transcription_cache = {}
             return self._transcription_cache
 
         def _save_transcription_cache_locked(self):
-            entries = list((self._transcription_cache or {}).values())
-            self._atomic_json_write({"entries": entries}, self.transcription_cache_path)
+            script_store = getattr(self, "script_store", None)
+            if script_store is None:
+                raise RuntimeError("Transcription cache requires the SQLite script store")
+            script_store.clear_transcription_cache(reason="save_transcription_cache", wait=True)
+            for entry in list((self._transcription_cache or {}).values()):
+                script_store.store_transcription_cache(entry, reason="save_transcription_cache", wait=True)
 
         @staticmethod
         def _transcription_cache_key(filename, size_bytes):
@@ -158,7 +145,13 @@ class ProjectIOStateMixin:
                 cache = self._load_transcription_cache_locked()
                 entry = cache.get(key)
                 if not entry:
-                    return None
+                    script_store = getattr(self, "script_store", None)
+                    if script_store is None:
+                        return None
+                    entry = script_store.lookup_transcription_cache(filename, size_bytes)
+                    if not entry:
+                        return None
+                    cache[key] = dict(entry)
                 return {
                     "text": entry.get("text", ""),
                     "normalized_text": entry.get("normalized_text", ""),
@@ -185,7 +178,10 @@ class ProjectIOStateMixin:
             with self._transcription_cache_lock:
                 cache = self._load_transcription_cache_locked()
                 cache[entry["key"]] = entry
-                self._save_transcription_cache_locked()
+                script_store = getattr(self, "script_store", None)
+                if script_store is None:
+                    raise RuntimeError("Transcription cache requires the SQLite script store")
+                script_store.store_transcription_cache(entry, reason="store_cached_transcription", wait=True)
 
         def _copy_cached_transcription_key(self, source_relative_audio_path, target_relative_audio_path):
             source_full_path = os.path.join(self.root_dir, source_relative_audio_path)
@@ -205,7 +201,13 @@ class ProjectIOStateMixin:
                 cache = self._load_transcription_cache_locked()
                 entry = cache.get(source_key)
                 if not entry:
-                    return
+                    script_store = getattr(self, "script_store", None)
+                    if script_store is None:
+                        return
+                    entry = script_store.lookup_transcription_cache(source_filename, source_size_bytes)
+                    if not entry:
+                        return
+                    cache[source_key] = dict(entry)
                 cache[target_key] = {
                     **dict(entry),
                     "key": target_key,
@@ -213,7 +215,10 @@ class ProjectIOStateMixin:
                     "size_bytes": target_size_bytes,
                     "updated_at": time.time(),
                 }
-                self._save_transcription_cache_locked()
+                script_store = getattr(self, "script_store", None)
+                if script_store is None:
+                    raise RuntimeError("Transcription cache requires the SQLite script store")
+                script_store.store_transcription_cache(cache[target_key], reason="copy_cached_transcription", wait=True)
 
         def _current_script_title(self):
             state_path = os.path.join(self.root_dir, "state.json")

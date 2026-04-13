@@ -50,6 +50,60 @@ def _write_sqlite_db(path):
         conn.commit()
 
 
+def _sqlite_bytes():
+    with tempfile.TemporaryDirectory() as temp_root:
+        path = os.path.join(temp_root, "snapshot.sqlite3")
+        _write_sqlite_db(path)
+        with open(path, "rb") as f:
+            return f.read()
+
+
+def _ensure_project_root(root):
+    for dirname in (
+        "app",
+        "scripts",
+        "saved_projects",
+        "uploads",
+        "voicelines",
+        "clone_voices",
+        "designed_voices",
+        "workflow",
+        "db",
+        "repair",
+        "exports",
+    ):
+        os.makedirs(os.path.join(root, dirname), exist_ok=True)
+
+
+def _seed_db_project(root, *, entries=None, chunks=None, voice_config=None, state=None):
+    _ensure_project_root(root)
+    manager = ProjectManager(root)
+    try:
+        if entries is not None:
+            manager.script_store.replace_script_document(
+                entries=entries,
+                dictionary=[],
+                sanity_cache={"phrase_decisions": {}},
+                reason="test_seed_script",
+                rebuild_chunks=True,
+                wait=True,
+            )
+        if chunks is not None:
+            manager.save_chunks(chunks)
+        if voice_config is not None:
+            manager._save_voice_config(voice_config)
+        if state is not None:
+            _write_json(os.path.join(root, "state.json"), state)
+        return manager
+    except Exception:
+        manager.shutdown_script_store(flush=True)
+        raise
+
+
+def _snapshot_manager_db(manager, snapshot_path):
+    app_module._copy_sqlite_database_snapshot(manager.chunks_db_path, snapshot_path)
+
+
 class _StubProjectManager:
     def __init__(self):
         self.engine = object()
@@ -114,38 +168,45 @@ class _TempProjectRuntime:
             "ROOT_DIR",
             "SCRIPTS_DIR",
             "SAVED_PROJECTS_DIR",
-            "SCRIPT_PATH",
-            "VOICE_CONFIG_PATH",
-            "VOICES_PATH",
-            "CHUNKS_PATH",
             "UPLOADS_DIR",
+            "VOICELINES_DIR",
+            "CLONE_VOICES_DIR",
+            "DESIGNED_VOICES_DIR",
             "CLONE_VOICES_MANIFEST",
             "DESIGNED_VOICES_MANIFEST",
             "project_manager",
             "_any_project_task_running",
         ):
-            self.originals[name] = getattr(app_module, name)
+            self.originals[name] = getattr(app_module, name, None)
 
+        _ensure_project_root(self.temp_root)
         app_module.ROOT_DIR = self.temp_root
         app_module.SCRIPTS_DIR = os.path.join(self.temp_root, "scripts")
         app_module.SAVED_PROJECTS_DIR = os.path.join(self.temp_root, "saved_projects")
-        app_module.SCRIPT_PATH = os.path.join(self.temp_root, "annotated_script.json")
-        app_module.VOICE_CONFIG_PATH = os.path.join(self.temp_root, "voice_config.json")
-        app_module.VOICES_PATH = os.path.join(self.temp_root, "voices.json")
-        app_module.CHUNKS_PATH = os.path.join(self.temp_root, "chunks.json")
         app_module.UPLOADS_DIR = os.path.join(self.temp_root, "uploads")
+        app_module.VOICELINES_DIR = os.path.join(self.temp_root, "voicelines")
+        app_module.CLONE_VOICES_DIR = os.path.join(self.temp_root, "clone_voices")
+        app_module.DESIGNED_VOICES_DIR = os.path.join(self.temp_root, "designed_voices")
         app_module.CLONE_VOICES_MANIFEST = os.path.join(self.temp_root, "clone_voices", "manifest.json")
         app_module.DESIGNED_VOICES_MANIFEST = os.path.join(self.temp_root, "designed_voices", "manifest.json")
-        app_module.project_manager = _StubProjectManager()
+        self.manager = _seed_db_project(self.temp_root)
+        app_module.project_manager = self.manager
         app_module._any_project_task_running = lambda: None
 
-        for dirname in ("scripts", "saved_projects", "uploads", "voicelines", "clone_voices", "designed_voices"):
-            os.makedirs(os.path.join(self.temp_root, dirname), exist_ok=True)
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        manager = getattr(self, "manager", None)
+        if manager is not None:
+            try:
+                manager.shutdown_script_store(flush=True)
+            except Exception:
+                pass
         for name, value in self.originals.items():
-            setattr(app_module, name, value)
+            if value is None and hasattr(app_module, name):
+                delattr(app_module, name)
+            elif value is not None:
+                setattr(app_module, name, value)
         return False
 
 
@@ -156,9 +217,6 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 "ROOT_DIR": app_module.ROOT_DIR,
                 "SAVED_PROJECTS_DIR": app_module.SAVED_PROJECTS_DIR,
                 "SCRIPTS_DIR": app_module.SCRIPTS_DIR,
-                "SCRIPT_PATH": app_module.SCRIPT_PATH,
-                "VOICE_CONFIG_PATH": app_module.VOICE_CONFIG_PATH,
-                "CHUNKS_PATH": app_module.CHUNKS_PATH,
                 "UPLOADS_DIR": app_module.UPLOADS_DIR,
                 "VOICELINES_DIR": app_module.VOICELINES_DIR,
                 "CLONE_VOICES_DIR": getattr(app_module, "CLONE_VOICES_DIR", os.path.join(app_module.ROOT_DIR, "clone_voices")),
@@ -168,13 +226,12 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 "project_manager": app_module.project_manager,
                 "_any_project_task_running": app_module._any_project_task_running,
             }
+            manager = None
             try:
+                _ensure_project_root(temp_root)
                 app_module.ROOT_DIR = temp_root
                 app_module.SAVED_PROJECTS_DIR = os.path.join(temp_root, "saved_projects")
                 app_module.SCRIPTS_DIR = os.path.join(temp_root, "scripts")
-                app_module.SCRIPT_PATH = os.path.join(temp_root, "annotated_script.json")
-                app_module.VOICE_CONFIG_PATH = os.path.join(temp_root, "voice_config.json")
-                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
                 app_module.UPLOADS_DIR = os.path.join(temp_root, "uploads")
                 app_module.VOICELINES_DIR = os.path.join(temp_root, "voicelines")
                 app_module.CLONE_VOICES_DIR = os.path.join(temp_root, "clone_voices")
@@ -183,18 +240,6 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 app_module.DESIGNED_VOICES_MANIFEST = os.path.join(app_module.DESIGNED_VOICES_DIR, "manifest.json")
                 app_module._any_project_task_running = lambda: None
 
-                for dirname in (
-                    app_module.SAVED_PROJECTS_DIR,
-                    app_module.SCRIPTS_DIR,
-                    app_module.UPLOADS_DIR,
-                    app_module.VOICELINES_DIR,
-                    app_module.CLONE_VOICES_DIR,
-                    app_module.DESIGNED_VOICES_DIR,
-                ):
-                    os.makedirs(dirname, exist_ok=True)
-
-                with open(app_module.SCRIPT_PATH, "w", encoding="utf-8") as f:
-                    json.dump({"entries": [{"speaker": "Blake", "text": "hello"}], "dictionary": []}, f)
                 with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
                     json.dump({"loaded_script_name": "book", "input_file_path": os.path.join(app_module.UPLOADS_DIR, "story.txt")}, f)
                 with open(os.path.join(app_module.UPLOADS_DIR, "story.txt"), "w", encoding="utf-8") as f:
@@ -216,9 +261,11 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 with open(os.path.join(app_module.DESIGNED_VOICES_DIR, "book.blake.wav"), "wb") as f:
                     f.write(b"wav")
 
-                manager = ProjectManager(temp_root)
+                manager = _seed_db_project(
+                    temp_root,
+                    entries=[{"speaker": "Blake", "text": "hello"}],
+                )
                 app_module.project_manager = manager
-                manager.reload_script_store()
                 manager._save_voice_config(
                     {
                         "Blake": {
@@ -291,21 +338,21 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 f.write("stub")
             with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
                 json.dump({"input_file_path": input_path}, f)
-            with open(os.path.join(temp_root, "chunks.json"), "w", encoding="utf-8") as f:
-                json.dump(
-                    [
-                        {"id": 0, "chapter": "Chapter 1"},
-                        {"id": 1, "chapter": "Epilogue: Interview"},
-                    ],
-                    f,
-                )
 
             original_root = app_module.ROOT_DIR
-            original_chunks = app_module.CHUNKS_PATH
+            original_pm = app_module.project_manager
             original_loader = app_module.load_source_document
+            manager = None
             try:
                 app_module.ROOT_DIR = temp_root
-                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
+                manager = _seed_db_project(
+                    temp_root,
+                    chunks=[
+                        {"id": 0, "uid": "c1", "chapter": "Chapter 1", "speaker": "Narrator", "text": "A", "status": "pending"},
+                        {"id": 1, "uid": "c2", "chapter": "Epilogue: Interview", "speaker": "Narrator", "text": "B", "status": "pending"},
+                    ],
+                )
+                app_module.project_manager = manager
                 app_module.load_source_document = lambda _path: {
                     "type": "epub",
                     "chapters": [
@@ -320,7 +367,9 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 self.assertEqual(result["last_source_chapter"], "Epilogue: Interview")
             finally:
                 app_module.ROOT_DIR = original_root
-                app_module.CHUNKS_PATH = original_chunks
+                app_module.project_manager = original_pm
+                if manager is not None:
+                    manager.shutdown_script_store(flush=True)
                 app_module.load_source_document = original_loader
 
     def test_generate_script_skip_import_marks_script_complete_without_running(self):
@@ -446,11 +495,8 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_root:
             scripts_dir = os.path.join(temp_root, "scripts")
             os.makedirs(scripts_dir, exist_ok=True)
-            with open(os.path.join(scripts_dir, "demo.json"), "w", encoding="utf-8") as f:
-                json.dump({"entries": [], "dictionary": []}, f)
-            _write_sqlite_db(os.path.join(scripts_dir, "demo.chunks.sqlite3"))
-            with open(os.path.join(temp_root, "chunks.json"), "w", encoding="utf-8") as f:
-                json.dump([{"id": 0}], f)
+            manager = _seed_db_project(temp_root, entries=[{"speaker": "Narrator", "text": "hello"}])
+            _snapshot_manager_db(manager, os.path.join(scripts_dir, "demo.sqlite3"))
             with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
                 json.dump(
                     {
@@ -466,9 +512,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
 
             original_root = app_module.ROOT_DIR
             original_scripts = app_module.SCRIPTS_DIR
-            original_script = app_module.SCRIPT_PATH
-            original_voice_config = app_module.VOICE_CONFIG_PATH
-            original_chunks = app_module.CHUNKS_PATH
+            original_pm = app_module.project_manager
             original_audio_state = app_module.process_state["audio"].copy()
             with app_module.audio_queue_lock:
                 original_audio_queue = list(app_module.audio_queue)
@@ -476,9 +520,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
             try:
                 app_module.ROOT_DIR = temp_root
                 app_module.SCRIPTS_DIR = scripts_dir
-                app_module.SCRIPT_PATH = os.path.join(temp_root, "annotated_script.json")
-                app_module.VOICE_CONFIG_PATH = os.path.join(temp_root, "voice_config.json")
-                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
+                app_module.project_manager = manager
                 app_module.process_state["audio"]["running"] = False
                 with app_module.audio_queue_lock:
                     app_module.audio_queue.clear()
@@ -491,33 +533,30 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                     state = json.load(f)
                 self.assertFalse(state["render_prep_complete"])
                 self.assertEqual(list(state["processing_stage_markers"].keys()), ["script", "voices"])
-                self.assertFalse(os.path.exists(os.path.join(temp_root, "chunks.json")))
+                self.assertTrue(os.path.exists(manager.chunks_db_path))
             finally:
                 app_module.ROOT_DIR = original_root
                 app_module.SCRIPTS_DIR = original_scripts
-                app_module.SCRIPT_PATH = original_script
-                app_module.VOICE_CONFIG_PATH = original_voice_config
-                app_module.CHUNKS_PATH = original_chunks
+                app_module.project_manager = original_pm
                 app_module.process_state["audio"].clear()
                 app_module.process_state["audio"].update(original_audio_state)
                 with app_module.audio_queue_lock:
                     app_module.audio_queue[:] = original_audio_queue
                     app_module.audio_current_job = original_audio_current
+                manager.shutdown_script_store(flush=True)
 
     def test_load_script_ignores_stale_audio_running_flag_when_no_job_or_queue(self):
         with tempfile.TemporaryDirectory() as temp_root:
             scripts_dir = os.path.join(temp_root, "scripts")
             os.makedirs(scripts_dir, exist_ok=True)
-            with open(os.path.join(scripts_dir, "demo.json"), "w", encoding="utf-8") as f:
-                json.dump({"entries": [], "dictionary": []}, f)
-            _write_sqlite_db(os.path.join(scripts_dir, "demo.chunks.sqlite3"))
+            manager = _seed_db_project(temp_root, entries=[{"speaker": "Narrator", "text": "hello"}])
+            _snapshot_manager_db(manager, os.path.join(scripts_dir, "demo.sqlite3"))
             with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
                 json.dump({"render_prep_complete": True}, f)
 
             original_root = app_module.ROOT_DIR
             original_scripts = app_module.SCRIPTS_DIR
-            original_script = app_module.SCRIPT_PATH
-            original_chunks = app_module.CHUNKS_PATH
+            original_pm = app_module.project_manager
             original_audio_state = app_module.process_state["audio"].copy()
             with app_module.audio_queue_lock:
                 original_audio_queue = list(app_module.audio_queue)
@@ -525,8 +564,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
             try:
                 app_module.ROOT_DIR = temp_root
                 app_module.SCRIPTS_DIR = scripts_dir
-                app_module.SCRIPT_PATH = os.path.join(temp_root, "annotated_script.json")
-                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
+                app_module.project_manager = manager
 
                 app_module.process_state["audio"]["running"] = True  # stale flag
                 app_module.process_state["audio"]["merge_running"] = False
@@ -539,24 +577,24 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
             finally:
                 app_module.ROOT_DIR = original_root
                 app_module.SCRIPTS_DIR = original_scripts
-                app_module.SCRIPT_PATH = original_script
-                app_module.CHUNKS_PATH = original_chunks
+                app_module.project_manager = original_pm
                 app_module.process_state["audio"].clear()
                 app_module.process_state["audio"].update(original_audio_state)
                 with app_module.audio_queue_lock:
                     app_module.audio_queue[:] = original_audio_queue
                     app_module.audio_current_job = original_audio_current
+                manager.shutdown_script_store(flush=True)
 
     def test_normalize_archive_path_rejects_parent_traversal(self):
         with self.assertRaises(ValueError):
             app_module._normalize_archive_path("../secret.txt")
 
     def test_allowed_archive_paths_cover_expected_project_content(self):
-        self.assertTrue(app_module._is_allowed_project_archive_path("annotated_script.json"))
+        self.assertTrue(app_module._is_allowed_project_archive_path("db/chunks.sqlite3"))
         self.assertTrue(app_module._is_allowed_project_archive_path("voicelines/chunk_001.mp3"))
         self.assertTrue(app_module._is_allowed_project_archive_path("voicelines/discarded/rejected_001.mp3"))
         self.assertTrue(app_module._is_allowed_project_archive_path("clone_voices/manifest.json"))
-        self.assertTrue(app_module._is_allowed_project_archive_path("transcription_cache.json"))
+        self.assertTrue(app_module._is_allowed_project_archive_path("state.json"))
         self.assertFalse(app_module._is_allowed_project_archive_path("app/config.json"))
 
     def test_archive_state_rewrites_uploaded_file_path_relative_to_root(self):
@@ -586,38 +624,8 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
 
     def test_project_archive_entries_include_timeline_audio_voice_assets_discarded_pool_and_cache(self):
         with tempfile.TemporaryDirectory() as temp_root:
-            for dirname in ("voicelines", "clone_voices", "designed_voices", "uploads"):
-                os.makedirs(os.path.join(temp_root, dirname), exist_ok=True)
+            _ensure_project_root(temp_root)
             os.makedirs(os.path.join(temp_root, "voicelines", "discarded"), exist_ok=True)
-
-            files = {
-                "annotated_script.json": {"entries": [], "dictionary": []},
-                "voice_config.json": {
-                    "Narrator": {"ref_audio": "clone_voices/current_clone.wav"},
-                    "Alice": {"ref_audio": "designed_voices/current_design.wav"},
-                },
-                "voices.json": ["Narrator", "Alice"],
-                "chunks.json": [
-                    {"id": 0, "audio_path": "voicelines/live_a.mp3"},
-                    {"id": 1, "audio_path": "voicelines/live_b.mp3"},
-                    {"id": 2, "audio_path": None},
-                ],
-                "script_sanity_check.json": {"ok": True},
-                "state.json": {"input_file_path": os.path.join(temp_root, "uploads", "story.txt")},
-                "transcription_cache.json": {
-                    "entries": [
-                        {
-                            "filename": "voicelines/live_a.mp3",
-                            "size_bytes": 4,
-                            "text": "cached transcript",
-                            "normalized_text": "cached transcript",
-                        }
-                    ]
-                },
-            }
-            for rel, payload in files.items():
-                with open(os.path.join(temp_root, rel), "w", encoding="utf-8") as f:
-                    json.dump(payload, f)
 
             for rel in (
                 "voicelines/live_a.mp3",
@@ -642,25 +650,39 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
 
             original_root = app_module.ROOT_DIR
             original_uploads = app_module.UPLOADS_DIR
-            original_chunks = app_module.CHUNKS_PATH
-            original_voice_config = app_module.VOICE_CONFIG_PATH
             original_clone_manifest = getattr(app_module, "CLONE_VOICES_MANIFEST", None)
             original_design_manifest = getattr(app_module, "DESIGNED_VOICES_MANIFEST", None)
+            original_pm = app_module.project_manager
+            manager = None
             try:
                 app_module.ROOT_DIR = temp_root
-                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
-                app_module.VOICE_CONFIG_PATH = os.path.join(temp_root, "voice_config.json")
                 app_module.UPLOADS_DIR = os.path.join(temp_root, "uploads")
                 app_module.CLONE_VOICES_MANIFEST = os.path.join(temp_root, "clone_voices", "manifest.json")
                 app_module.DESIGNED_VOICES_MANIFEST = os.path.join(temp_root, "designed_voices", "manifest.json")
+                manager = _seed_db_project(
+                    temp_root,
+                    entries=[{"speaker": "Narrator", "text": "hello"}, {"speaker": "Alice", "text": "hi"}],
+                    chunks=[
+                        {"id": 0, "uid": "c1", "speaker": "Narrator", "text": "hello", "status": "done", "audio_path": "voicelines/live_a.mp3"},
+                        {"id": 1, "uid": "c2", "speaker": "Alice", "text": "hi", "status": "done", "audio_path": "voicelines/live_b.mp3"},
+                        {"id": 2, "uid": "c3", "speaker": "Narrator", "text": "later", "status": "pending", "audio_path": None},
+                    ],
+                    voice_config={
+                        "Narrator": {"ref_audio": "clone_voices/current_clone.wav"},
+                        "Alice": {"ref_audio": "designed_voices/current_design.wav"},
+                    },
+                    state={"input_file_path": os.path.join(temp_root, "uploads", "story.txt")},
+                )
+                app_module.project_manager = manager
                 entries = dict(app_module._project_archive_entries())
             finally:
                 app_module.ROOT_DIR = original_root
-                app_module.CHUNKS_PATH = original_chunks
-                app_module.VOICE_CONFIG_PATH = original_voice_config
                 app_module.UPLOADS_DIR = original_uploads
                 app_module.CLONE_VOICES_MANIFEST = original_clone_manifest
                 app_module.DESIGNED_VOICES_MANIFEST = original_design_manifest
+                app_module.project_manager = original_pm
+                if manager is not None:
+                    manager.shutdown_script_store(flush=True)
 
             self.assertIn("voicelines/live_a.mp3", entries)
             self.assertIn("voicelines/live_b.mp3", entries)
@@ -673,7 +695,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
             self.assertIn("designed_voices/current_design.wav", entries)
             self.assertNotIn("designed_voices/orphan_design.wav", entries)
             self.assertIn("uploads/story.txt", entries)
-            self.assertIn("db/transcription_cache.json", entries)
+            self.assertIn("db/chunks.sqlite3", {name: None for name in app_module.PROJECT_ARCHIVE_ALLOWED_FILES})
 
     def test_restore_project_archive_restores_discarded_pool_and_transcription_cache(self):
         with tempfile.TemporaryDirectory() as temp_root:
@@ -682,14 +704,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
             os.makedirs(os.path.join(extract_root, "uploads"), exist_ok=True)
             os.makedirs(os.path.join(extract_root, "clone_voices"), exist_ok=True)
             os.makedirs(os.path.join(extract_root, "designed_voices"), exist_ok=True)
-
-            with open(os.path.join(extract_root, "chunks.json"), "w", encoding="utf-8") as f:
-                json.dump([{"id": 0, "audio_path": None}], f)
-            with open(os.path.join(extract_root, "transcription_cache.json"), "w", encoding="utf-8") as f:
-                json.dump(
-                    {"entries": [{"filename": "voicelines/discarded/rejected.mp3", "size_bytes": 4, "text": "cached"}]},
-                    f,
-                )
+            _write_sqlite_db(os.path.join(extract_root, "db", "chunks.sqlite3"))
             with open(os.path.join(extract_root, "state.json"), "w", encoding="utf-8") as f:
                 json.dump({"input_file_path": "uploads/story.txt"}, f)
             with open(os.path.join(extract_root, "uploads", "story.txt"), "wb") as f:
@@ -724,7 +739,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
 
                 app_module._restore_project_archive(extract_root)
 
-                self.assertTrue(os.path.exists(os.path.join(temp_root, "transcription_cache.json")))
+                self.assertTrue(os.path.exists(os.path.join(temp_root, "chunks.sqlite3")))
                 self.assertTrue(os.path.exists(os.path.join(temp_root, "voicelines", "discarded", "rejected.mp3")))
                 with open(os.path.join(temp_root, "state.json"), "r", encoding="utf-8") as f:
                     restored_state = json.load(f)
@@ -740,30 +755,38 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
     def test_project_has_generated_audio_requires_existing_chunk_audio(self):
         with tempfile.TemporaryDirectory() as temp_root:
             with _TempProjectRuntime(self, temp_root):
-                _write_json(
-                    app_module.CHUNKS_PATH,
+                app_module.project_manager.save_chunks(
                     [
-                        {"id": 0, "audio_path": "voicelines/missing.mp3"},
-                        {"id": 1, "audio_path": None},
-                    ],
+                        {"id": 0, "uid": "c1", "speaker": "Narrator", "text": "hello", "status": "done", "audio_path": "voicelines/missing.mp3"},
+                        {"id": 1, "uid": "c2", "speaker": "Narrator", "text": "later", "status": "pending", "audio_path": None},
+                    ]
                 )
                 self.assertFalse(app_module._project_has_generated_audio())
 
                 audio_path = os.path.join(temp_root, "voicelines", "existing.mp3")
                 with open(audio_path, "wb") as f:
                     f.write(b"audio")
-                _write_json(app_module.CHUNKS_PATH, [{"id": 0, "audio_path": "voicelines/existing.mp3"}])
+                app_module.project_manager.save_chunks(
+                    [{"id": 0, "uid": "c1", "speaker": "Narrator", "text": "hello", "status": "done", "audio_path": "voicelines/existing.mp3"}]
+                )
                 self.assertTrue(app_module._project_has_generated_audio())
 
     def test_unified_save_uses_project_zip_without_audio_and_removes_script_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_root:
             with _TempProjectRuntime(self, temp_root):
-                _write_json(app_module.SCRIPT_PATH, {"entries": [], "dictionary": []})
-                _write_json(app_module.VOICE_CONFIG_PATH, {"Narrator": {}})
-                _write_json(app_module.CHUNKS_PATH, [{"id": 0, "audio_path": "voicelines/missing.mp3"}])
-                _write_sqlite_db(os.path.join(temp_root, "chunks.sqlite3"))
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.json"), {"old": True})
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json"), {"old": True})
+                app_module.project_manager.script_store.replace_script_document(
+                    entries=[{"speaker": "Narrator", "text": "hello"}],
+                    dictionary=[],
+                    sanity_cache={"phrase_decisions": {}},
+                    reason="test_seed_script",
+                    rebuild_chunks=True,
+                    wait=True,
+                )
+                app_module.project_manager._save_voice_config({"Narrator": {}})
+                app_module.project_manager.save_chunks(
+                    [{"id": 0, "uid": "c1", "speaker": "Narrator", "text": "hello", "status": "done", "audio_path": "voicelines/missing.mp3"}]
+                )
+                _write_sqlite_db(os.path.join(app_module.SCRIPTS_DIR, "demo.sqlite3"))
                 stale_zip = os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip")
                 _write_project_zip(stale_zip, {"state.json": {}})
 
@@ -772,35 +795,35 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 archive_path = os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip")
                 self.assertEqual(result["kind"], "project")
                 self.assertTrue(os.path.exists(archive_path))
-                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.json")))
-                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json")))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.sqlite3")))
                 with zipfile.ZipFile(archive_path, "r") as zf:
                     self.assertIn("db/chunks.sqlite3", zf.namelist())
 
     def test_unified_save_uses_project_zip_with_audio_and_removes_script_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_root:
             with _TempProjectRuntime(self, temp_root):
-                _write_json(app_module.SCRIPT_PATH, {"entries": [{"text": "hello"}], "dictionary": []})
-                _write_json(app_module.VOICE_CONFIG_PATH, {"Narrator": {}})
-                _write_json(app_module.VOICES_PATH, ["Narrator"])
-                _write_json(app_module.CHUNKS_PATH, [{"id": 0, "audio_path": "voicelines/live.mp3"}])
-                _write_sqlite_db(os.path.join(temp_root, "chunks.sqlite3"))
+                app_module.project_manager.script_store.replace_script_document(
+                    entries=[{"speaker": "Narrator", "text": "hello"}],
+                    dictionary=[],
+                    sanity_cache={"phrase_decisions": {}},
+                    reason="test_seed_script",
+                    rebuild_chunks=True,
+                    wait=True,
+                )
+                app_module.project_manager._save_voice_config({"Narrator": {}})
+                app_module.project_manager.save_chunks(
+                    [{"id": 0, "uid": "c1", "speaker": "Narrator", "text": "hello", "status": "done", "audio_path": "voicelines/live.mp3"}]
+                )
                 with open(os.path.join(temp_root, "voicelines", "live.mp3"), "wb") as f:
                     f.write(b"audio")
-                for suffix, payload in (
-                    (".json", {"old": True}),
-                    (".voice_config.json", {"old": True}),
-                    (".paragraphs.json", {"old": True}),
-                ):
-                    _write_json(os.path.join(app_module.SCRIPTS_DIR, f"demo{suffix}"), payload)
+                _write_sqlite_db(os.path.join(app_module.SCRIPTS_DIR, "demo.sqlite3"))
 
                 result = asyncio.run(app_module.save_script(app_module.ScriptSaveRequest(name="Demo")))
 
                 archive_path = os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip")
                 self.assertEqual(result["kind"], "project")
                 self.assertTrue(os.path.exists(archive_path))
-                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.json")))
-                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json")))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.sqlite3")))
                 with zipfile.ZipFile(archive_path, "r") as zf:
                     self.assertIn(app_module.PROJECT_ARCHIVE_MANIFEST_NAME, zf.namelist())
                     self.assertIn("voicelines/live.mp3", zf.namelist())
@@ -809,12 +832,11 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
     def test_unified_list_deduplicates_script_when_project_zip_exists(self):
         with tempfile.TemporaryDirectory() as temp_root:
             with _TempProjectRuntime(self, temp_root):
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.json"), {"entries": []})
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json"), {"Narrator": {}})
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "script_only.json"), {"entries": []})
+                _write_sqlite_db(os.path.join(app_module.SCRIPTS_DIR, "demo.sqlite3"))
+                _write_sqlite_db(os.path.join(app_module.SCRIPTS_DIR, "script_only.sqlite3"))
                 _write_project_zip(
                     os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip"),
-                    {"voice_config.json": {"Narrator": {}}, "chunks.json": []},
+                    {"db/chunks.sqlite3": _sqlite_bytes()},
                     metadata={"kind": "project", "has_audio": False, "has_voice_config": True, "chunk_count": 0, "chapter_count": 0},
                 )
 
@@ -830,11 +852,11 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
     def test_unified_load_prefers_project_zip_over_script_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_root:
             with _TempProjectRuntime(self, temp_root):
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.json"), {"entries": [{"text": "script"}]})
+                _write_sqlite_db(os.path.join(app_module.SCRIPTS_DIR, "demo.sqlite3"))
                 _write_project_zip(
                     os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip"),
                     {
-                        "annotated_script.json": {"entries": [{"text": "zip"}], "dictionary": []},
+                        "db/chunks.sqlite3": _sqlite_bytes(),
                         "state.json": {"input_file_path": "uploads/story.txt"},
                         "uploads/story.txt": b"story",
                     },
@@ -843,16 +865,12 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 result = asyncio.run(app_module.load_script(app_module.ScriptLoadRequest(name="Demo")))
 
                 self.assertEqual(result["kind"], "project")
-                with open(app_module.SCRIPT_PATH, "r", encoding="utf-8") as f:
-                    restored = json.load(f)
-                self.assertEqual(restored["entries"][0]["text"], "zip")
+                self.assertTrue(os.path.exists(app_module.project_manager.chunks_db_path))
 
     def test_unified_delete_removes_project_zip_and_script_companions(self):
         with tempfile.TemporaryDirectory() as temp_root:
             with _TempProjectRuntime(self, temp_root):
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.json"), {"entries": []})
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json"), {"Narrator": {}})
-                _write_json(os.path.join(app_module.SCRIPTS_DIR, "demo.paragraphs.json"), [])
+                _write_sqlite_db(os.path.join(app_module.SCRIPTS_DIR, "demo.sqlite3"))
                 with open(os.path.join(app_module.SCRIPTS_DIR, "demo.source.txt"), "w", encoding="utf-8") as f:
                     f.write("source")
                 _write_project_zip(os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip"), {"state.json": {}})
@@ -861,9 +879,7 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
 
                 self.assertEqual(result["status"], "deleted")
                 self.assertFalse(os.path.exists(os.path.join(app_module.SAVED_PROJECTS_DIR, "demo.zip")))
-                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.json")))
-                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.voice_config.json")))
-                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.paragraphs.json")))
+                self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.sqlite3")))
                 self.assertFalse(os.path.exists(os.path.join(app_module.SCRIPTS_DIR, "demo.source.txt")))
 
     def test_named_project_archive_restores_through_zip_validation_path(self):
@@ -873,16 +889,14 @@ class ProjectArchiveHelpersTests(unittest.TestCase):
                 _write_project_zip(
                     archive_path,
                     {
-                        "annotated_script.json": {"entries": [{"text": "restored"}], "dictionary": []},
+                        "db/chunks.sqlite3": _sqlite_bytes(),
                         "state.json": {},
                     },
                 )
 
                 app_module._restore_project_archive_zip(archive_path)
 
-                with open(app_module.SCRIPT_PATH, "r", encoding="utf-8") as f:
-                    restored = json.load(f)
-                self.assertEqual(restored["entries"][0]["text"], "restored")
+                self.assertTrue(os.path.exists(app_module.project_manager.chunks_db_path))
 
     def test_generate_script_rejects_duplicate_start_while_running(self):
         with tempfile.TemporaryDirectory() as temp_root:

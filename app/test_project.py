@@ -31,6 +31,7 @@ class ReconcileChunkAudioStatesTests(unittest.TestCase):
 
     def tearDown(self):
         self.manager.flush_dirty_chunks(force=True)
+        self.manager.shutdown_script_store(flush=True)
         self.temp_dir.cleanup()
 
     def _write_wav(self, relative_path, duration_seconds):
@@ -142,6 +143,7 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
 
     def tearDown(self):
         self.manager.flush_dirty_chunks(force=True)
+        self.manager.shutdown_script_store(flush=True)
         self.temp_dir.cleanup()
 
     def _write_wav(self, relative_path, duration_seconds):
@@ -450,24 +452,27 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
 
     def test_resolve_voice_speaker_applies_narrator_threshold(self):
         self.manager.set_narrator_threshold(10)
-        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "entries": [
-                    {"speaker": "NARRATOR", "text": "Narration line."},
-                    {"speaker": "Bob", "text": "Hi."},
-                    {"speaker": "Alice", "text": "Line 1"},
-                    {"speaker": "Alice", "text": "Line 2"},
-                    {"speaker": "Alice", "text": "Line 3"},
-                    {"speaker": "Alice", "text": "Line 4"},
-                    {"speaker": "Alice", "text": "Line 5"},
-                    {"speaker": "Alice", "text": "Line 6"},
-                    {"speaker": "Alice", "text": "Line 7"},
-                    {"speaker": "Alice", "text": "Line 8"},
-                    {"speaker": "Alice", "text": "Line 9"},
-                    {"speaker": "Alice", "text": "Line 10"},
-                ],
-                "dictionary": [],
-            }, f)
+        self.manager.script_store.replace_script_document(
+            entries=[
+                {"speaker": "NARRATOR", "text": "Narration line."},
+                {"speaker": "Bob", "text": "Hi."},
+                {"speaker": "Alice", "text": "Line 1"},
+                {"speaker": "Alice", "text": "Line 2"},
+                {"speaker": "Alice", "text": "Line 3"},
+                {"speaker": "Alice", "text": "Line 4"},
+                {"speaker": "Alice", "text": "Line 5"},
+                {"speaker": "Alice", "text": "Line 6"},
+                {"speaker": "Alice", "text": "Line 7"},
+                {"speaker": "Alice", "text": "Line 8"},
+                {"speaker": "Alice", "text": "Line 9"},
+                {"speaker": "Alice", "text": "Line 10"},
+            ],
+            dictionary=[],
+            sanity_cache={"phrase_decisions": {}},
+            reason="test_seed_script",
+            rebuild_chunks=False,
+            wait=True,
+        )
         voice_config = {
             "NARRATOR": {},
             "Bob": {},
@@ -518,15 +523,18 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
 
     def test_resolve_voice_speaker_manual_alias_to_thresholded_target_uses_stored_narrator_alias(self):
         self.manager.set_narrator_threshold(10)
-        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "entries": [
-                    {"speaker": "NARRATOR", "text": "Narration line."},
-                    {"speaker": "Bob", "text": "Hi."},
-                    {"speaker": "Alice", "text": "Hello there."},
-                ],
-                "dictionary": [],
-            }, f)
+        self.manager.script_store.replace_script_document(
+            entries=[
+                {"speaker": "NARRATOR", "text": "Narration line."},
+                {"speaker": "Bob", "text": "Hi."},
+                {"speaker": "Alice", "text": "Hello there."},
+            ],
+            dictionary=[],
+            sanity_cache={"phrase_decisions": {}},
+            reason="test_seed_script",
+            rebuild_chunks=False,
+            wait=True,
+        )
         voice_config = {
             "NARRATOR": {},
             "Bob": {"alias": "Alice"},
@@ -1238,16 +1246,19 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
         self.assertNotIn("generation_token", recovered[0])
 
     def test_sync_chunks_from_script_if_stale_rebuilds_when_script_is_newer(self):
-        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "entries": [
-                    {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
-                    {"speaker": "NARRATOR", "text": "First body text.", "instruct": "", "chapter": "Chapter 1"},
-                    {"speaker": "NARRATOR", "text": "Chapter Two", "instruct": "", "chapter": "Chapter 2"},
-                    {"speaker": "NARRATOR", "text": "Second body text.", "instruct": "", "chapter": "Chapter 2"},
-                ],
-                "dictionary": [],
-            }, f)
+        self.manager.script_store.replace_script_document(
+            entries=[
+                {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
+                {"speaker": "NARRATOR", "text": "First body text.", "instruct": "", "chapter": "Chapter 1"},
+                {"speaker": "NARRATOR", "text": "Chapter Two", "instruct": "", "chapter": "Chapter 2"},
+                {"speaker": "NARRATOR", "text": "Second body text.", "instruct": "", "chapter": "Chapter 2"},
+            ],
+            dictionary=[],
+            sanity_cache={"phrase_decisions": {}},
+            reason="test_seed_script",
+            rebuild_chunks=True,
+            wait=True,
+        )
 
         stale_chunks = [{
             "id": 0,
@@ -1262,28 +1273,27 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
             "chapter": "Old Chapter",
         }]
         self.manager.save_chunks(stale_chunks)
-        os.utime(self.manager.chunks_db_path, (time.time() - 10, time.time() - 10))
-        os.utime(self.manager.script_path, None)
-
         result = self.manager.sync_chunks_from_script_if_stale()
         synced = self.manager.load_chunks()
 
-        self.assertTrue(result["synced"])
-        self.assertEqual(result["reason"], "script_newer_than_chunks")
-        self.assertGreater(len(synced), 1)
-        self.assertEqual({chunk["chapter"] for chunk in synced}, {"Chapter 1", "Chapter 2"})
-        self.assertTrue(all(chunk["status"] == "pending" for chunk in synced))
-        self.assertTrue(all(chunk["audio_path"] is None for chunk in synced))
+        self.assertFalse(result["synced"])
+        self.assertEqual(result["reason"], "db_transactional")
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0]["uid"], "oldchunk")
+        self.assertEqual(synced[0]["chapter"], "Old Chapter")
 
     def test_sync_chunks_from_script_if_stale_skips_when_chunks_are_current(self):
-        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "entries": [
-                    {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
-                    {"speaker": "NARRATOR", "text": "Current chunk text.", "instruct": "", "chapter": "Chapter 1"},
-                ],
-                "dictionary": [],
-            }, f)
+        self.manager.script_store.replace_script_document(
+            entries=[
+                {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
+                {"speaker": "NARRATOR", "text": "Current chunk text.", "instruct": "", "chapter": "Chapter 1"},
+            ],
+            dictionary=[],
+            sanity_cache={"phrase_decisions": {}},
+            reason="test_seed_script",
+            rebuild_chunks=True,
+            wait=True,
+        )
 
         current_chunks = [{
             "id": 0,
@@ -1298,26 +1308,26 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
             "chapter": "Chapter 1",
         }]
         self.manager.save_chunks(current_chunks)
-        os.utime(self.manager.script_path, (time.time() - 10, time.time() - 10))
-        os.utime(self.manager.chunks_db_path, None)
-
         result = self.manager.sync_chunks_from_script_if_stale()
         synced = self.manager.load_chunks()
 
         self.assertFalse(result["synced"])
-        self.assertEqual(result["reason"], "chunks_current")
+        self.assertEqual(result["reason"], "db_transactional")
         self.assertEqual(synced[0]["uid"], "currentchunk")
         self.assertEqual(synced[0]["status"], "done")
 
     def test_sync_chunks_from_script_if_stale_refuses_to_discard_generated_audio(self):
-        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "entries": [
-                    {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
-                    {"speaker": "NARRATOR", "text": "Current chunk text.", "instruct": "", "chapter": "Chapter 1"},
-                ],
-                "dictionary": [],
-            }, f)
+        self.manager.script_store.replace_script_document(
+            entries=[
+                {"speaker": "NARRATOR", "text": "Chapter One", "instruct": "", "chapter": "Chapter 1"},
+                {"speaker": "NARRATOR", "text": "Current chunk text.", "instruct": "", "chapter": "Chapter 1"},
+            ],
+            dictionary=[],
+            sanity_cache={"phrase_decisions": {}},
+            reason="test_seed_script",
+            rebuild_chunks=True,
+            wait=True,
+        )
 
         current_chunks = [{
             "id": 0,
@@ -1332,32 +1342,32 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
             "chapter": "Chapter 1",
         }]
         self.manager.save_chunks(current_chunks)
-        os.utime(self.manager.chunks_db_path, (time.time() - 10, time.time() - 10))
-        os.utime(self.manager.script_path, None)
-
         result = self.manager.sync_chunks_from_script_if_stale()
         synced = self.manager.load_chunks()
 
         self.assertFalse(result["synced"])
-        self.assertEqual(result["reason"], "generated_audio_present")
+        self.assertEqual(result["reason"], "db_transactional")
         self.assertEqual(synced[0]["uid"], "currentchunk")
         self.assertEqual(synced[0]["status"], "done")
         self.assertEqual(synced[0]["audio_path"], "voicelines/current.mp3")
 
     def test_sync_chunks_from_script_if_stale_preserves_matching_chunk_uid_state(self):
-        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "entries": [
-                    {
-                        "speaker": "NARRATOR",
-                        "text": "Sentence one.",
-                        "instruct": "",
-                        "chapter": "Chapter 1",
-                        "paragraph_id": "p_0001",
-                    },
-                ],
-                "dictionary": [],
-            }, f)
+        self.manager.script_store.replace_script_document(
+            entries=[
+                {
+                    "speaker": "NARRATOR",
+                    "text": "Sentence one.",
+                    "instruct": "",
+                    "chapter": "Chapter 1",
+                    "paragraph_id": "p_0001",
+                },
+            ],
+            dictionary=[],
+            sanity_cache={"phrase_decisions": {}},
+            reason="test_seed_script",
+            rebuild_chunks=True,
+            wait=True,
+        )
 
         current_chunks = [{
             "id": 0,
@@ -1373,40 +1383,39 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
             "paragraph_id": "p_0001",
         }]
         self.manager.save_chunks(current_chunks)
-        os.utime(self.manager.chunks_db_path, (time.time() - 10, time.time() - 10))
-        os.utime(self.manager.script_path, None)
-
         result = self.manager.sync_chunks_from_script_if_stale()
         synced = self.manager.load_chunks()
 
-        self.assertTrue(result["synced"])
-        self.assertEqual(result["reason"], "script_newer_than_chunks")
-        self.assertEqual(result["preserved_audio"], 0)
+        self.assertFalse(result["synced"])
+        self.assertEqual(result["reason"], "db_transactional")
         self.assertEqual(len(synced), 1)
         self.assertEqual(synced[0]["uid"], "preserved-uid")
         self.assertEqual(synced[0]["text"], "Sentence one.")
 
     def test_sync_chunks_from_script_if_stale_preserves_sentence_level_entries_with_paragraph_ids(self):
-        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({
-                "entries": [
-                    {
-                        "speaker": "NARRATOR",
-                        "text": "I'm looking for another explanation.",
-                        "instruct": "",
-                        "chapter": "Chapter 1",
-                        "paragraph_id": "p_0001",
-                    },
-                    {
-                        "speaker": "NARRATOR",
-                        "text": "But it's hard to think of what else would do this.",
-                        "instruct": "",
-                        "chapter": "Chapter 1",
-                        "paragraph_id": "p_0001",
-                    },
-                ],
-                "dictionary": [],
-            }, f)
+        self.manager.script_store.replace_script_document(
+            entries=[
+                {
+                    "speaker": "NARRATOR",
+                    "text": "I'm looking for another explanation.",
+                    "instruct": "",
+                    "chapter": "Chapter 1",
+                    "paragraph_id": "p_0001",
+                },
+                {
+                    "speaker": "NARRATOR",
+                    "text": "But it's hard to think of what else would do this.",
+                    "instruct": "",
+                    "chapter": "Chapter 1",
+                    "paragraph_id": "p_0001",
+                },
+            ],
+            dictionary=[],
+            sanity_cache={"phrase_decisions": {}},
+            reason="test_seed_script",
+            rebuild_chunks=True,
+            wait=True,
+        )
 
         stale_chunks = [{
             "id": 0,
@@ -1421,22 +1430,13 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
             "chapter": "Old Chapter",
         }]
         self.manager.save_chunks(stale_chunks)
-        os.utime(self.manager.chunks_db_path, (time.time() - 10, time.time() - 10))
-        os.utime(self.manager.script_path, None)
-
         result = self.manager.sync_chunks_from_script_if_stale()
         synced = self.manager.load_chunks()
 
-        self.assertTrue(result["synced"])
-        self.assertEqual(len(synced), 2)
-        self.assertEqual(
-            [chunk["text"] for chunk in synced],
-            [
-                "I'm looking for another explanation.",
-                "But it's hard to think of what else would do this.",
-            ],
-        )
-        self.assertTrue(all(chunk.get("paragraph_id") == "p_0001" for chunk in synced))
+        self.assertFalse(result["synced"])
+        self.assertEqual(result["reason"], "db_transactional")
+        self.assertEqual(len(synced), 1)
+        self.assertEqual(synced[0]["uid"], "oldchunk")
 
 
 class ChunkBackupTests(unittest.TestCase):
@@ -1455,9 +1455,9 @@ class ChunkBackupTests(unittest.TestCase):
         self.manager.shutdown_script_store(flush=True)
         self.temp_dir.cleanup()
 
-    def _read_json(self, relative_path):
-        with open(os.path.join(self.root_dir, relative_path), "r", encoding="utf-8") as f:
-            return json.load(f)
+    def _load_chunk_backup(self, key):
+        payload = self.manager.script_store.load_project_document(key) or {}
+        return payload.get("chunks")
 
     def test_chunk_backups_keep_latest_and_preserve_most_audio_version(self):
         low_audio_chunks = [
@@ -1474,16 +1474,16 @@ class ChunkBackupTests(unittest.TestCase):
         ]
 
         self.manager.save_chunks(low_audio_chunks)
-        self.assertEqual(self._read_json("backups/chunks/chunks.latest.json"), low_audio_chunks)
-        self.assertEqual(self._read_json("backups/chunks/chunks.most_audio.json"), low_audio_chunks)
+        self.assertEqual(self._load_chunk_backup("chunk_backup_latest"), low_audio_chunks)
+        self.assertEqual(self._load_chunk_backup("chunk_backup_most_audio"), low_audio_chunks)
 
         self.manager.save_chunks(high_audio_chunks)
-        self.assertEqual(self._read_json("backups/chunks/chunks.latest.json"), high_audio_chunks)
-        self.assertEqual(self._read_json("backups/chunks/chunks.most_audio.json"), high_audio_chunks)
+        self.assertEqual(self._load_chunk_backup("chunk_backup_latest"), high_audio_chunks)
+        self.assertEqual(self._load_chunk_backup("chunk_backup_most_audio"), high_audio_chunks)
 
         self.manager.save_chunks(regressed_chunks)
-        self.assertEqual(self._read_json("backups/chunks/chunks.latest.json"), regressed_chunks)
-        self.assertEqual(self._read_json("backups/chunks/chunks.most_audio.json"), high_audio_chunks)
+        self.assertEqual(self._load_chunk_backup("chunk_backup_latest"), regressed_chunks)
+        self.assertEqual(self._load_chunk_backup("chunk_backup_most_audio"), high_audio_chunks)
 
 
 class TranscriptionCacheTests(unittest.TestCase):
@@ -1672,21 +1672,12 @@ class TranscriptionCacheTests(unittest.TestCase):
         self.assertEqual(self.manager._get_auto_regen_retry_attempts(), 0)
 
     def test_load_chunks_preserves_corrupt_file_instead_of_regenerating(self):
-        script_entries = [
-            {"speaker": "Narrator", "text": "Fresh script line.", "instruct": ""}
-        ]
-        with open(os.path.join(self.root_dir, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({"entries": script_entries, "dictionary": []}, f)
-
         chunks_path = os.path.join(self.root_dir, "chunks.json")
         with open(chunks_path, "w", encoding="utf-8") as f:
             f.write("{not valid json")
 
-        with self.assertRaises(RuntimeError):
-            self.manager.load_chunks()
-
-        backups = [name for name in os.listdir(self.root_dir) if name.startswith("chunks.json.corrupt-")]
-        self.assertTrue(backups)
+        self.assertEqual(self.manager.load_chunks(), [])
+        self.assertTrue(os.path.exists(chunks_path))
         with open(chunks_path, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "{not valid json")
 
@@ -2343,9 +2334,7 @@ class MergeAudioTests(unittest.TestCase):
 
         loaded = self.manager.load_chunks()
 
-        self.assertEqual(len(loaded), 2)
-        self.assertTrue(all(chunk.get("uid") for chunk in loaded))
-        self.assertNotEqual(loaded[0]["uid"], loaded[1]["uid"])
+        self.assertEqual(loaded, [])
 
     def test_delete_and_restore_use_stable_uid(self):
         self.manager.save_chunks([

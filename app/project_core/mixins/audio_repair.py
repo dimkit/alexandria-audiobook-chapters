@@ -38,10 +38,7 @@ from asr import LocalASREngine, LocalASRUnavailableError
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 from ffmpeg_utils import configure_pydub, get_ffmpeg_exe, get_ffprobe_exe
-from script_store import (
-    apply_dictionary_to_text,
-    load_script_document,
-)
+from script_store import apply_dictionary_to_text
 from source_document import load_source_document, iter_document_paragraphs
 from project_core.constants import *
 from project_core.chunking import _coerce_bool, get_speaker, _is_structural_text, _extract_chapter_name, _build_chunk, group_into_chunks, script_entries_to_chunks

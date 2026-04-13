@@ -1,9 +1,9 @@
 """Chunk persistence, indexing, and script-sync reconciliation utilities.
 
 This mixin handles:
-- loading/saving ``chunks.json`` with atomic writes and backups,
+- loading/saving chunk state through the SQLite script store,
 - resolving chunk references (uid/id/index) robustly for API/UI calls, and
-- reconciling stale chunk state against script updates and on-disk audio.
+- reconciling chunk state against script updates and on-disk audio.
 """
 
 import os
@@ -42,7 +42,6 @@ from pydub.silence import detect_nonsilent
 from ffmpeg_utils import configure_pydub, get_ffmpeg_exe, get_ffprobe_exe
 from script_store import (
     apply_dictionary_to_text,
-    load_script_document,
 )
 from chunk_events import chunk_event_broker
 from source_document import load_source_document, iter_document_paragraphs
@@ -50,6 +49,9 @@ from project_core.constants import *
 from project_core.chunking import _coerce_bool, get_speaker, _is_structural_text, _extract_chapter_name, _build_chunk, group_into_chunks, script_entries_to_chunks
 
 class ProjectChunkStoreMixin:
+        _CHUNK_BACKUP_LATEST_KEY = "chunk_backup_latest"
+        _CHUNK_BACKUP_MOST_AUDIO_KEY = "chunk_backup_most_audio"
+
         """Provide durable chunk storage and integrity/recovery helpers."""
         @staticmethod
         def _normalize_scope_mode(scope_mode):
@@ -332,52 +334,13 @@ class ProjectChunkStoreMixin:
             return preserved, preserved_audio
 
         def sync_chunks_from_script_if_stale(self):
-            """Rebuild chunks from annotated_script.json when the script is newer.
-
-            This is a conservative sync used when navigating into the editor after a
-            script-generation/review flow. It avoids overwriting user-edited chunks
-            unless the script file is clearly newer than the chunk timeline.
-            """
-            if not os.path.exists(self.script_path):
+            """Script/chunk synchronization is handled transactionally inside SQLite."""
+            if not self.load_script_document().get("entries"):
                 return {"synced": False, "reason": "no_script"}
-
-            if not self.load_chunks():
-                chunks = self.load_chunks()
-                return {"synced": True, "reason": "missing_chunks", "chunk_count": len(chunks)}
-
-            script_mtime = os.path.getmtime(self.script_path)
-            chunks_mtime = os.path.getmtime(self.chunks_db_path) if os.path.exists(self.chunks_db_path) else 0
-            if script_mtime <= chunks_mtime:
-                return {"synced": False, "reason": "chunks_current"}
-
-            existing_chunks = self.load_chunks_raw()
-            if any(self._chunk_has_generated_work(chunk) for chunk in existing_chunks):
-                return {
-                    "synced": False,
-                    "reason": "generated_audio_present",
-                    "chunk_count": len(existing_chunks),
-                }
-
-            script = load_script_document(self.script_path)["entries"]
-            rebuilt_chunks = script_entries_to_chunks(script)
-            chunks, preserved_audio = self._preserve_chunk_state_for_script_sync(existing_chunks, rebuilt_chunks)
-            for i, chunk in enumerate(chunks):
-                chunk["id"] = i
-                chunk["uid"] = chunk.get("uid") or self._new_chunk_uid()
-                chunk.setdefault("status", "pending")
-                chunk.setdefault("audio_path", None)
-                chunk.setdefault("audio_validation", None)
-                chunk.setdefault("auto_regen_count", 0)
-
-            self.save_chunks(chunks)
-            return {
-                "synced": True,
-                "reason": "script_newer_than_chunks",
-                "chunk_count": len(chunks),
-                "preserved_audio": preserved_audio,
-                "script_mtime": script_mtime,
-                "chunks_mtime": chunks_mtime,
-            }
+            chunks = self.load_chunks()
+            if not chunks:
+                return {"synced": False, "reason": "no_chunks"}
+            return {"synced": False, "reason": "db_transactional"}
 
         def reconcile_chunk_audio_states(self):
             """Repair stale error states when a stored clip is actually valid.
@@ -533,37 +496,68 @@ class ProjectChunkStoreMixin:
             return outcome
 
         def load_script_document(self):
-            if not os.path.exists(self.script_path):
-                return {"entries": [], "dictionary": []}
-            return load_script_document(self.script_path)
+            script_store = getattr(self, "script_store", None)
+            if script_store is None:
+                raise RuntimeError("Script document requires the SQLite script store")
+            return script_store.load_script_document()
 
         def load_dictionary_entries(self):
-            return self.load_script_document()["dictionary"]
+            script_store = getattr(self, "script_store", None)
+            if script_store is None:
+                raise RuntimeError("Dictionary requires the SQLite script store")
+            return script_store.load_dictionary_entries()
 
         @staticmethod
         def _count_audio_linked_chunks(chunks):
             return sum(1 for chunk in (chunks or []) if str((chunk or {}).get("audio_path") or "").strip())
 
-        def _load_chunk_backup_audio_count(self, backup_path):
-            if not os.path.exists(backup_path):
+        def _load_chunk_backup_document(self, key):
+            script_store = getattr(self, "script_store", None)
+            if script_store is None:
+                return None
+            payload = script_store.load_project_document(key)
+            if not isinstance(payload, dict):
+                return None
+            chunks = payload.get("chunks")
+            if not isinstance(chunks, list):
+                return None
+            return payload
+
+        def _load_chunk_backup_audio_count(self, key):
+            payload = self._load_chunk_backup_document(key)
+            if not payload:
                 return -1
-            try:
-                with open(backup_path, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                if not isinstance(payload, list):
-                    return -1
-                return self._count_audio_linked_chunks(payload)
-            except (OSError, ValueError, json.JSONDecodeError):
-                return -1
+            stored_count = payload.get("audio_linked_count")
+            if isinstance(stored_count, int):
+                return stored_count
+            return self._count_audio_linked_chunks(payload.get("chunks") or [])
 
         def _update_chunks_backups(self, chunks):
             if not isinstance(chunks, list):
                 return
-            self._atomic_json_write_raw(chunks, self.chunks_latest_backup_path)
+            script_store = getattr(self, "script_store", None)
+            if script_store is None:
+                return
+            latest_payload = {
+                "chunks": copy.deepcopy(chunks),
+                "audio_linked_count": self._count_audio_linked_chunks(chunks),
+                "updated_at": time.time(),
+            }
+            script_store.replace_project_document(
+                self._CHUNK_BACKUP_LATEST_KEY,
+                latest_payload,
+                reason="chunk_backup_latest",
+                wait=True,
+            )
             current_audio_count = self._count_audio_linked_chunks(chunks)
-            best_audio_count = self._load_chunk_backup_audio_count(self.chunks_best_backup_path)
+            best_audio_count = self._load_chunk_backup_audio_count(self._CHUNK_BACKUP_MOST_AUDIO_KEY)
             if current_audio_count > best_audio_count:
-                self._atomic_json_write_raw(chunks, self.chunks_best_backup_path)
+                script_store.replace_project_document(
+                    self._CHUNK_BACKUP_MOST_AUDIO_KEY,
+                    latest_payload,
+                    reason="chunk_backup_most_audio",
+                    wait=True,
+                )
 
         def _atomic_json_write_raw(self, data, target_path, max_retries=5):
             """Atomically write JSON data with retry logic for Windows file locking."""

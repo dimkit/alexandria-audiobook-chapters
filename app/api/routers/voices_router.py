@@ -276,7 +276,7 @@ async def get_voices():
                 }
             seen[normalized]["line_count"] += 1
         voice_rows = list(seen.values())
-    elif not voice_rows and os.path.exists(SCRIPT_PATH):
+    elif not voice_rows and _project_has_script_document():
         try:
             script_data = _load_project_script_document()["entries"]
             seen = {}
@@ -320,21 +320,18 @@ async def get_voices():
         })
         voice["config"] = config
 
-    # Count paragraphs per speaker from paragraphs.json (new pipeline only)
+    # Count paragraphs per speaker from the persisted paragraphs document.
     para_counts_by_norm: dict[str, int] = {}
-    paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
-    if os.path.exists(paragraphs_path):
-        try:
-            with open(paragraphs_path, "r", encoding="utf-8") as f:
-                para_doc = json.load(f)
-            for p in para_doc.get("paragraphs", []):
-                spk = (p.get("speaker") or "").strip()
-                if spk:
-                    normalized = _normalized_speaker(spk)
-                    if normalized:
-                        para_counts_by_norm[normalized] = para_counts_by_norm.get(normalized, 0) + 1
-        except Exception:
-            pass
+    try:
+        para_doc = _load_project_paragraphs_document()
+        for p in para_doc.get("paragraphs", []):
+            spk = (p.get("speaker") or "").strip()
+            if spk:
+                normalized = _normalized_speaker(spk)
+                if normalized:
+                    para_counts_by_norm[normalized] = para_counts_by_norm.get(normalized, 0) + 1
+    except Exception:
+        pass
 
     result = []
     for voice in voice_rows:
@@ -385,9 +382,11 @@ async def get_dictionary():
 
 @router.post("/api/dictionary")
 async def save_dictionary(request: DictionarySaveRequest):
-    document = save_script_document(
-        SCRIPT_PATH,
+    document = project_manager.script_store.replace_script_document(
         dictionary=clean_dictionary_entries([entry.model_dump() for entry in request.entries]),
+        reason="save_dictionary",
+        rebuild_chunks=False,
+        wait=True,
     )
     return {"status": "saved", "entries": document["dictionary"]}
 
@@ -596,7 +595,7 @@ def run_voice_processing_task(run_id: str, stop_check=None, relay_fn=None):
                 pass
 
     try:
-        if not os.path.exists(SCRIPT_PATH):
+        if not _project_has_script_document():
             raise FileNotFoundError("No annotated script found. Generate a script first.")
 
         chunks = project_manager.load_chunks()
@@ -859,7 +858,7 @@ async def clear_uploaded_voices_for_current_script():
     normalized_title_prefix = f"{normalized_title}."
 
     current_speakers = set()
-    if os.path.exists(SCRIPT_PATH):
+    if _project_has_script_document():
         try:
             entries = _load_project_script_document()["entries"]
             for entry in entries:

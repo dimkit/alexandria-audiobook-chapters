@@ -41,7 +41,6 @@ from pydub.silence import detect_nonsilent
 from ffmpeg_utils import configure_pydub, get_ffmpeg_exe, get_ffprobe_exe
 from script_store import (
     apply_dictionary_to_text,
-    load_script_document,
 )
 from source_document import load_source_document, iter_document_paragraphs
 from project_core.constants import *
@@ -75,7 +74,7 @@ class ProjectVoiceMixin:
             entries = script_entries
             if entries is None:
                 try:
-                    entries = load_script_document(self.script_path).get("entries", [])
+                    entries = self.load_script_document().get("entries", [])
                 except Exception:
                     entries = []
 
@@ -1200,7 +1199,7 @@ class ProjectVoiceMixin:
                 return self.engine
 
             try:
-                self.engine = TTSEngine(self._load_app_config())
+                self.engine = TTSEngine(self._load_app_config(), project_root=self.root_dir)
                 backend = self.engine.local_backend if self.engine.mode == "local" else "external"
                 print(f"TTS engine initialized (mode={self.engine.mode}, backend={backend})")
                 return self.engine

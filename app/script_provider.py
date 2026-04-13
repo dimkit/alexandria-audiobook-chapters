@@ -1,7 +1,6 @@
 import json
 import os
 import queue
-import shutil
 import sqlite3
 import threading
 import time
@@ -11,10 +10,11 @@ from abc import ABC, abstractmethod
 
 from project_core.chunking import script_entries_to_chunks
 from project_core.constants import VOICE_AUDIT_LOG_ENABLED_DEFAULT
-from script_store import load_script_document
+from runtime_layout import LAYOUT
+from script_store import clean_dictionary_entries, normalize_script_document
 
 
-SCRIPT_STORE_SCHEMA_VERSION = 3
+SCRIPT_STORE_SCHEMA_VERSION = 4
 
 
 class ScriptStore(ABC):
@@ -116,6 +116,70 @@ class ScriptStore(ABC):
 
     @abstractmethod
     def clear(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def has_script_entries(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_script_entries(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def replace_script_entries(self, entries, *, reason="replace_script_entries", rebuild_chunks=True, wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_script_document(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def replace_script_document(self, entries=None, dictionary=None, sanity_cache=None, *, reason="replace_script_document", rebuild_chunks=True, wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_dictionary_entries(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def replace_dictionary_entries(self, entries, *, reason="replace_dictionary_entries", wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def has_project_document(self, key):
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_project_document(self, key, default=None):
+        raise NotImplementedError
+
+    @abstractmethod
+    def replace_project_document(self, key, payload, *, reason="replace_project_document", wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_project_document(self, key, *, reason="delete_project_document", wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def has_paragraphs(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def has_script_sanity_result(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def lookup_transcription_cache(self, filename, size_bytes):
+        raise NotImplementedError
+
+    @abstractmethod
+    def store_transcription_cache(self, entry, *, reason="store_transcription_cache", wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def clear_transcription_cache(self, *, reason="clear_transcription_cache", wait=True):
         raise NotImplementedError
 
     @abstractmethod
@@ -260,9 +324,6 @@ class SQLiteScriptStore(ScriptStore):
         root_dir,
         db_path,
         queue_log_path,
-        script_path,
-        legacy_chunks_path,
-        voice_config_path=None,
         state_path=None,
         archive_dir=None,
         voice_audit_log_path=None,
@@ -270,9 +331,6 @@ class SQLiteScriptStore(ScriptStore):
         self.root_dir = root_dir
         self.db_path = db_path
         self.queue_log_path = queue_log_path
-        self.script_path = script_path
-        self.legacy_chunks_path = legacy_chunks_path
-        self.voice_config_path = voice_config_path or os.path.join(root_dir, "voice_config.json")
         self.state_path = state_path or os.path.join(root_dir, "state.json")
         self.archive_dir = archive_dir or os.path.join(root_dir, "backups", "chunks")
         self.voice_audit_log_path = voice_audit_log_path or os.path.join(root_dir, "voice_state.audit.jsonl")
@@ -327,6 +385,144 @@ class SQLiteScriptStore(ScriptStore):
         self._command_queue = queue.Queue()
         self._writer_stop = threading.Event()
         self.start()
+
+    def has_script_entries(self):
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM script_entries LIMIT 1").fetchone()
+        return row is not None
+
+    def load_script_entries(self):
+        with self._connect() as conn:
+            return self._load_script_entries_tx(conn)
+
+    def replace_script_entries(self, entries, *, reason="replace_script_entries", rebuild_chunks=True, wait=True):
+        return self._submit_command(
+            "replace_script_entries",
+            {"entries": list(entries or []), "reason": reason, "rebuild_chunks": bool(rebuild_chunks)},
+            wait=wait,
+        )
+
+    def load_dictionary_entries(self):
+        with self._connect() as conn:
+            return self._load_dictionary_entries_tx(conn)
+
+    def replace_dictionary_entries(self, entries, *, reason="replace_dictionary_entries", wait=True):
+        return self._submit_command(
+            "replace_dictionary_entries",
+            {"entries": list(entries or []), "reason": reason},
+            wait=wait,
+        )
+
+    def load_project_document(self, key, default=None):
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return default
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM project_documents WHERE key = ?",
+                (normalized_key,),
+            ).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return default
+
+    def has_project_document(self, key):
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM project_documents WHERE key = ? LIMIT 1",
+                (normalized_key,),
+            ).fetchone()
+        return row is not None
+
+    def replace_project_document(self, key, payload, *, reason="replace_project_document", wait=True):
+        return self._submit_command(
+            "replace_project_document",
+            {"key": str(key or "").strip(), "payload": payload, "reason": reason},
+            wait=wait,
+        )
+
+    def delete_project_document(self, key, *, reason="delete_project_document", wait=True):
+        return self._submit_command(
+            "delete_project_document",
+            {"key": str(key or "").strip(), "reason": reason},
+            wait=wait,
+        )
+
+    def has_paragraphs(self):
+        payload = self.load_project_document("paragraphs") or {}
+        return bool((payload.get("paragraphs") if isinstance(payload, dict) else None) or [])
+
+    def has_script_sanity_result(self):
+        return self.has_project_document("script_sanity_result")
+
+    def load_script_document(self):
+        entries = self.load_script_entries()
+        dictionary = self.load_dictionary_entries()
+        sanity_cache = self.load_project_document("script_sanity_cache", {"phrase_decisions": {}})
+        normalized = normalize_script_document(
+            {
+                "entries": entries,
+                "dictionary": dictionary,
+                "sanity_cache": sanity_cache if isinstance(sanity_cache, dict) else {"phrase_decisions": {}},
+            }
+        )
+        return normalized
+
+    def replace_script_document(self, entries=None, dictionary=None, sanity_cache=None, *, reason="replace_script_document", rebuild_chunks=True, wait=True):
+        current = self.load_script_document()
+        return self._submit_command(
+            "replace_script_document",
+            {
+                "entries": current["entries"] if entries is None else list(entries or []),
+                "dictionary": current["dictionary"] if dictionary is None else list(dictionary or []),
+                "sanity_cache": current.get("sanity_cache", {"phrase_decisions": {}}) if sanity_cache is None else dict(sanity_cache or {}),
+                "reason": reason,
+                "rebuild_chunks": bool(rebuild_chunks),
+            },
+            wait=wait,
+        )
+
+    def lookup_transcription_cache(self, filename, size_bytes):
+        normalized_filename = str(filename or "").strip()
+        try:
+            normalized_size = int(size_bytes or 0)
+        except (TypeError, ValueError):
+            normalized_size = 0
+        if not normalized_filename or normalized_size <= 0:
+            return None
+        cache_key = self._transcription_cache_key(normalized_filename, normalized_size)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT cache_key, filename, size_bytes, text, normalized_text, updated_at
+                FROM transcription_cache_entries
+                WHERE cache_key = ?
+                """,
+                (cache_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def store_transcription_cache(self, entry, *, reason="store_transcription_cache", wait=True):
+        return self._submit_command(
+            "store_transcription_cache",
+            {"entry": dict(entry or {}), "reason": reason},
+            wait=wait,
+        )
+
+    def clear_transcription_cache(self, *, reason="clear_transcription_cache", wait=True):
+        return self._submit_command(
+            "clear_transcription_cache",
+            {"reason": reason},
+            wait=wait,
+        )
 
     def load_chunks(self, chapter=None):
         self._bootstrap_if_needed()
@@ -1027,6 +1223,50 @@ class SQLiteScriptStore(ScriptStore):
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS script_entries (
+                    ordinal INTEGER PRIMARY KEY,
+                    speaker TEXT,
+                    text TEXT,
+                    instruct TEXT,
+                    chapter TEXT,
+                    paragraph_id TEXT,
+                    entry_type TEXT,
+                    extra_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS script_dictionary_entries (
+                    ordinal INTEGER PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    alias TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS project_documents (
+                    key TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transcription_cache_entries (
+                    cache_key TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    text TEXT,
+                    normalized_text TEXT,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS voice_profiles (
                     speaker_key TEXT PRIMARY KEY,
                     display_name TEXT NOT NULL,
@@ -1127,51 +1367,14 @@ class SQLiteScriptStore(ScriptStore):
             row = conn.execute("SELECT COUNT(*) AS count FROM chunks").fetchone()
             if int(row["count"] or 0) > 0:
                 return
-        legacy_chunks = self._load_legacy_chunks()
-        if legacy_chunks is not None:
-            with self._connect() as conn:
-                self._replace_chunks_tx(conn, legacy_chunks)
-            self._archive_legacy_chunks()
-            return
-        if os.path.exists(self.script_path):
-            script_entries = load_script_document(self.script_path)["entries"]
-            chunks = script_entries_to_chunks(script_entries)
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS count FROM script_entries").fetchone()
+            if int(row["count"] or 0) <= 0:
+                return
+            entries = self._load_script_entries_tx(conn)
+            chunks = script_entries_to_chunks(entries)
             normalized = [self._normalize_chunk(chunk, index) for index, chunk in enumerate(chunks)]
-            with self._connect() as conn:
-                self._replace_chunks_tx(conn, normalized)
-
-    def _load_legacy_chunks(self):
-        if not os.path.exists(self.legacy_chunks_path):
-            return None
-        try:
-            with open(self.legacy_chunks_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except (OSError, ValueError, json.JSONDecodeError) as e:
-            backup_path = f"{self.legacy_chunks_path}.corrupt-{int(time.time())}"
-            try:
-                shutil.copy2(self.legacy_chunks_path, backup_path)
-            except OSError:
-                backup_path = None
-            raise RuntimeError(
-                "chunks.json is corrupted"
-                + (f"; preserved backup at {backup_path}" if backup_path else "")
-            ) from e
-        if not isinstance(payload, list):
-            return None
-        return [self._normalize_chunk(chunk, index) for index, chunk in enumerate(payload)]
-
-    def _archive_legacy_chunks(self):
-        if not os.path.exists(self.legacy_chunks_path):
-            return
-        timestamp = int(time.time())
-        archive_path = os.path.join(self.archive_dir, f"chunks.imported.{timestamp}.json")
-        if os.path.abspath(archive_path) == os.path.abspath(self.legacy_chunks_path):
-            return
-        shutil.copy2(self.legacy_chunks_path, archive_path)
-        try:
-            os.remove(self.legacy_chunks_path)
-        except OSError:
-            pass
+            self._replace_chunks_tx(conn, normalized)
 
     def _bootstrap_voice_state_if_needed(self):
         with self._connect() as conn:
@@ -1242,6 +1445,30 @@ class SQLiteScriptStore(ScriptStore):
             conn.close()
 
     def _apply_command(self, conn, name, payload):
+        if name == "replace_script_entries":
+            return self._replace_script_entries_tx(
+                conn,
+                payload.get("entries") or [],
+                rebuild_chunks=bool(payload.get("rebuild_chunks", True)),
+            )
+        if name == "replace_dictionary_entries":
+            return self._replace_dictionary_entries_tx(conn, payload.get("entries") or [])
+        if name == "replace_project_document":
+            return self._replace_project_document_tx(conn, payload.get("key"), payload.get("payload"))
+        if name == "delete_project_document":
+            return self._delete_project_document_tx(conn, payload.get("key"))
+        if name == "replace_script_document":
+            return self._replace_script_document_tx(
+                conn,
+                payload.get("entries") or [],
+                payload.get("dictionary") or [],
+                payload.get("sanity_cache") or {"phrase_decisions": {}},
+                rebuild_chunks=bool(payload.get("rebuild_chunks", True)),
+            )
+        if name == "store_transcription_cache":
+            return self._store_transcription_cache_tx(conn, payload.get("entry") or {})
+        if name == "clear_transcription_cache":
+            return self._clear_transcription_cache_tx(conn)
         if name == "replace_chunks":
             return self._replace_chunks_tx(conn, payload.get("chunks") or [])
         if name == "patch_chunks":
@@ -1329,6 +1556,159 @@ class SQLiteScriptStore(ScriptStore):
         if name == "barrier":
             return True
         raise ValueError(f"Unsupported script store command: {name}")
+
+    def _load_script_entries_tx(self, conn):
+        rows = conn.execute(
+            """
+            SELECT ordinal, speaker, text, instruct, chapter, paragraph_id, entry_type, extra_json
+            FROM script_entries
+            ORDER BY ordinal ASC
+            """
+        ).fetchall()
+        return [self._row_to_script_entry(row) for row in rows]
+
+    def _load_dictionary_entries_tx(self, conn):
+        rows = conn.execute(
+            """
+            SELECT ordinal, source, alias
+            FROM script_dictionary_entries
+            ORDER BY ordinal ASC
+            """
+        ).fetchall()
+        return [
+            {"source": str(row["source"] or "").strip(), "alias": str(row["alias"] or "").strip()}
+            for row in rows
+            if str(row["source"] or "").strip() and str(row["alias"] or "").strip()
+        ]
+
+    def _replace_script_entries_tx(self, conn, entries, *, rebuild_chunks=True):
+        normalized_entries = [self._normalize_script_entry(entry, index) for index, entry in enumerate(entries or [])]
+        with conn:
+            conn.execute("DELETE FROM script_entries")
+            for entry in normalized_entries:
+                conn.execute(
+                    """
+                    INSERT INTO script_entries(
+                        ordinal, speaker, text, instruct, chapter, paragraph_id, entry_type, extra_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    self._script_entry_to_params(entry),
+                )
+            if rebuild_chunks:
+                existing_chunks = [self._row_to_chunk(row) for row in conn.execute(
+                    """
+                    SELECT uid, ordinal, speaker, text, instruct, chapter, paragraph_id,
+                           chunk_type, silence_duration_s, status, audio_path,
+                           audio_validation_json, proofread_json, auto_regen_count,
+                           generation_token, extra_json
+                    FROM chunks
+                    ORDER BY ordinal ASC
+                    """
+                ).fetchall()]
+                rebuilt = script_entries_to_chunks(normalized_entries)
+                preserved = self._preserve_chunk_state_for_entries(existing_chunks, rebuilt)
+                self._replace_chunks_tx(conn, preserved)
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_write_at', ?)",
+                (str(time.time()),),
+            )
+        return len(normalized_entries)
+
+    def _replace_dictionary_entries_tx(self, conn, entries):
+        normalized_entries = clean_dictionary_entries(entries or [])
+        with conn:
+            conn.execute("DELETE FROM script_dictionary_entries")
+            for index, entry in enumerate(normalized_entries):
+                conn.execute(
+                    """
+                    INSERT INTO script_dictionary_entries(ordinal, source, alias)
+                    VALUES (?, ?, ?)
+                    """,
+                    (index, entry["source"], entry["alias"]),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_write_at', ?)",
+                (str(time.time()),),
+            )
+        return len(normalized_entries)
+
+    def _replace_project_document_tx(self, conn, key, payload):
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return False
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO project_documents(key, payload_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (normalized_key, json.dumps(payload, ensure_ascii=False), time.time()),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_write_at', ?)",
+                (str(time.time()),),
+            )
+        return True
+
+    def _delete_project_document_tx(self, conn, key):
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            return False
+        with conn:
+            conn.execute("DELETE FROM project_documents WHERE key = ?", (normalized_key,))
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_write_at', ?)",
+                (str(time.time()),),
+            )
+        return True
+
+    def _replace_script_document_tx(self, conn, entries, dictionary, sanity_cache, *, rebuild_chunks=True):
+        normalized = normalize_script_document(
+            {
+                "entries": entries,
+                "dictionary": dictionary,
+                "sanity_cache": sanity_cache,
+            }
+        )
+        self._replace_script_entries_tx(conn, normalized["entries"], rebuild_chunks=rebuild_chunks)
+        self._replace_dictionary_entries_tx(conn, normalized["dictionary"])
+        self._replace_project_document_tx(conn, "script_sanity_cache", normalized.get("sanity_cache", {"phrase_decisions": {}}))
+        return normalized
+
+    def _store_transcription_cache_tx(self, conn, entry):
+        normalized = self._normalize_transcription_cache_entry(entry)
+        if normalized is None:
+            return None
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO transcription_cache_entries(
+                    cache_key, filename, size_bytes, text, normalized_text, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized["cache_key"],
+                    normalized["filename"],
+                    normalized["size_bytes"],
+                    normalized.get("text", ""),
+                    normalized.get("normalized_text", ""),
+                    float(normalized.get("updated_at") or time.time()),
+                ),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_write_at', ?)",
+                (str(time.time()),),
+            )
+        return normalized
+
+    def _clear_transcription_cache_tx(self, conn):
+        with conn:
+            conn.execute("DELETE FROM transcription_cache_entries")
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_write_at', ?)",
+                (str(time.time()),),
+            )
+        return True
 
     def _replace_chunks_tx(self, conn, chunks):
         normalized = [self._normalize_chunk(chunk, index) for index, chunk in enumerate(chunks or [])]
@@ -2135,6 +2515,120 @@ class SQLiteScriptStore(ScriptStore):
                 })
         return self._replace_auto_narrator_aliases_tx(conn, rows)
 
+    @staticmethod
+    def _transcription_cache_key(filename, size_bytes):
+        return f"{str(filename or '').strip()}|{int(size_bytes or 0)}"
+
+    def _normalize_transcription_cache_entry(self, entry):
+        payload = dict(entry or {})
+        filename = str(payload.get("filename") or "").strip()
+        try:
+            size_bytes = int(payload.get("size_bytes") or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
+        if not filename or size_bytes <= 0:
+            return None
+        normalized = {
+            "cache_key": str(payload.get("key") or "").strip() or self._transcription_cache_key(filename, size_bytes),
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "text": str(payload.get("text") or ""),
+            "normalized_text": str(payload.get("normalized_text") or ""),
+            "updated_at": float(payload.get("updated_at") or time.time()),
+        }
+        return normalized
+
+    def _row_to_script_entry(self, row):
+        entry = {
+            "speaker": row["speaker"],
+            "text": row["text"],
+            "instruct": row["instruct"],
+        }
+        if row["chapter"]:
+            entry["chapter"] = row["chapter"]
+        if row["paragraph_id"]:
+            entry["paragraph_id"] = row["paragraph_id"]
+        if row["entry_type"]:
+            entry["type"] = row["entry_type"]
+        if row["extra_json"]:
+            entry.update(json.loads(row["extra_json"]))
+        return entry
+
+    def _normalize_script_entry(self, entry, index):
+        normalized = dict(entry or {})
+        normalized.setdefault("speaker", "NARRATOR")
+        normalized.setdefault("text", "")
+        normalized.setdefault("instruct", "")
+        normalized["text"] = normalize_script_document({"entries": [normalized]}).get("entries", [{}])[0].get("text", "")
+        normalized["_ordinal"] = int(index)
+        return normalized
+
+    def _script_entry_to_params(self, entry):
+        extra = {
+            key: value
+            for key, value in dict(entry or {}).items()
+            if key not in {"_ordinal", "speaker", "text", "instruct", "chapter", "paragraph_id", "type"}
+        }
+        return (
+            int(entry.get("_ordinal") or 0),
+            entry.get("speaker"),
+            entry.get("text"),
+            entry.get("instruct"),
+            entry.get("chapter"),
+            entry.get("paragraph_id"),
+            entry.get("type"),
+            json.dumps(extra, ensure_ascii=False) if extra else None,
+        )
+
+    def _preserve_chunk_state_for_entries(self, existing_chunks, rebuilt_chunks):
+        preserved = []
+        lookup = {}
+        fallback_lookup = {}
+        for chunk in existing_chunks or []:
+            exact_key = (
+                str(chunk.get("paragraph_id") or "").strip(),
+                str(chunk.get("chapter") or "").strip(),
+                str(chunk.get("speaker") or "").strip(),
+                str(chunk.get("text") or ""),
+                str(chunk.get("instruct") or ""),
+            )
+            fallback_key = (
+                str(chunk.get("chapter") or "").strip(),
+                str(chunk.get("speaker") or "").strip(),
+                str(chunk.get("text") or ""),
+                str(chunk.get("instruct") or ""),
+            )
+            lookup.setdefault(exact_key, []).append(chunk)
+            fallback_lookup.setdefault(fallback_key, []).append(chunk)
+
+        for index, chunk in enumerate(rebuilt_chunks or []):
+            normalized = self._normalize_chunk(chunk, index)
+            exact_key = (
+                str(normalized.get("paragraph_id") or "").strip(),
+                str(normalized.get("chapter") or "").strip(),
+                str(normalized.get("speaker") or "").strip(),
+                str(normalized.get("text") or ""),
+                str(normalized.get("instruct") or ""),
+            )
+            fallback_key = (
+                str(normalized.get("chapter") or "").strip(),
+                str(normalized.get("speaker") or "").strip(),
+                str(normalized.get("text") or ""),
+                str(normalized.get("instruct") or ""),
+            )
+            matched = None
+            if lookup.get(exact_key):
+                matched = lookup[exact_key].pop(0)
+            elif fallback_lookup.get(fallback_key):
+                matched = fallback_lookup[fallback_key].pop(0)
+            if matched:
+                for field in ("uid", "status", "audio_path", "audio_validation", "proofread", "auto_regen_count"):
+                    if field in matched:
+                        normalized[field] = matched.get(field)
+                normalized.pop("generation_token", None)
+            preserved.append(normalized)
+        return preserved
+
     def _chunk_to_params(self, chunk):
         return (
             chunk["uid"],
@@ -2585,3 +3079,23 @@ def create_script_store(**kwargs):
     if backend != "sqlite":
         raise ValueError(f"Unsupported script store backend: {backend}")
     return SQLiteScriptStore(**kwargs)
+
+
+def open_project_script_store(root_dir):
+    normalized_root = os.path.abspath(root_dir)
+    using_default_layout = os.path.abspath(normalized_root) == os.path.abspath(LAYOUT.project_dir)
+    return create_script_store(
+        root_dir=normalized_root,
+        db_path=(LAYOUT.chunks_db_path if using_default_layout else os.path.join(normalized_root, "chunks.sqlite3")),
+        queue_log_path=(
+            LAYOUT.chunks_queue_log_path if using_default_layout else os.path.join(normalized_root, "chunks.queue.log")
+        ),
+        state_path=os.path.join(normalized_root, "state.json"),
+        archive_dir=(
+            LAYOUT.chunk_backups_dir if using_default_layout else os.path.join(normalized_root, "archives", "backups", "chunks")
+        ),
+        voice_audit_log_path=(
+            LAYOUT.voice_audit_log_path
+            if using_default_layout else os.path.join(normalized_root, "voice_state.audit.jsonl")
+        ),
+    ).start()

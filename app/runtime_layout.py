@@ -21,12 +21,7 @@ class RuntimeLayout:
     resources_dir: str
     builtin_lora_dir: str
 
-    voices_path: str
-    voice_config_path: str
-    script_path: str
     state_path: str
-    chunks_path: str
-    paragraphs_path: str
 
     workflow_dir: str
     processing_workflow_state_path: str
@@ -39,11 +34,9 @@ class RuntimeLayout:
     db_dir: str
     chunks_db_path: str
     chunks_queue_log_path: str
-    transcription_cache_path: str
     voice_audit_log_path: str
 
     repair_dir: str
-    script_sanity_path: str
     script_repair_trace_path: str
 
     exports_dir: str
@@ -128,12 +121,7 @@ class RuntimeLayout:
             runs_dir=runs_dir,
             resources_dir=resources_dir,
             builtin_lora_dir=builtin_lora_dir,
-            voices_path=os.path.join(project_dir, "voices.json"),
-            voice_config_path=os.path.join(project_dir, "voice_config.json"),
-            script_path=os.path.join(project_dir, "annotated_script.json"),
             state_path=os.path.join(project_dir, "state.json"),
-            chunks_path=os.path.join(project_dir, "chunks.json"),
-            paragraphs_path=os.path.join(project_dir, "paragraphs.json"),
             workflow_dir=workflow_dir,
             processing_workflow_state_path=os.path.join(workflow_dir, "processing_workflow_state.json"),
             new_mode_workflow_state_path=os.path.join(workflow_dir, "new_mode_workflow_state.json"),
@@ -144,10 +132,8 @@ class RuntimeLayout:
             db_dir=db_dir,
             chunks_db_path=os.path.join(db_dir, "chunks.sqlite3"),
             chunks_queue_log_path=os.path.join(db_dir, "chunks.queue.log"),
-            transcription_cache_path=os.path.join(db_dir, "transcription_cache.json"),
             voice_audit_log_path=os.path.join(db_dir, "voice_state.audit.jsonl"),
             repair_dir=repair_dir,
-            script_sanity_path=os.path.join(repair_dir, "script_sanity_check.json"),
             script_repair_trace_path=os.path.join(repair_dir, "script_repair_trace.jsonl"),
             exports_dir=exports_dir,
             audiobook_path=os.path.join(exports_dir, "cloned_audiobook.mp3"),

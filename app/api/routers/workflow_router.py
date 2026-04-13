@@ -102,25 +102,20 @@ async def reset_project():
 
     paths_to_report = [
         state_path,
-        SCRIPT_PATH,
-        VOICES_PATH,
-        VOICE_CONFIG_PATH,
-        CHUNKS_PATH,
         getattr(project_manager, "chunks_db_path", os.path.join(ROOT_DIR, "chunks.sqlite3")),
         f"{getattr(project_manager, 'chunks_db_path', os.path.join(ROOT_DIR, 'chunks.sqlite3'))}-wal",
         f"{getattr(project_manager, 'chunks_db_path', os.path.join(ROOT_DIR, 'chunks.sqlite3'))}-shm",
         getattr(project_manager, "chunks_queue_log_path", os.path.join(ROOT_DIR, "chunks.queue.log")),
-        getattr(project_manager, "transcription_cache_path", os.path.join(ROOT_DIR, "transcription_cache.json")),
         SCRIPT_REPAIR_TRACE_PATH,
         AUDIOBOOK_PATH,
         M4B_PATH,
         AUDIO_QUEUE_STATE_PATH,
         PROCESSING_WORKFLOW_STATE_PATH,
         NEW_MODE_WORKFLOW_STATE_PATH,
-        os.path.join(ROOT_DIR, "paragraphs.json"),
-        SCRIPT_SANITY_PATH,
         _project_export_filesystem_path("audacity_export.zip"),
         _project_export_filesystem_path("m4b_cover.jpg"),
+        LAYOUT.script_generation_checkpoint_path,
+        LAYOUT.script_review_checkpoint_path,
     ]
 
     for path in paths_to_report:
@@ -177,18 +172,8 @@ async def start_assign_dialogue(background_tasks: BackgroundTasks):
     _ensure_new_mode_workflow_inactive()
     _ensure_task_not_running("assign_dialogue", "Dialogue assignment is already running.")
 
-    paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
-    if not os.path.exists(paragraphs_path):
-        raise HTTPException(
-            status_code=400,
-            detail="No paragraph data found. Run 'Process Paragraphs' first.",
-        )
-    try:
-        with open(paragraphs_path, "r", encoding="utf-8") as f:
-            pdata = json.load(f)
-        if not pdata.get("paragraphs"):
-            raise ValueError("empty")
-    except Exception:
+    pdata = _load_project_paragraphs_document()
+    if not pdata.get("paragraphs"):
         raise HTTPException(
             status_code=400,
             detail="Paragraph data is empty or corrupt. Re-run 'Process Paragraphs'.",
@@ -196,7 +181,7 @@ async def start_assign_dialogue(background_tasks: BackgroundTasks):
 
     config_path = os.path.join(BASE_DIR, "config.json")
     run_id = _start_task_run("assign_dialogue")
-    background_tasks.add_task(_run_assign_dialogue_task, run_id, paragraphs_path, config_path)
+    background_tasks.add_task(_run_assign_dialogue_task, run_id, config_path)
     return {"status": "started", "run_id": run_id}
 
 
@@ -205,18 +190,8 @@ async def start_extract_temperament(background_tasks: BackgroundTasks):
     _ensure_new_mode_workflow_inactive()
     _ensure_task_not_running("extract_temperament", "Temperament extraction is already running.")
 
-    paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
-    if not os.path.exists(paragraphs_path):
-        raise HTTPException(
-            status_code=400,
-            detail="No paragraph data found. Run 'Process Paragraphs' first.",
-        )
-    try:
-        with open(paragraphs_path, "r", encoding="utf-8") as f:
-            pdata = json.load(f)
-        if not pdata.get("paragraphs"):
-            raise ValueError("empty")
-    except Exception:
+    pdata = _load_project_paragraphs_document()
+    if not pdata.get("paragraphs"):
         raise HTTPException(
             status_code=400,
             detail="Paragraph data is empty or corrupt. Re-run 'Process Paragraphs'.",
@@ -224,14 +199,13 @@ async def start_extract_temperament(background_tasks: BackgroundTasks):
 
     config_path = os.path.join(BASE_DIR, "config.json")
     run_id = _start_task_run("extract_temperament")
-    background_tasks.add_task(_run_extract_temperament_task, run_id, paragraphs_path, config_path)
+    background_tasks.add_task(_run_extract_temperament_task, run_id, config_path)
     return {"status": "started", "run_id": run_id}
 
 
 @router.get("/api/script_info")
 async def get_script_info():
     """Return a lightweight summary of the current script state."""
-    script_path = os.path.join(ROOT_DIR, "annotated_script.json")
     if hasattr(project_manager, "_load_voice_config"):
         try:
             voice_config = project_manager._load_voice_config()
@@ -252,7 +226,7 @@ async def get_script_info():
         except Exception:
             pass
 
-    if not os.path.exists(script_path):
+    if not _project_has_script_document():
         return {
             "entry_count": 0,
             "has_voice_config": has_voice_config,
@@ -260,9 +234,7 @@ async def get_script_info():
             "has_voicelines": has_voicelines,
         }
     try:
-        with open(script_path, "r", encoding="utf-8") as f:
-            doc = json.load(f)
-        entries = doc.get("entries", []) if isinstance(doc, dict) else doc
+        entries = _load_project_script_document().get("entries", [])
         return {
             "entry_count": len(entries) if isinstance(entries, list) else 0,
             "has_voice_config": has_voice_config,
@@ -280,16 +252,8 @@ async def get_script_info():
 
 def _run_create_script_task_with_new_mode_state(
     run_id: str,
-    paragraphs_path: str,
-    script_output_path: str,
-    chunks_output_path: str,
 ):
-    _run_create_script_task(
-        run_id,
-        paragraphs_path,
-        script_output_path,
-        chunks_output_path,
-    )
+    _run_create_script_task(run_id)
     _mark_new_mode_stage_completed_marker("create_script")
     with new_mode_workflow_lock:
         options = process_state["new_mode_workflow"].get("options") or {}
@@ -299,9 +263,7 @@ def _run_create_script_task_with_new_mode_state(
 
 @router.get("/api/pipeline_step_status")
 async def get_pipeline_step_status():
-    """Return file-based completion status for the 4 new-mode pipeline steps."""
-    paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
-    script_path = SCRIPT_PATH
+    """Return DB-backed completion status for the 4 new-mode pipeline steps."""
 
     # Check if an input file is loaded
     has_input_file = False
@@ -324,7 +286,7 @@ async def get_pipeline_step_status():
     }
 
     # A durable script project should keep the pipeline unlocked even if
-    # migration-era intermediates like paragraphs.json are absent.
+    # DB-backed paragraph/script state may exist even when legacy intermediates are absent.
     if _project_script_complete_detected():
         result.update(
             {
@@ -336,15 +298,8 @@ async def get_pipeline_step_status():
         )
         return result
 
-    if not os.path.exists(paragraphs_path):
-        return result
-
-    try:
-        with open(paragraphs_path, "r", encoding="utf-8") as f:
-            pdata = json.load(f)
-        paragraphs = pdata.get("paragraphs", [])
-    except Exception:
-        return result
+    pdata = _load_project_paragraphs_document()
+    paragraphs = pdata.get("paragraphs", [])
 
     if not paragraphs:
         return result
@@ -374,16 +329,8 @@ async def get_pipeline_step_status():
     if result["extract_temperament"] != "complete":
         return result
 
-    # Create Script: annotated_script.json must exist with entries
-    if os.path.exists(script_path):
-        try:
-            with open(script_path, "r", encoding="utf-8") as f:
-                sdata = json.load(f)
-            entries = sdata.get("entries", []) if isinstance(sdata, dict) else sdata
-            if isinstance(entries, list) and len(entries) > 0:
-                result["create_script"] = "complete"
-        except Exception:
-            pass
+    if _project_has_script_document():
+        result["create_script"] = "complete"
 
     return result
 
@@ -392,15 +339,18 @@ async def get_pipeline_step_status():
 async def reset_new_mode(request: ResetNewModeRequest = ResetNewModeRequest()):
     """Clear script artifacts so Create Script can start fresh."""
     removed = []
-    files_to_remove = [
-        os.path.join(ROOT_DIR, "annotated_script.json"),
-        CHUNKS_PATH,
-    ]
-
-    for path in files_to_remove:
-        if os.path.exists(path):
-            os.remove(path)
-            removed.append(os.path.basename(path))
+    if getattr(project_manager, "script_store", None) is not None:
+        project_manager.script_store.replace_script_document(
+            entries=[],
+            dictionary=[],
+            sanity_cache={"phrase_decisions": {}},
+            reason="reset_new_mode_script_clear",
+            rebuild_chunks=True,
+            wait=True,
+        )
+        project_manager.script_store.delete_project_document("paragraphs", reason="reset_new_mode", wait=True)
+        project_manager.script_store.delete_project_document("script_sanity_result", reason="reset_new_mode", wait=True)
+        removed.extend(["script_entries", "chunks", "paragraphs", "script_sanity_result"])
 
     if not request.preserve_voices:
         try:
@@ -408,9 +358,7 @@ async def reset_new_mode(request: ResetNewModeRequest = ResetNewModeRequest()):
                 project_manager.reset_voice_state(reason="reset_new_mode")
         except Exception:
             pass
-        if os.path.exists(VOICE_CONFIG_PATH):
-            os.remove(VOICE_CONFIG_PATH)
-            removed.append(os.path.basename(VOICE_CONFIG_PATH))
+        removed.append("voice_profiles")
 
     _clear_directory_contents(VOICELINES_DIR)
     removed.append("voicelines/*")
@@ -438,31 +386,15 @@ async def start_create_script(background_tasks: BackgroundTasks):
     _ensure_new_mode_workflow_inactive()
     _ensure_task_not_running("create_script", "Script creation is already running.")
 
-    paragraphs_path    = os.path.join(ROOT_DIR, "paragraphs.json")
-    script_output_path = os.path.join(ROOT_DIR, "annotated_script.json")
-    chunks_output_path = CHUNKS_PATH
-
-    if not os.path.exists(paragraphs_path):
-        raise HTTPException(
-            status_code=400,
-            detail="No paragraph data found. Run 'Process Paragraphs' first.",
-        )
-    try:
-        with open(paragraphs_path, "r", encoding="utf-8") as f:
-            pdata = json.load(f)
-        if not pdata.get("paragraphs"):
-            raise ValueError("empty")
-    except Exception:
+    pdata = _load_project_paragraphs_document()
+    if not pdata.get("paragraphs"):
         raise HTTPException(
             status_code=400,
             detail="Paragraph data is empty or corrupt. Re-run 'Process Paragraphs'.",
         )
 
     run_id = _start_task_run("create_script")
-    background_tasks.add_task(
-        _run_create_script_task_with_new_mode_state, run_id,
-        paragraphs_path, script_output_path, chunks_output_path,
-    )
+    background_tasks.add_task(_run_create_script_task_with_new_mode_state, run_id)
     return {"status": "started", "run_id": run_id}
 
 
@@ -471,22 +403,11 @@ async def start_process_paragraphs(background_tasks: BackgroundTasks):
     _ensure_new_mode_workflow_inactive()
     _ensure_task_not_running("process_paragraphs", "Paragraph processing is already running.")
 
-    # Hard-fail if an annotated script already exists with entries
-    script_path = os.path.join(ROOT_DIR, "annotated_script.json")
-    if os.path.exists(script_path):
-        try:
-            with open(script_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            entries = data.get("entries") if isinstance(data, dict) else data
-            if isinstance(entries, list) and len(entries) > 0:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Generating a new audiobook script requires erasing the old one first.",
-                )
-        except HTTPException:
-            raise
-        except Exception:
-            pass  # Unreadable or corrupt file — allow proceeding
+    if _project_has_script_document():
+        raise HTTPException(
+            status_code=409,
+            detail="Generating a new audiobook script requires erasing the old one first.",
+        )
 
     # Resolve input file from state.json
     state_path = os.path.join(ROOT_DIR, "state.json")
@@ -498,9 +419,8 @@ async def start_process_paragraphs(background_tasks: BackgroundTasks):
     if not input_file or not os.path.exists(input_file):
         raise HTTPException(status_code=400, detail="No input file found. Please upload a book first.")
 
-    output_path = os.path.join(ROOT_DIR, "paragraphs.json")
     run_id = _start_task_run("process_paragraphs")
-    background_tasks.add_task(_run_process_paragraphs_task, run_id, input_file, output_path)
+    background_tasks.add_task(_run_process_paragraphs_task, run_id, input_file)
     return {"status": "started", "run_id": run_id}
 
 
@@ -541,7 +461,7 @@ async def generate_script(request: Optional[ScriptGenerationRequest] = None, bac
 
 @router.post("/api/review_script")
 async def review_script(background_tasks: BackgroundTasks):
-    if not os.path.exists(SCRIPT_PATH):
+    if not _project_has_script_document():
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
     run_id = _start_task_run("review")
@@ -550,7 +470,7 @@ async def review_script(background_tasks: BackgroundTasks):
 
 @router.post("/api/script_sanity_check")
 async def script_sanity_check(background_tasks: BackgroundTasks):
-    if not os.path.exists(SCRIPT_PATH):
+    if not _project_has_script_document():
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
     run_id = _start_task_run("sanity")
@@ -559,7 +479,7 @@ async def script_sanity_check(background_tasks: BackgroundTasks):
 
 @router.post("/api/replace_missing_chunks")
 async def replace_missing_chunks(background_tasks: BackgroundTasks):
-    if not os.path.exists(SCRIPT_PATH):
+    if not _project_has_script_document():
         raise HTTPException(status_code=400, detail="No annotated script found. Generate a script first.")
 
     run_id = _start_task_run("repair")
@@ -568,18 +488,17 @@ async def replace_missing_chunks(background_tasks: BackgroundTasks):
 
 @router.get("/api/annotated_script")
 async def get_annotated_script():
-    """Return the current working annotated_script.json."""
-    if not os.path.exists(SCRIPT_PATH):
+    """Return the current working annotated script entries from SQLite."""
+    if not _project_has_script_document():
         raise HTTPException(status_code=404, detail="No annotated script found")
-    # Backward-compatible response shape: return entries list.
     return _load_project_script_document().get("entries", [])
 
 @router.get("/api/script_sanity_check")
 async def get_script_sanity_check():
-    if not os.path.exists(SCRIPT_SANITY_PATH):
+    payload = _load_project_script_sanity_result()
+    if not payload:
         raise HTTPException(status_code=404, detail="No sanity check results found")
-    with open(SCRIPT_SANITY_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return payload
 
 @router.get("/api/status/{task_name}")
 async def get_status(task_name: str):

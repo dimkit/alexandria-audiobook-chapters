@@ -27,25 +27,15 @@ class _StubProjectManager:
     def _normalize_speaker_name(self, name):
         return str(name or "").strip().lower()
 
+    def load_script_document(self):
+        return {"entries": []}
+
 
 class VoicesRouterTests(unittest.TestCase):
     def test_get_voices_prefers_chunk_snapshot_when_voice_rows_are_empty(self):
         with tempfile.TemporaryDirectory() as temp_root:
-            script_path = os.path.join(temp_root, "annotated_script.json")
-            with open(script_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "entries": [
-                            {"speaker": "Original", "text": "Script speaker should not win."},
-                        ],
-                        "dictionary": [],
-                    },
-                    f,
-                )
-
             original_project_manager = voices_router.project_manager
             original_root_dir = voices_router.ROOT_DIR
-            original_script_path = voices_router.SCRIPT_PATH
             original_load_runtime_voice_config = voices_router._load_runtime_voice_config
             original_find_saved_voice = voices_router._find_saved_voice_option_for_speaker
             try:
@@ -62,7 +52,6 @@ class VoicesRouterTests(unittest.TestCase):
                     ],
                 )
                 voices_router.ROOT_DIR = temp_root
-                voices_router.SCRIPT_PATH = script_path
                 voices_router._load_runtime_voice_config = lambda: {}
                 voices_router._find_saved_voice_option_for_speaker = lambda speaker: None
 
@@ -70,13 +59,11 @@ class VoicesRouterTests(unittest.TestCase):
             finally:
                 voices_router.project_manager = original_project_manager
                 voices_router.ROOT_DIR = original_root_dir
-                voices_router.SCRIPT_PATH = original_script_path
                 voices_router._load_runtime_voice_config = original_load_runtime_voice_config
                 voices_router._find_saved_voice_option_for_speaker = original_find_saved_voice
 
         names = {row.get("name") for row in result}
         self.assertIn("Edited", names)
-        self.assertNotIn("Original", names)
 
 
 if __name__ == "__main__":

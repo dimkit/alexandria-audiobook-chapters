@@ -92,6 +92,30 @@ class NormalizeExternalUrlTests(unittest.TestCase):
         self.assertIn(os.path.join("designed_voices", "previews"), preview_path)
         self.assertTrue(os.path.isdir(os.path.dirname(preview_path)))
 
+    def test_get_clone_prompt_resolves_relative_audio_against_project_root(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            clone_dir = os.path.join(temp_root, "clone_voices")
+            os.makedirs(clone_dir, exist_ok=True)
+            ref_path = os.path.join(clone_dir, "sample.wav")
+            with wave.open(ref_path, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(24000)
+                wav_file.writeframes(b"\x00\x00" * 240)
+
+            engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}}, project_root=temp_root)
+            fake_model = mock.Mock()
+            fake_model.create_voice_clone_prompt.return_value = "prompt-token"
+
+            with mock.patch.object(engine, "_init_local_clone", return_value=fake_model):
+                prompt = engine._get_clone_prompt(
+                    "Aerial",
+                    {"Aerial": {"ref_audio": "clone_voices/sample.wav", "ref_text": "hello"}},
+                )
+
+            self.assertEqual(prompt, "prompt-token")
+            fake_model.create_voice_clone_prompt.assert_called_once()
+
     @mock.patch.object(TTSEngine, "_init_local_design")
     @mock.patch.object(TTSEngine, "_new_voice_design_preview_path")
     @mock.patch.object(TTSEngine, "_external_http_post")

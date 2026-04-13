@@ -2,12 +2,15 @@ import copy
 import importlib.util
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 import asyncio
 import json
 from fastapi import HTTPException
 from fastapi import BackgroundTasks
+from project import ProjectManager
 
 MODULE_PATH = os.path.join(os.path.dirname(__file__), "app.py")
 SPEC = importlib.util.spec_from_file_location("threadspeak_app_module_workflow_entrypoints", MODULE_PATH)
@@ -34,6 +37,34 @@ def _quiesce_workflows():
 
 
 _quiesce_workflows()
+
+
+def _ensure_project_root(root):
+    for dirname in ("app", "uploads", "voicelines", "clone_voices", "designed_voices", "workflow", "db", "repair", "exports"):
+        os.makedirs(os.path.join(root, dirname), exist_ok=True)
+
+
+def _seed_db_project(root, *, entries=None, chunks=None, voice_config=None):
+    _ensure_project_root(root)
+    manager = ProjectManager(root)
+    try:
+        if entries is not None:
+            manager.script_store.replace_script_document(
+                entries=entries,
+                dictionary=[],
+                sanity_cache={"phrase_decisions": {}},
+                reason="test_seed_script",
+                rebuild_chunks=True,
+                wait=True,
+            )
+        if chunks is not None:
+            manager.save_chunks(chunks)
+        if voice_config is not None:
+            manager._save_voice_config(voice_config)
+        return manager
+    except Exception:
+        manager.shutdown_script_store(flush=True)
+        raise
 
 
 class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
@@ -128,20 +159,14 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
 
             original_root = app_module.ROOT_DIR
             original_config = app_module.CONFIG_PATH
-            original_voice = app_module.VOICE_CONFIG_PATH
-            original_chunks = app_module.CHUNKS_PATH
             try:
                 app_module.ROOT_DIR = temp_root
                 app_module.CONFIG_PATH = config_path
-                app_module.VOICE_CONFIG_PATH = os.path.join(temp_root, "voice_config.json")
-                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
 
                 app_module._run_new_mode_workflow_stage("create_script")
             finally:
                 app_module.ROOT_DIR = original_root
                 app_module.CONFIG_PATH = original_config
-                app_module.VOICE_CONFIG_PATH = original_voice
-                app_module.CHUNKS_PATH = original_chunks
 
         self.assertEqual(captured["stage_name"], "create_script")
         self.assertEqual(captured["run_id"], "run-1")
@@ -164,86 +189,77 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
 
     def test_reset_new_mode_can_preserve_voice_config_while_clearing_script_and_clips(self):
         with tempfile.TemporaryDirectory() as temp_root:
-            script_path = os.path.join(temp_root, "annotated_script.json")
-            chunks_path = os.path.join(temp_root, "chunks.json")
-            voice_config_path = os.path.join(temp_root, "voice_config.json")
             voicelines_dir = os.path.join(temp_root, "voicelines")
             os.makedirs(voicelines_dir, exist_ok=True)
             os.makedirs(os.path.join(voicelines_dir, "discarded"), exist_ok=True)
-
-            for path in (script_path, chunks_path, voice_config_path):
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump({"ok": True}, f)
             with open(os.path.join(voicelines_dir, "clip.wav"), "w", encoding="utf-8") as f:
                 f.write("audio")
             with open(os.path.join(voicelines_dir, "discarded", "old.wav"), "w", encoding="utf-8") as f:
                 f.write("audio")
 
             original_root = app_module.ROOT_DIR
-            original_chunks = app_module.CHUNKS_PATH
-            original_voice = app_module.VOICE_CONFIG_PATH
             original_voicelines = app_module.VOICELINES_DIR
+            original_pm = app_module.project_manager
+            manager = None
             try:
+                manager = _seed_db_project(
+                    temp_root,
+                    entries=[{"speaker": "Narrator", "text": "hello"}],
+                    voice_config={"Narrator": {"alias": "kept"}},
+                )
                 app_module.ROOT_DIR = temp_root
-                app_module.CHUNKS_PATH = chunks_path
-                app_module.VOICE_CONFIG_PATH = voice_config_path
                 app_module.VOICELINES_DIR = voicelines_dir
+                app_module.project_manager = manager
 
                 result = asyncio.run(
                     app_module.reset_new_mode(app_module.ResetNewModeRequest(preserve_voices=True))
                 )
             finally:
                 app_module.ROOT_DIR = original_root
-                app_module.CHUNKS_PATH = original_chunks
-                app_module.VOICE_CONFIG_PATH = original_voice
                 app_module.VOICELINES_DIR = original_voicelines
+                app_module.project_manager = original_pm
+                if manager is not None:
+                    manager.shutdown_script_store(flush=True)
 
             self.assertEqual(result["status"], "reset")
             self.assertTrue(result["preserved_voices"])
-            self.assertFalse(os.path.exists(script_path))
-            self.assertFalse(os.path.exists(chunks_path))
-            self.assertTrue(os.path.exists(voice_config_path))
+            self.assertFalse(bool(manager.script_store.has_script_entries()))
+            self.assertTrue(bool(manager._load_voice_config()))
             self.assertEqual(os.listdir(voicelines_dir), [])
 
     def test_reset_new_mode_deletes_voice_config_when_not_preserved(self):
         with tempfile.TemporaryDirectory() as temp_root:
-            voice_config_path = os.path.join(temp_root, "voice_config.json")
             voicelines_dir = os.path.join(temp_root, "voicelines")
             os.makedirs(voicelines_dir, exist_ok=True)
 
-            with open(voice_config_path, "w", encoding="utf-8") as f:
-                json.dump({"Narrator": {"alias": "kept"}}, f)
             with open(os.path.join(voicelines_dir, "clip.wav"), "w", encoding="utf-8") as f:
                 f.write("audio")
 
             original_root = app_module.ROOT_DIR
-            original_voice = app_module.VOICE_CONFIG_PATH
             original_voicelines = app_module.VOICELINES_DIR
             original_pm = app_module.project_manager
+            manager = None
             try:
-                class StubProjectManager:
-                    def __init__(self):
-                        self.reset_calls = 0
-
-                    def reset_voice_state(self, reason=""):
-                        self.reset_calls += 1
-
+                manager = _seed_db_project(
+                    temp_root,
+                    entries=[{"speaker": "Narrator", "text": "hello"}],
+                    voice_config={"Narrator": {"alias": "kept"}},
+                )
                 app_module.ROOT_DIR = temp_root
-                app_module.VOICE_CONFIG_PATH = voice_config_path
                 app_module.VOICELINES_DIR = voicelines_dir
-                app_module.project_manager = StubProjectManager()
+                app_module.project_manager = manager
 
                 result = asyncio.run(app_module.reset_new_mode())
-                self.assertEqual(app_module.project_manager.reset_calls, 1)
             finally:
                 app_module.ROOT_DIR = original_root
-                app_module.VOICE_CONFIG_PATH = original_voice
                 app_module.VOICELINES_DIR = original_voicelines
                 app_module.project_manager = original_pm
+                if manager is not None:
+                    manager.shutdown_script_store(flush=True)
 
             self.assertEqual(result["status"], "reset")
             self.assertFalse(result["preserved_voices"])
-            self.assertFalse(os.path.exists(voice_config_path))
+            self.assertFalse(bool(manager._load_voice_config()))
             self.assertEqual(os.listdir(voicelines_dir), [])
 
     def test_reset_project_clears_db_runtime_artifacts_and_reinitializes_store(self):
@@ -260,13 +276,8 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
             state_path = os.path.join(temp_root, "state.json")
             chunks_db_path = os.path.join(temp_root, "chunks.sqlite3")
             queue_log_path = os.path.join(temp_root, "chunks.queue.log")
-            transcription_cache_path = os.path.join(temp_root, "transcription_cache.json")
             for path, payload in (
                 (state_path, {"input_file_path": os.path.join(uploads_dir, "story.txt"), "loaded_script_name": "demo"}),
-                (os.path.join(temp_root, "annotated_script.json"), {"entries": [], "dictionary": []}),
-                (os.path.join(temp_root, "voice_config.json"), {"Narrator": {}}),
-                (os.path.join(temp_root, "paragraphs.json"), {"paragraphs": []}),
-                (transcription_cache_path, {"entries": []}),
                 (os.path.join(temp_root, "audio_queue_state.json"), {"queue": []}),
                 (os.path.join(temp_root, "processing_workflow_state.json"), {"running": True}),
                 (os.path.join(temp_root, "new_mode_workflow_state.json"), {"running": True}),
@@ -294,9 +305,6 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                 f.write("shm")
 
             original_root = app_module.ROOT_DIR
-            original_script = app_module.SCRIPT_PATH
-            original_voice = app_module.VOICE_CONFIG_PATH
-            original_chunks = app_module.CHUNKS_PATH
             original_voicelines = app_module.VOICELINES_DIR
             original_uploads = app_module.UPLOADS_DIR
             original_clone = app_module.CLONE_VOICES_DIR
@@ -312,7 +320,6 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                         self.root_dir = root_dir
                         self.chunks_db_path = os.path.join(root_dir, "chunks.sqlite3")
                         self.chunks_queue_log_path = os.path.join(root_dir, "chunks.queue.log")
-                        self.transcription_cache_path = os.path.join(root_dir, "transcription_cache.json")
                         self._transcription_cache_lock = app_module.threading.Lock()
                         self._transcription_cache = {"stale": True}
                         self.engine = object()
@@ -330,9 +337,6 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                 stub_manager = ResetStubManager(temp_root)
 
                 app_module.ROOT_DIR = temp_root
-                app_module.SCRIPT_PATH = os.path.join(temp_root, "annotated_script.json")
-                app_module.VOICE_CONFIG_PATH = os.path.join(temp_root, "voice_config.json")
-                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
                 app_module.VOICELINES_DIR = voicelines_dir
                 app_module.UPLOADS_DIR = uploads_dir
                 app_module.CLONE_VOICES_DIR = clone_dir
@@ -351,9 +355,6 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                 result = asyncio.run(app_module.reset_project())
             finally:
                 app_module.ROOT_DIR = original_root
-                app_module.SCRIPT_PATH = original_script
-                app_module.VOICE_CONFIG_PATH = original_voice
-                app_module.CHUNKS_PATH = original_chunks
                 app_module.VOICELINES_DIR = original_voicelines
                 app_module.UPLOADS_DIR = original_uploads
                 app_module.CLONE_VOICES_DIR = original_clone
@@ -370,8 +371,6 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
             self.assertTrue(os.path.exists(queue_log_path))
             self.assertFalse(os.path.exists(f"{chunks_db_path}-wal"))
             self.assertFalse(os.path.exists(f"{chunks_db_path}-shm"))
-            self.assertFalse(os.path.exists(os.path.join(temp_root, "annotated_script.json")))
-            self.assertFalse(os.path.exists(os.path.join(temp_root, "voice_config.json")))
             self.assertEqual(os.listdir(voicelines_dir), [])
             self.assertEqual(os.listdir(uploads_dir), [])
             self.assertEqual(os.listdir(clone_dir), [])
@@ -421,9 +420,9 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
     def test_standalone_create_script_marks_new_mode_stage_complete(self):
         captured = {"calls": 0}
 
-        def fake_run_create_script_task(run_id, paragraphs_path, script_output_path, chunks_output_path):
+        def fake_run_create_script_task(run_id):
             captured["calls"] += 1
-            captured["args"] = (run_id, paragraphs_path, script_output_path, chunks_output_path)
+            captured["args"] = (run_id,)
 
         self._patch("_run_create_script_task", fake_run_create_script_task)
 
@@ -438,12 +437,7 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                 with app_module.new_mode_workflow_lock:
                     app_module.process_state["new_mode_workflow"] = app_module._new_mode_workflow_initial_state()
 
-                app_module._run_create_script_task_with_new_mode_state(
-                    "run-1",
-                    os.path.join(temp_root, "paragraphs.json"),
-                    os.path.join(temp_root, "annotated_script.json"),
-                    os.path.join(temp_root, "chunks.json"),
-                )
+                app_module._run_create_script_task_with_new_mode_state("run-1")
 
                 markers = app_module._load_new_mode_stage_markers()
                 completed = app_module.process_state["new_mode_workflow"]["completed_stages"]
@@ -502,13 +496,11 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_root:
             with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
                 json.dump({}, f)
-            with open(os.path.join(temp_root, "annotated_script.json"), "w", encoding="utf-8") as f:
-                json.dump({"entries": [{"speaker": "Narrator", "text": "Hello world."}], "dictionary": []}, f)
-            with open(os.path.join(temp_root, "chunks.json"), "w", encoding="utf-8") as f:
-                json.dump(
-                    [{"id": 0, "speaker": "Narrator", "text": "Hello world.", "status": "pending"}],
-                    f,
-                )
+            manager = _seed_db_project(
+                temp_root,
+                entries=[{"speaker": "Narrator", "text": "Hello world."}],
+                chunks=[{"id": 0, "uid": "c1", "speaker": "Narrator", "text": "Hello world.", "status": "pending"}],
+            )
 
             workflow_state_path = os.path.join(temp_root, "new_mode_workflow_state.json")
             with open(workflow_state_path, "w", encoding="utf-8") as f:
@@ -523,16 +515,14 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                 )
 
             original_root = app_module.ROOT_DIR
-            original_script = app_module.SCRIPT_PATH
-            original_chunks = app_module.CHUNKS_PATH
             original_new_mode_path = app_module.NEW_MODE_WORKFLOW_STATE_PATH
             original_starter = app_module._start_new_mode_workflow_thread_locked
+            original_pm = app_module.project_manager
             started = {"count": 0}
             try:
                 app_module.ROOT_DIR = temp_root
-                app_module.SCRIPT_PATH = os.path.join(temp_root, "annotated_script.json")
-                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
                 app_module.NEW_MODE_WORKFLOW_STATE_PATH = workflow_state_path
+                app_module.project_manager = manager
                 app_module._start_new_mode_workflow_thread_locked = lambda: started.__setitem__("count", started["count"] + 1)
                 app_module._restore_new_mode_workflow_state()
                 state = app_module.process_state["new_mode_workflow"]
@@ -553,42 +543,118 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                 )
             finally:
                 app_module.ROOT_DIR = original_root
-                app_module.SCRIPT_PATH = original_script
-                app_module.CHUNKS_PATH = original_chunks
                 app_module.NEW_MODE_WORKFLOW_STATE_PATH = original_new_mode_path
+                app_module.project_manager = original_pm
                 app_module._start_new_mode_workflow_thread_locked = original_starter
+                manager.shutdown_script_store(flush=True)
 
     def test_pipeline_step_status_treats_existing_script_project_as_complete_without_paragraphs(self):
         with tempfile.TemporaryDirectory() as temp_root:
-            script_path = os.path.join(temp_root, "annotated_script.json")
-            chunks_path = os.path.join(temp_root, "chunks.json")
-            with open(script_path, "w", encoding="utf-8") as f:
-                json.dump({"entries": [{"speaker": "Narrator", "text": "Hello world."}]}, f)
-            with open(chunks_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    [{"id": 0, "speaker": "Narrator", "text": "Hello world.", "status": "done"}],
-                    f,
-                )
+            manager = _seed_db_project(
+                temp_root,
+                entries=[{"speaker": "Narrator", "text": "Hello world."}],
+                chunks=[{"id": 0, "uid": "c1", "speaker": "Narrator", "text": "Hello world.", "status": "done"}],
+            )
 
             original_root = app_module.ROOT_DIR
-            original_script = app_module.SCRIPT_PATH
-            original_chunks = app_module.CHUNKS_PATH
+            original_pm = app_module.project_manager
             try:
                 app_module.ROOT_DIR = temp_root
-                app_module.SCRIPT_PATH = script_path
-                app_module.CHUNKS_PATH = chunks_path
+                app_module.project_manager = manager
 
                 result = asyncio.run(app_module.get_pipeline_step_status())
             finally:
                 app_module.ROOT_DIR = original_root
-                app_module.SCRIPT_PATH = original_script
-                app_module.CHUNKS_PATH = original_chunks
+                app_module.project_manager = original_pm
+                manager.shutdown_script_store(flush=True)
 
             self.assertFalse(result["has_input_file"])
             self.assertEqual(result["process_paragraphs"], "complete")
             self.assertEqual(result["assign_dialogue"], "complete")
             self.assertEqual(result["extract_temperament"], "complete")
             self.assertEqual(result["create_script"], "complete")
+
+
+class LegacyCliRedirectTests(unittest.TestCase):
+    def _run_script(self, *args):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.dirname(__file__)
+        result = subprocess.run(
+            [sys.executable, *args],
+            cwd=os.path.dirname(__file__),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"Script failed: {' '.join(args)}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
+        return result
+
+    def test_process_paragraphs_legacy_output_path_redirects_into_project_store(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            os.makedirs(os.path.join(temp_root, "app"), exist_ok=True)
+            input_path = os.path.join(temp_root, "story.txt")
+            output_path = os.path.join(temp_root, "paragraphs.json")
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write('Chapter One\n\n"Hello there."\n\nPlain narration.')
+
+            self._run_script(
+                os.path.join("scripts", "process_paragraphs.py"),
+                input_path,
+                output_path,
+            )
+
+            manager = ProjectManager(temp_root)
+            try:
+                paragraphs_doc = manager.load_paragraphs() or {}
+                self.assertGreater(len(paragraphs_doc.get("paragraphs") or []), 0)
+                self.assertFalse(os.path.exists(output_path))
+            finally:
+                manager.shutdown_script_store(flush=True)
+
+    def test_create_script_legacy_file_args_import_into_project_store(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            os.makedirs(os.path.join(temp_root, "app"), exist_ok=True)
+            paragraphs_path = os.path.join(temp_root, "paragraphs.json")
+            script_output_path = os.path.join(temp_root, "annotated_script.json")
+            chunks_output_path = os.path.join(temp_root, "chunks.json")
+            with open(paragraphs_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "paragraphs": [
+                            {
+                                "id": "p_0001",
+                                "chapter": "Chapter One",
+                                "text": "Plain narration.",
+                                "has_dialogue": False,
+                                "tone": "",
+                            }
+                        ]
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            self._run_script(
+                os.path.join("scripts", "create_script.py"),
+                paragraphs_path,
+                script_output_path,
+                chunks_output_path,
+            )
+
+            manager = ProjectManager(temp_root)
+            try:
+                script_doc = manager.load_script_document()
+                chunks = manager.load_chunks()
+                self.assertEqual(len(script_doc.get("entries") or []), 1)
+                self.assertEqual(len(chunks), 1)
+                self.assertFalse(os.path.exists(script_output_path))
+                self.assertFalse(os.path.exists(chunks_output_path))
+            finally:
+                manager.shutdown_script_store(flush=True)
 
     def test_start_new_mode_workflow_uses_stage_markers_to_skip_script_pipeline(self):
         with tempfile.TemporaryDirectory() as temp_root:

@@ -9,7 +9,7 @@ from openai import OpenAI
 
 from scripts.generate_script import process_chunk
 from script_sanity import run_script_sanity_check
-from script_store import load_script_document, save_script_document
+from script_provider import open_project_script_store
 from source_document import load_source_document
 
 
@@ -154,8 +154,8 @@ def _find_source_chapter(source_document, title, index):
     return None
 
 
-def repair_chapter_heading_entries(script_path, source_document):
-    script_document = load_script_document(script_path)
+def repair_chapter_heading_entries(store, source_document):
+    script_document = store.load_script_document()
     entries = script_document.get("entries") or []
     if not entries:
         return 0
@@ -200,11 +200,13 @@ def repair_chapter_heading_entries(script_path, source_document):
         rebuilt_entries.extend(group_entries)
 
     if repaired_count:
-        save_script_document(
-            script_path,
+        store.replace_script_document(
             entries=rebuilt_entries,
             dictionary=script_document.get("dictionary", []),
             sanity_cache=script_document.get("sanity_cache"),
+            reason="repair_chapter_headings",
+            rebuild_chunks=True,
+            wait=True,
         )
 
     return repaired_count
@@ -212,12 +214,9 @@ def repair_chapter_heading_entries(script_path, source_document):
 
 def repair_chapter_headings_only(root_dir):
     state_path = os.path.join(root_dir, "state.json")
-    script_path = os.path.join(root_dir, "annotated_script.json")
 
     if not os.path.exists(state_path):
         raise FileNotFoundError("No source file selected.")
-    if not os.path.exists(script_path):
-        raise FileNotFoundError("No annotated script found. Generate a script first.")
 
     with open(state_path, "r", encoding="utf-8") as f:
         input_file = json.load(f).get("input_file_path")
@@ -225,7 +224,13 @@ def repair_chapter_headings_only(root_dir):
         raise FileNotFoundError("Original uploaded source could not be found.")
 
     source_document = load_source_document(input_file)
-    repaired = repair_chapter_heading_entries(script_path, source_document)
+    store = open_project_script_store(root_dir)
+    try:
+        if not store.load_script_document().get("entries"):
+            raise FileNotFoundError("No annotated script found. Generate a script first.")
+        repaired = repair_chapter_heading_entries(store, source_document)
+    finally:
+        store.stop()
     return {
         "repaired_headings": repaired,
         "chunks_reset": False,
@@ -673,14 +678,10 @@ def _merge_narrator_replacement_into_adjacent_entry(entries, chapter_group, repl
 
 def repair_invalid_chunks(root_dir, log, should_continue=None, trace=None):
     state_path = os.path.join(root_dir, "state.json")
-    script_path = os.path.join(root_dir, "annotated_script.json")
-    chunks_path = os.path.join(root_dir, "chunks.json")
     config_path = os.path.join(root_dir, "app", "config.json")
 
     if not os.path.exists(state_path):
         raise FileNotFoundError("No source file selected.")
-    if not os.path.exists(script_path):
-        raise FileNotFoundError("No annotated script found. Generate a script first.")
 
     with open(state_path, "r", encoding="utf-8") as f:
         input_file = json.load(f).get("input_file_path")
@@ -694,6 +695,10 @@ def repair_invalid_chunks(root_dir, log, should_continue=None, trace=None):
         timeout=settings["timeout"],
     )
     source_document = load_source_document(input_file)
+    store = open_project_script_store(root_dir)
+    if not store.load_script_document().get("entries"):
+        store.stop()
+        raise FileNotFoundError("No annotated script found. Generate a script first.")
 
     repaired_targets = 0
     attempted_targets = set()
@@ -752,14 +757,14 @@ def repair_invalid_chunks(root_dir, log, should_continue=None, trace=None):
             )
             return False
 
-        save_script_document(
-            script_path,
+        store.replace_script_document(
             entries=updated_entries,
             dictionary=current_script_document.get("dictionary", []),
             sanity_cache=sanity_cache,
+            reason=f"script_repair_{failure_label}",
+            rebuild_chunks=True,
+            wait=True,
         )
-        if os.path.exists(chunks_path):
-            os.remove(chunks_path)
         record_repair_completion(target_started_at)
         emit_trace(
             "resolution_committed",
@@ -786,17 +791,15 @@ def repair_invalid_chunks(root_dir, log, should_continue=None, trace=None):
     while True:
         _ensure_continue(should_continue)
         if repaired_headings == 0:
-            repaired_headings = repair_chapter_heading_entries(script_path, source_document)
+            repaired_headings = repair_chapter_heading_entries(store, source_document)
             if repaired_headings:
-                if os.path.exists(chunks_path):
-                    os.remove(chunks_path)
                 emit_trace("chapter_headings_restored", count=int(repaired_headings))
                 log(
                     f'Restored {repaired_headings} chapter heading'
                     f'{"s" if repaired_headings != 1 else ""} from source metadata before repair.'
                 )
 
-        script_document = load_script_document(script_path)
+        script_document = store.load_script_document()
         sanity_cache = script_document.get("sanity_cache") or {}
         sanity_result = run_script_sanity_check(
             source_document,
@@ -808,7 +811,7 @@ def repair_invalid_chunks(root_dir, log, should_continue=None, trace=None):
             initial_result = sanity_result
 
         if sanity_result["invalid_chunk_count"] == 0:
-            return {
+            result = {
                 "initial_invalid_chunks": initial_result["invalid_chunk_count"],
                 "initial_missing_words": initial_result["missing_words"],
                 "initial_inserted_words": initial_result["inserted_words"],
@@ -817,10 +820,12 @@ def repair_invalid_chunks(root_dir, log, should_continue=None, trace=None):
                 "failed_targets": len(failed_targets),
                 "final_sanity": sanity_result,
             }
+            store.stop()
+            return result
 
         chapter_result, replacement_chunk, signature = _pick_next_target(sanity_result, attempted_targets)
         if chapter_result is None:
-            return {
+            result = {
                 "initial_invalid_chunks": initial_result["invalid_chunk_count"],
                 "initial_missing_words": initial_result["missing_words"],
                 "initial_inserted_words": initial_result["inserted_words"],
@@ -829,6 +834,8 @@ def repair_invalid_chunks(root_dir, log, should_continue=None, trace=None):
                 "failed_targets": len(failed_targets),
                 "final_sanity": sanity_result,
             }
+            store.stop()
+            return result
         attempted_targets.add(signature)
         target_id = _target_trace_id(signature)
 

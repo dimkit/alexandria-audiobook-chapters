@@ -16,6 +16,7 @@ import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
 import httpx
+from runtime_layout import LAYOUT
 
 DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
@@ -58,7 +59,7 @@ class TTSEngine:
     Models and clients are lazily initialized on first use.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, *, project_root=None):
         tts_config = config.get("tts", {})
         self._mode = tts_config.get("mode", "external")
         self._local_backend_preference = (tts_config.get("local_backend", "auto") or "auto").strip().lower()
@@ -96,6 +97,7 @@ class TTSEngine:
         self._gradio_client = None
         self._external_backend = None
         self._external_http_base = None
+        self._project_root = os.path.abspath(project_root or LAYOUT.project_dir)
 
         # MLX local model cache
         self._mlx_models = {}
@@ -860,13 +862,17 @@ class TTSEngine:
 
     @staticmethod
     def _new_voice_design_preview_path():
-        previews_dir = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            "designed_voices",
-            "previews",
-        )
+        previews_dir = os.path.join(LAYOUT.designed_voices_dir, "previews")
         os.makedirs(previews_dir, exist_ok=True)
         return os.path.join(previews_dir, f"preview_{int(time.time() * 1000)}.wav")
+
+    def _resolve_project_path(self, path):
+        resolved = str(path or "").strip()
+        if not resolved:
+            return ""
+        if os.path.isabs(resolved):
+            return resolved
+        return os.path.join(self._project_root, resolved)
 
     # ── Clone prompt cache (local mode) ──────────────────────────
 
@@ -884,10 +890,7 @@ class TTSEngine:
 
         if not ref_audio_path or not ref_text:
             raise ValueError(f"Clone voice for '{speaker}' missing ref_audio or ref_text")
-        # Resolve relative paths against project root (parent of app/)
-        if not os.path.isabs(ref_audio_path):
-            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            ref_audio_path = os.path.join(root_dir, ref_audio_path)
+        ref_audio_path = self._resolve_project_path(ref_audio_path)
         if not os.path.exists(ref_audio_path):
             raise FileNotFoundError(f"Reference audio not found for '{speaker}': {ref_audio_path}")
 
@@ -1416,9 +1419,7 @@ class TTSEngine:
                 print(f"Warning: Clone voice for '{speaker}' missing ref_audio. Skipping.")
                 return False
 
-            if not os.path.isabs(ref_audio_path):
-                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                ref_audio_path = os.path.join(root_dir, ref_audio_path)
+            ref_audio_path = self._resolve_project_path(ref_audio_path)
 
             if not os.path.exists(ref_audio_path):
                 print(f"Warning: Reference audio not found for '{speaker}': {ref_audio_path}")
@@ -2108,10 +2109,7 @@ class TTSEngine:
                 print(f"Warning: Clone voice for '{speaker}' missing ref_audio or ref_text. Skipping.")
                 return False
 
-            # Resolve relative paths against project root
-            if not os.path.isabs(ref_audio):
-                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                ref_audio = os.path.join(root_dir, ref_audio)
+            ref_audio = self._resolve_project_path(ref_audio)
 
             if not os.path.exists(ref_audio):
                 print(f"Warning: Reference audio not found for '{speaker}': {ref_audio}")

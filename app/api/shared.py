@@ -44,7 +44,7 @@ from review_prompts import load_review_prompts
 from attribution_prompts import load_attribution_prompts
 from voice_prompt import load_voice_prompt
 from hf_utils import fetch_builtin_manifest, download_builtin_adapter, is_adapter_downloaded
-from script_store import apply_dictionary_to_text, clean_dictionary_entries, load_script_document, save_script_document
+from script_store import apply_dictionary_to_text, clean_dictionary_entries
 from source_document import load_source_document
 from script_sanity import build_attribution_classifier, run_script_sanity_check
 from script_repair import RepairSupersededError, repair_invalid_chunks
@@ -61,19 +61,14 @@ BASE_DIR = LAYOUT.app_dir
 REPO_DIR = REPO_ROOT
 ROOT_DIR = LAYOUT.project_dir
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-VOICES_PATH = LAYOUT.voices_path
-VOICE_CONFIG_PATH = LAYOUT.voice_config_path
-SCRIPT_PATH = LAYOUT.script_path
 AUDIOBOOK_PATH = LAYOUT.audiobook_path
 M4B_PATH = LAYOUT.m4b_path
 OPTIMIZED_EXPORT_PATH = LAYOUT.optimized_export_path
 UPLOADS_DIR = LAYOUT.uploads_dir
 SCRIPTS_DIR = LAYOUT.script_snapshots_dir
 SAVED_PROJECTS_DIR = LAYOUT.project_archives_dir
-CHUNKS_PATH = LAYOUT.chunks_path
 AUDIO_QUEUE_STATE_PATH = LAYOUT.audio_queue_state_path
 AUDIO_CANCEL_TOMBSTONE_PATH = LAYOUT.audio_cancel_tombstone_path
-SCRIPT_SANITY_PATH = LAYOUT.script_sanity_path
 SCRIPT_REPAIR_TRACE_PATH = LAYOUT.script_repair_trace_path
 DESIGNED_VOICES_DIR = LAYOUT.designed_voices_dir
 CLONE_VOICES_DIR = LAYOUT.clone_voices_dir
@@ -85,23 +80,25 @@ DATASET_BUILDER_DIR = LAYOUT.dataset_builder_dir
 DESIGNED_VOICES_MANIFEST = os.path.join(DESIGNED_VOICES_DIR, "manifest.json")
 CLONE_VOICES_MANIFEST = os.path.join(CLONE_VOICES_DIR, "manifest.json")
 ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg"}
-PROJECT_ARCHIVE_VERSION = 4
+PROJECT_ARCHIVE_VERSION = 5
 PROJECT_ARCHIVE_MANIFEST_NAME = "project_archive_manifest.json"
 PROJECT_ARCHIVE_ALLOWED_FILES = {
-    "annotated_script.json",
-    "paragraphs.json",
-    "voices.json",
-    "chunks.json",
     "db/chunks.sqlite3",
-    "repair/script_sanity_check.json",
     "state.json",
-    "db/transcription_cache.json",
+    "workflow/processing_workflow_state.json",
+    "workflow/new_mode_workflow_state.json",
+    "workflow/audio_queue_state.json",
+    "workflow/audio_cancel_tombstone.json",
+    "workflow/script_generation_checkpoint.json",
+    "workflow/script_review_checkpoint.json",
+    "repair/script_repair_trace.jsonl",
+    "exports/cloned_audiobook.mp3",
+    "exports/optimized_audiobook.zip",
+    "exports/audacity_export.zip",
+    "exports/audiobook.m4b",
+    "exports/m4b_cover.jpg",
 }
-PROJECT_ARCHIVE_LEGACY_FILE_ALIASES = {
-    "chunks.sqlite3": "db/chunks.sqlite3",
-    "script_sanity_check.json": "repair/script_sanity_check.json",
-    "transcription_cache.json": "db/transcription_cache.json",
-}
+PROJECT_ARCHIVE_LEGACY_FILE_ALIASES = {}
 PROJECT_ARCHIVE_ALLOWED_DIRS = {
     "uploads",
     "clone_voices",
@@ -452,9 +449,50 @@ def _resolve_voice_alias_target(speaker: str, alias: str, known_names):
 
 
 def _load_project_script_document():
-    if not os.path.exists(SCRIPT_PATH):
-        return {"entries": [], "dictionary": []}
-    return load_script_document(SCRIPT_PATH)
+    load_fn = getattr(project_manager, "load_script_document", None)
+    if callable(load_fn):
+        try:
+            return load_fn()
+        except Exception:
+            pass
+    return {"entries": [], "dictionary": [], "sanity_cache": {"phrase_decisions": {}}}
+
+
+def _project_has_script_document():
+    has_fn = getattr(project_manager, "script_store", None)
+    if has_fn is not None and hasattr(project_manager.script_store, "has_script_entries"):
+        try:
+            return bool(project_manager.script_store.has_script_entries())
+        except Exception:
+            return False
+    return bool(_load_project_script_document().get("entries"))
+
+
+def _load_project_paragraphs_document():
+    load_fn = getattr(project_manager, "load_paragraphs", None)
+    if callable(load_fn):
+        try:
+            payload = load_fn()
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _project_has_paragraphs_document():
+    payload = _load_project_paragraphs_document()
+    return bool(payload.get("paragraphs"))
+
+
+def _load_project_script_sanity_result():
+    script_store = getattr(project_manager, "script_store", None)
+    if script_store is not None and hasattr(script_store, "load_project_document"):
+        try:
+            payload = script_store.load_project_document("script_sanity_result")
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+    return None
 
 
 def _load_project_dictionary_entries():
@@ -508,14 +546,11 @@ def _save_script_source_companion(name: str):
 
 
 def _saved_script_db_companion_path(name: str):
-    return os.path.join(SCRIPTS_DIR, f"{name}.chunks.sqlite3")
+    return os.path.join(SCRIPTS_DIR, f"{name}.sqlite3")
 
 
 def _delete_saved_script_artifacts(name: str):
-    base = os.path.join(SCRIPTS_DIR, f"{name}.json")
-    if os.path.exists(base):
-        os.remove(base)
-    for suffix in (".chunks.sqlite3", ".paragraphs.json", ".voice_config.json"):
+    for suffix in (".sqlite3", ".json"):
         companion = os.path.join(SCRIPTS_DIR, f"{name}{suffix}")
         if os.path.exists(companion):
             os.remove(companion)
@@ -529,28 +564,22 @@ def _delete_saved_script_artifacts(name: str):
 
 
 def _save_current_script_snapshot(name: str, *, purge_existing: bool = False):
-    if not os.path.exists(SCRIPT_PATH):
-        raise FileNotFoundError("No annotated script to save. Generate a script first.")
+    if not _project_has_script_document():
+        raise FileNotFoundError("No script to save. Generate a script first.")
 
     safe_name = _sanitize_name(name)
     if not safe_name:
         raise ValueError("Invalid script name.")
 
-    dest = os.path.join(SCRIPTS_DIR, f"{safe_name}.json")
+    dest = _saved_script_db_companion_path(safe_name)
     existed = os.path.exists(dest)
     if purge_existing and existed:
         _delete_saved_script_artifacts(safe_name)
 
-    shutil.copy2(SCRIPT_PATH, dest)
-    db_companion = _saved_script_db_companion_path(safe_name)
     db_path = getattr(project_manager, "chunks_db_path", os.path.join(ROOT_DIR, "chunks.sqlite3"))
     if not os.path.exists(db_path):
-        raise FileNotFoundError("No SQLite project state to save alongside the script.")
-    _copy_sqlite_database_snapshot(db_path, db_companion)
-
-    paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
-    if os.path.exists(paragraphs_path):
-        shutil.copy2(paragraphs_path, os.path.join(SCRIPTS_DIR, f"{safe_name}.paragraphs.json"))
+        raise FileNotFoundError("No SQLite project state to save.")
+    _copy_sqlite_database_snapshot(db_path, dest)
     _save_script_source_companion(safe_name)
 
     state = _load_project_state_payload()
@@ -585,6 +614,27 @@ def _autosave_current_script_for_workflow(*, purge_existing: bool, trigger: str)
         purge_existing,
     )
     return result
+
+
+def _save_current_project_archive_snapshot(name: str):
+    if not _project_has_script_document():
+        has_substantive_chunks = getattr(project_manager, "has_substantive_chunks", None)
+        if not callable(has_substantive_chunks) or not bool(has_substantive_chunks()):
+            raise FileNotFoundError("No script to save. Generate a script first.")
+
+    safe_name = _sanitize_name(name)
+    if not safe_name:
+        raise ValueError("Invalid project name.")
+
+    archive_path = _saved_project_archive_path(safe_name)
+    existed = os.path.exists(archive_path)
+    archive_result = _write_project_archive(archive_path)
+    _delete_saved_script_artifacts(safe_name)
+    return {
+        "name": safe_name,
+        "overwrote": existed,
+        "entries": archive_result["entries"],
+    }
 
 
 def _extract_first_json_object(text):
@@ -1710,21 +1760,19 @@ def _derived_processing_completed_stages(options=None):
         if stage_name not in allowed:
             continue
         if stage_name == "script":
-            # Persisted markers are authoritative for restore/resume workflows;
-            # fall back to file existence for legacy projects.
-            if markers.get(stage_name) or os.path.exists(SCRIPT_PATH):
+            if markers.get(stage_name) or _project_has_script_document():
                 completed.append(stage_name)
             continue
         if stage_name == "review" and markers.get(stage_name):
             completed.append(stage_name)
             continue
-        if stage_name in ("sanity", "repair") and markers.get(stage_name) and os.path.exists(SCRIPT_PATH) and os.path.exists(SCRIPT_SANITY_PATH):
+        if stage_name in ("sanity", "repair") and markers.get(stage_name) and _project_has_script_document() and _load_project_script_sanity_result():
             completed.append(stage_name)
             continue
         if stage_name == "voices" and markers.get(stage_name) and getattr(project_manager, "has_voice_config", lambda: False)():
             completed.append(stage_name)
             continue
-        if stage_name == "audio" and markers.get(stage_name) and bool(_load_compat_chunks_snapshot()):
+        if stage_name == "audio" and markers.get(stage_name) and bool(_load_project_chunks_snapshot()):
             completed.append(stage_name)
 
     return completed
@@ -1732,7 +1780,7 @@ def _derived_processing_completed_stages(options=None):
 
 def _chunk_chapter_summary():
     try:
-        chunks = _load_compat_chunks_snapshot()
+        chunks = _load_project_chunks_snapshot()
         ordered_chapters = []
         last_seen = None
         for chunk in chunks:
@@ -1755,26 +1803,15 @@ def _chunk_chapter_summary():
         }
 
 
-def _load_compat_chunks_snapshot():
-    manager_root = os.path.abspath(getattr(project_manager, "root_dir", ROOT_DIR))
-    current_root = os.path.abspath(ROOT_DIR)
-    if manager_root == current_root and hasattr(project_manager, "load_chunks"):
+def _load_project_chunks_snapshot():
+    if hasattr(project_manager, "load_chunks"):
         try:
             chunks = project_manager.load_chunks()
             if isinstance(chunks, list):
                 return chunks
         except Exception:
             pass
-
-    if not os.path.exists(CHUNKS_PATH):
-        return []
-    try:
-        chunks_path = CHUNKS_PATH
-        with open(chunks_path, "r", encoding="utf-8", errors="ignore") as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, list) else []
-    except (OSError, json.JSONDecodeError, ValueError):
-        return []
+    return []
 
 
 def _script_ingestion_preflight_summary():
@@ -1864,32 +1901,25 @@ def _clear_project_derived_state(preserve_input_file=True):
     if manager_root == current_root:
         chunks_db_path = project_manager.chunks_db_path
         chunks_queue_log_path = project_manager.chunks_queue_log_path
-        transcription_cache_path = project_manager.transcription_cache_path
     else:
         chunks_db_path = getattr(project_manager, "chunks_db_path", os.path.join(ROOT_DIR, "chunks.sqlite3"))
         chunks_queue_log_path = getattr(project_manager, "chunks_queue_log_path", os.path.join(ROOT_DIR, "chunks.queue.log"))
-        transcription_cache_path = getattr(project_manager, "transcription_cache_path", os.path.join(ROOT_DIR, "transcription_cache.json"))
 
     files_to_remove = [
-        SCRIPT_PATH,
-        VOICES_PATH,
-        VOICE_CONFIG_PATH,
-        CHUNKS_PATH,
         chunks_db_path,
         f"{chunks_db_path}-wal",
         f"{chunks_db_path}-shm",
         chunks_queue_log_path,
-        transcription_cache_path,
         SCRIPT_REPAIR_TRACE_PATH,
         AUDIOBOOK_PATH,
         M4B_PATH,
         AUDIO_QUEUE_STATE_PATH,
         PROCESSING_WORKFLOW_STATE_PATH,
         NEW_MODE_WORKFLOW_STATE_PATH,
-        os.path.join(ROOT_DIR, "paragraphs.json"),
-        SCRIPT_SANITY_PATH,
-        os.path.join(ROOT_DIR, "audacity_export.zip"),
-        os.path.join(ROOT_DIR, "m4b_cover.jpg"),
+        LAYOUT.script_generation_checkpoint_path,
+        LAYOUT.script_review_checkpoint_path,
+        LAYOUT.audacity_export_path,
+        LAYOUT.m4b_cover_path,
     ]
     for path in files_to_remove:
         if os.path.exists(path):
@@ -2091,6 +2121,8 @@ def _archive_relative_file_target(path: str) -> str:
 
 def _project_archive_filesystem_path(path: str) -> str:
     normalized = _archive_relative_file_target(path)
+    if normalized == "db/chunks.sqlite3":
+        return getattr(project_manager, "chunks_db_path", os.path.join(ROOT_DIR, "chunks.sqlite3"))
     if os.path.abspath(ROOT_DIR) == os.path.abspath(LAYOUT.project_dir):
         return os.path.join(ROOT_DIR, normalized)
     reverse_aliases = {target: legacy for legacy, target in PROJECT_ARCHIVE_LEGACY_FILE_ALIASES.items()}
@@ -2248,7 +2280,7 @@ def _project_archive_entries():
         if os.path.exists(absolute_path):
             entries[normalized] = absolute_path
 
-    for relative_path in sorted(PROJECT_ARCHIVE_ALLOWED_FILES - {"chunks.json", "db/chunks.sqlite3"}):
+    for relative_path in sorted(PROJECT_ARCHIVE_ALLOWED_FILES - {"db/chunks.sqlite3"}):
         add_relative_path(relative_path)
 
     state = _archive_state_with_relative_paths()
@@ -2256,10 +2288,7 @@ def _project_archive_entries():
     if input_file_path:
         add_relative_path(input_file_path)
 
-    chunks = _load_compat_chunks_snapshot()
-
-    if chunks:
-        entries["chunks.json"] = None
+    chunks = _load_project_chunks_snapshot()
 
     for chunk in chunks:
         audio_path = (chunk.get("audio_path") or "").strip()
@@ -2324,9 +2353,20 @@ def _saved_project_archive_path(name: str) -> str:
     return os.path.join(SAVED_PROJECTS_DIR, f"{safe_name}.zip")
 
 
+def _delete_saved_project_archive(name: str) -> bool:
+    try:
+        archive_path = _saved_project_archive_path(name)
+    except ValueError:
+        return False
+    if os.path.exists(archive_path):
+        os.remove(archive_path)
+        return True
+    return False
+
+
 def _project_has_generated_audio() -> bool:
     try:
-        chunks = _load_compat_chunks_snapshot()
+        chunks = _load_project_chunks_snapshot()
     except Exception:
         return False
 
@@ -2377,8 +2417,6 @@ def _write_project_archive(zip_path: str):
             for relative_path, absolute_path in sorted_entries:
                 if relative_path == "state.json":
                     zf.writestr(relative_path, json.dumps(_archive_state_with_relative_paths(), indent=2, ensure_ascii=False))
-                elif relative_path == "chunks.json":
-                    zf.writestr(relative_path, json.dumps(_load_compat_chunks_snapshot(), indent=2, ensure_ascii=False))
                 else:
                     zf.write(absolute_path, arcname=relative_path)
         os.replace(temp_zip_path, zip_path)
@@ -2398,17 +2436,11 @@ def _write_project_archive(zip_path: str):
 
 def _clear_project_archive_targets():
     removable_files = [
-        SCRIPT_PATH,
-        VOICE_CONFIG_PATH,
-        VOICES_PATH,
-        CHUNKS_PATH,
         getattr(project_manager, "chunks_db_path", os.path.join(ROOT_DIR, "chunks.sqlite3")),
         f"{getattr(project_manager, 'chunks_db_path', os.path.join(ROOT_DIR, 'chunks.sqlite3'))}-wal",
         f"{getattr(project_manager, 'chunks_db_path', os.path.join(ROOT_DIR, 'chunks.sqlite3'))}-shm",
         getattr(project_manager, "chunks_queue_log_path", os.path.join(ROOT_DIR, "chunks.queue.log")),
-        SCRIPT_SANITY_PATH,
         os.path.join(ROOT_DIR, "state.json"),
-        getattr(project_manager, "transcription_cache_path", os.path.join(ROOT_DIR, "transcription_cache.json")),
         AUDIOBOOK_PATH,
         OPTIMIZED_EXPORT_PATH,
         _project_export_filesystem_path("audacity_export.zip"),
@@ -2417,6 +2449,9 @@ def _clear_project_archive_targets():
         AUDIO_QUEUE_STATE_PATH,
         PROCESSING_WORKFLOW_STATE_PATH,
         NEW_MODE_WORKFLOW_STATE_PATH,
+        LAYOUT.script_generation_checkpoint_path,
+        LAYOUT.script_review_checkpoint_path,
+        SCRIPT_REPAIR_TRACE_PATH,
     ]
     removable_dirs = [UPLOADS_DIR, CLONE_VOICES_DIR, DESIGNED_VOICES_DIR, VOICELINES_DIR]
 
@@ -3897,20 +3932,26 @@ def run_script_sanity_task(run_id: str, stop_check=None):
             return
         if not _task_is_current("sanity", run_id):
             return
-        save_script_document(
-            SCRIPT_PATH,
+        project_manager.script_store.replace_script_document(
             entries=script_document.get("entries"),
             dictionary=script_document.get("dictionary", []),
             sanity_cache={"phrase_decisions": phrase_decisions},
+            reason="script_sanity_progress",
+            rebuild_chunks=False,
+            wait=True,
         )
 
     try:
         ensure_active()
-        if os.path.exists(SCRIPT_SANITY_PATH):
-            os.remove(SCRIPT_SANITY_PATH)
+        if getattr(project_manager, "script_store", None) is not None:
+            project_manager.script_store.delete_project_document(
+                "script_sanity_result",
+                reason="script_sanity_reset",
+                wait=True,
+            )
 
         ensure_active()
-        if not os.path.exists(SCRIPT_PATH):
+        if not _project_has_script_document():
             raise FileNotFoundError("No annotated script found. Generate a script first.")
 
         state_path = os.path.join(ROOT_DIR, "state.json")
@@ -3984,15 +4025,20 @@ def run_script_sanity_task(run_id: str, stop_check=None):
         updated_sanity_cache = {
             "phrase_decisions": result.get("attribution_phrase_decisions", {}),
         }
-        save_script_document(
-            SCRIPT_PATH,
+        project_manager.script_store.replace_script_document(
             entries=script_document.get("entries"),
             dictionary=script_document.get("dictionary", []),
             sanity_cache=updated_sanity_cache,
+            reason="script_sanity_complete",
+            rebuild_chunks=False,
+            wait=True,
         )
-
-        with open(SCRIPT_SANITY_PATH, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
+        project_manager.script_store.replace_project_document(
+            "script_sanity_result",
+            result,
+            reason="script_sanity_complete",
+            wait=True,
+        )
 
         mismatched = [chapter for chapter in result["chapters"] if chapter["missing_words"] or chapter["inserted_words"]]
         if not mismatched:
@@ -4057,9 +4103,17 @@ def run_script_repair_task(run_id: str, stop_check=None):
 
     try:
         ensure_active()
-        _append_script_repair_trace(run_id, "repair_run_started", {"script_path": SCRIPT_PATH})
-        if os.path.exists(SCRIPT_SANITY_PATH):
-            os.remove(SCRIPT_SANITY_PATH)
+        _append_script_repair_trace(
+            run_id,
+            "repair_run_started",
+            {"entry_count": len(_load_project_script_document().get("entries") or [])},
+        )
+        if getattr(project_manager, "script_store", None) is not None:
+            project_manager.script_store.delete_project_document(
+                "script_sanity_result",
+                reason="repair_reset_sanity",
+                wait=True,
+            )
 
         result = repair_invalid_chunks(
             ROOT_DIR,
@@ -4071,8 +4125,12 @@ def run_script_repair_task(run_id: str, stop_check=None):
             raise WorkflowPauseRequested()
         final_sanity = result["final_sanity"]
 
-        with open(SCRIPT_SANITY_PATH, "w", encoding="utf-8") as f:
-            json.dump(final_sanity, f, indent=2, ensure_ascii=False)
+        project_manager.script_store.replace_project_document(
+            "script_sanity_result",
+            final_sanity,
+            reason="repair_final_sanity",
+            wait=True,
+        )
 
         log(f"Initial invalid chunks: {result['initial_invalid_chunks']}")
         log(f"Initial missing words: {result['initial_missing_words']}")
@@ -4176,30 +4234,27 @@ def run_lost_audio_repair_task(run_id: str, use_asr: bool):
     return success
 
 
-def _run_assign_dialogue_task(run_id: str, paragraphs_path: str, config_path: str):
+def _run_assign_dialogue_task(run_id: str, config_path: str):
     run_process(
-        [sys.executable, "-u", "-m", "scripts.assign_dialogue", paragraphs_path, config_path],
+        [sys.executable, "-u", "-m", "scripts.assign_dialogue", "--project-root", ROOT_DIR, config_path],
         "assign_dialogue",
         run_id,
     )
 
 
-def _run_extract_temperament_task(run_id: str, paragraphs_path: str, config_path: str):
+def _run_extract_temperament_task(run_id: str, config_path: str):
     run_process(
-        [sys.executable, "-u", "-m", "scripts.extract_temperament", paragraphs_path, config_path],
+        [sys.executable, "-u", "-m", "scripts.extract_temperament", "--project-root", ROOT_DIR, config_path],
         "extract_temperament",
         run_id,
     )
 
 
-def _run_create_script_task(run_id: str, paragraphs_path: str,
-                            script_output_path: str, chunks_output_path: str):
-    _ensure_voice_compat_exports()
+def _run_create_script_task(run_id: str):
     # ── Error correction: retry dialogue-error paragraphs before building script ──
     try:
-        with open(paragraphs_path, "r", encoding="utf-8") as f:
-            pdata = json.load(f)
-        dialogue_errors = pdata.get("dialogue_errors", [])
+        pdata = _load_project_paragraphs_document()
+        dialogue_errors = pdata.get("dialogue_errors", []) if isinstance(pdata, dict) else []
     except Exception:
         dialogue_errors = []
 
@@ -4218,7 +4273,7 @@ def _run_create_script_task(run_id: str, paragraphs_path: str,
     if dialogue_errors and retry_attempts > 0:
         run_process(
             [sys.executable, "-u", "-m", "scripts.assign_dialogue",
-             paragraphs_path, CONFIG_PATH, "--retry-errors", str(retry_attempts)],
+             "--project-root", ROOT_DIR, CONFIG_PATH, "--retry-errors", str(retry_attempts)],
             "create_script",
             run_id,
         )
@@ -4226,13 +4281,12 @@ def _run_create_script_task(run_id: str, paragraphs_path: str,
     # ── Build the script ──────────────────────────────────────────────────────
     success = run_process(
         [sys.executable, "-u", "-m", "scripts.create_script",
-         paragraphs_path, script_output_path, chunks_output_path,
+         "--project-root", ROOT_DIR,
          "--max-length", str(script_max_length)],
         "create_script",
         run_id,
     )
     if success:
-        project_manager.reload_script_store()
         if hasattr(project_manager, "sync_missing_voice_profiles_from_chunks"):
             project_manager.sync_missing_voice_profiles_from_chunks(
                 reason="create_script_seed_voice_profiles",
@@ -4254,9 +4308,9 @@ def _load_script_max_length() -> int:
         return 100
 
 
-def _run_process_paragraphs_task(run_id: str, input_file: str, output_path: str):
+def _run_process_paragraphs_task(run_id: str, input_file: str):
     run_process(
-        [sys.executable, "-u", "-m", "scripts.process_paragraphs", input_file, output_path],
+        [sys.executable, "-u", "-m", "scripts.process_paragraphs", input_file, "--project-root", ROOT_DIR],
         "process_paragraphs",
         run_id,
     )
@@ -4330,22 +4384,22 @@ def _run_processing_script_stage():
 
 
 def _run_processing_review_stage():
-    if not os.path.exists(SCRIPT_PATH):
-        raise FileNotFoundError("No annotated script found. Generate a script first.")
+    if not _project_has_script_document():
+        raise FileNotFoundError("No script found. Generate a script first.")
     run_id = _start_task_run("review")
     return _run_review_script_task(run_id)
 
 
 def _run_processing_sanity_stage():
-    if not os.path.exists(SCRIPT_PATH):
-        raise FileNotFoundError("No annotated script found. Generate a script first.")
+    if not _project_has_script_document():
+        raise FileNotFoundError("No script found. Generate a script first.")
     run_id = _start_task_run("sanity")
     return _run_sanity_task(run_id, stop_check=_processing_workflow_is_pause_requested)
 
 
 def _run_processing_repair_stage():
-    if not os.path.exists(SCRIPT_PATH):
-        raise FileNotFoundError("No annotated script found. Generate a script first.")
+    if not _project_has_script_document():
+        raise FileNotFoundError("No script found. Generate a script first.")
     run_id = _start_task_run("repair")
     return _run_repair_task(run_id, stop_check=_processing_workflow_is_pause_requested)
 
@@ -4596,20 +4650,10 @@ def _derived_new_mode_completed_stages(options=None) -> list:
 
 
 def _derived_new_mode_completed_stages_from_files(options=None) -> list:
-    """Best-effort one-time migration source for missing marker state."""
+    """Derive completed new-mode stages from persisted DB-backed project state."""
     options = options or {}
     allowed = set(_new_mode_stage_sequence(options))
-    paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
-    chunks_path = CHUNKS_PATH
-    script_path = SCRIPT_PATH
-
-    pdata: dict = {}
-    if os.path.exists(paragraphs_path):
-        try:
-            with open(paragraphs_path, "r", encoding="utf-8") as f:
-                pdata = json.load(f)
-        except Exception:
-            pass
+    pdata = _load_project_paragraphs_document()
 
     completed = []
     if pdata.get("paragraphs"):
@@ -4618,7 +4662,7 @@ def _derived_new_mode_completed_stages_from_files(options=None) -> list:
         completed.append("assign_dialogue")
     if pdata.get("temperament_extraction_complete"):
         completed.append("extract_temperament")
-    if os.path.exists(script_path) and os.path.exists(chunks_path):
+    if _project_has_script_document() and bool(_load_project_chunks_snapshot()):
         completed.append("create_script")
 
     # process_voices: all voice entries in the runtime store have a ref_audio file
@@ -4641,17 +4685,12 @@ def _derived_new_mode_completed_stages_from_files(options=None) -> list:
 
 
 def _project_script_complete_detected() -> bool:
-    """Return True when a generated script project already exists on disk.
-
-    This is intentionally conservative: if annotated_script.json exists and the
-    script store already contains substantive chunk data, the Script tab workflow
-    should be treated as complete after restart instead of attempting to resume.
-    """
-    if not os.path.exists(SCRIPT_PATH):
+    """Return True when a generated script project already exists in SQLite."""
+    if not _project_has_script_document():
         return False
 
     try:
-        for chunk in _load_compat_chunks_snapshot():
+        for chunk in _load_project_chunks_snapshot():
             if not isinstance(chunk, dict):
                 continue
             has_text = bool(str(chunk.get("text") or "").strip())
@@ -4742,7 +4781,6 @@ def _run_new_mode_workflow_stage(stage_name: str):
         with new_mode_workflow_lock:
             _append_new_mode_workflow_log_locked(message)
 
-    paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
     config_path = os.path.join(BASE_DIR, "config.json")
 
     if stage_name == "process_voices":
@@ -4794,25 +4832,24 @@ def _run_new_mode_workflow_stage(stage_name: str):
             if not input_file or not os.path.exists(input_file):
                 raise RuntimeError("No input file found. Please upload a book first.")
             success = run_process(
-                [sys.executable, "-u", "-m", "scripts.process_paragraphs", input_file, paragraphs_path],
+                [sys.executable, "-u", "-m", "scripts.process_paragraphs", input_file, "--project-root", ROOT_DIR],
                 stage_name, run_id, relay_fn=relay,
             )
         elif stage_name == "assign_dialogue":
             success = run_process(
-                [sys.executable, "-u", "-m", "scripts.assign_dialogue", paragraphs_path, config_path],
+                [sys.executable, "-u", "-m", "scripts.assign_dialogue", "--project-root", ROOT_DIR, config_path],
                 stage_name, run_id, relay_fn=relay,
             )
         elif stage_name == "extract_temperament":
             success = run_process(
-                [sys.executable, "-u", "-m", "scripts.extract_temperament", paragraphs_path, config_path],
+                [sys.executable, "-u", "-m", "scripts.extract_temperament", "--project-root", ROOT_DIR, config_path],
                 stage_name, run_id, relay_fn=relay,
             )
         elif stage_name == "create_script":
-            script_path = SCRIPT_PATH
             script_max_length = _load_script_max_length()
             success = run_process(
                 [sys.executable, "-u", "-m", "scripts.create_script",
-                 paragraphs_path, script_path, CHUNKS_PATH,
+                 "--project-root", ROOT_DIR,
                  "--max-length", str(script_max_length)],
                 stage_name, run_id, relay_fn=relay,
             )

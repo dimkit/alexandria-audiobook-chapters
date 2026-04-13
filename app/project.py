@@ -33,7 +33,6 @@ from pydub.silence import detect_nonsilent
 from ffmpeg_utils import configure_pydub, get_ffmpeg_exe, get_ffprobe_exe
 from script_store import (
     apply_dictionary_to_text,
-    load_script_document,
 )
 from source_document import load_source_document, iter_document_paragraphs
 from script_provider import create_script_store
@@ -97,31 +96,27 @@ class ProjectManager(
         self.root_dir = root_dir
         using_default_layout = os.path.abspath(root_dir) == os.path.abspath(LAYOUT.project_dir)
         self._using_default_runtime_layout = using_default_layout
-        self.script_path = LAYOUT.script_path if using_default_layout else os.path.join(root_dir, "annotated_script.json")
-        self.chunks_path = LAYOUT.chunks_path if using_default_layout else os.path.join(root_dir, "chunks.json")
         self.chunks_db_path = LAYOUT.chunks_db_path if using_default_layout else os.path.join(root_dir, "chunks.sqlite3")
         self.chunks_queue_log_path = LAYOUT.chunks_queue_log_path if using_default_layout else os.path.join(root_dir, "chunks.queue.log")
         self.voice_audit_log_path = LAYOUT.voice_audit_log_path if using_default_layout else os.path.join(root_dir, "voice_state.audit.jsonl")
+        # Internal chunk persistence still routes through this marker path, but
+        # writes are intercepted and committed to SQLite instead of creating a
+        # project-side chunk file.
+        self.chunks_path = os.path.join(self.root_dir, ".chunk_store_state")
         self.backups_dir = LAYOUT.backups_dir if using_default_layout else os.path.join(root_dir, "backups")
         self.chunks_backups_dir = LAYOUT.chunk_backups_dir if using_default_layout else os.path.join(self.backups_dir, "chunks")
-        self.chunks_latest_backup_path = os.path.join(self.chunks_backups_dir, "chunks.latest.json")
-        self.chunks_best_backup_path = os.path.join(self.chunks_backups_dir, "chunks.most_audio.json")
         self.voicelines_dir = LAYOUT.voicelines_dir if using_default_layout else os.path.join(root_dir, "voicelines")
         self.exports_dir = LAYOUT.exports_dir if using_default_layout else root_dir
         self.audio_finalize_spool_dir = (
             os.path.join(LAYOUT.runs_dir, "audio-finalize", "spool")
             if using_default_layout else os.path.join(self.voicelines_dir, ".finalize_spool")
         )
-        self.voice_config_path = LAYOUT.voice_config_path if using_default_layout else os.path.join(root_dir, "voice_config.json")
         default_config_path = os.path.join(root_dir, "app", "config.json")
         self.config_path = config_path or (os.path.join(LAYOUT.app_dir, "config.json") if using_default_layout else default_config_path)
-        self.transcription_cache_path = LAYOUT.transcription_cache_path if using_default_layout else os.path.join(root_dir, "transcription_cache.json")
-        self.paragraphs_path = LAYOUT.paragraphs_path if using_default_layout else os.path.join(root_dir, "paragraphs.json")
 
         # Ensure voicelines dir exists
         os.makedirs(self.voicelines_dir, exist_ok=True)
         os.makedirs(self.audio_finalize_spool_dir, exist_ok=True)
-        os.makedirs(self.chunks_backups_dir, exist_ok=True)
 
         self.engine = None
         self.asr_engine = None
@@ -167,9 +162,6 @@ class ProjectManager(
             root_dir=self.root_dir,
             db_path=self.chunks_db_path,
             queue_log_path=self.chunks_queue_log_path,
-            script_path=self.script_path,
-            legacy_chunks_path=self.chunks_path,
-            voice_config_path=self.voice_config_path,
             state_path=os.path.join(self.root_dir, "state.json"),
             archive_dir=self.chunks_backups_dir,
             voice_audit_log_path=self.voice_audit_log_path,

@@ -200,6 +200,7 @@ EXPECTED_PROJECT_MANAGER_METHODS = {
     "load_script_document",
     "load_dictionary_entries",
     "_count_audio_linked_chunks",
+    "_load_chunk_backup_document",
     "_load_chunk_backup_audio_count",
     "_update_chunks_backups",
     "_atomic_json_write_raw",

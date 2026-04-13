@@ -13,7 +13,7 @@ class ScriptProviderTests(unittest.TestCase):
         os.makedirs(os.path.join(root, "voicelines"), exist_ok=True)
         return root
 
-    def test_bootstraps_store_from_legacy_chunks_json(self):
+    def test_does_not_bootstrap_store_from_legacy_chunks_json(self):
         root = self._make_root()
         chunks_path = os.path.join(root, "chunks.json")
         with open(chunks_path, "w", encoding="utf-8") as f:
@@ -26,14 +26,13 @@ class ScriptProviderTests(unittest.TestCase):
         manager = ProjectManager(root)
         try:
             chunks = manager.load_chunks()
-            self.assertEqual(len(chunks), 1)
-            self.assertEqual(chunks[0]["uid"], "chunk-1")
+            self.assertEqual(chunks, [])
             self.assertTrue(os.path.exists(manager.chunks_db_path))
-            self.assertFalse(os.path.exists(chunks_path))
+            self.assertTrue(os.path.exists(chunks_path))
         finally:
             manager.shutdown_script_store(flush=True)
 
-    def test_bootstraps_store_from_annotated_script_when_db_missing(self):
+    def test_does_not_bootstrap_store_from_annotated_script_when_db_missing(self):
         root = self._make_root()
         with open(os.path.join(root, "annotated_script.json"), "w", encoding="utf-8") as f:
             json.dump(
@@ -50,18 +49,14 @@ class ScriptProviderTests(unittest.TestCase):
         manager = ProjectManager(root)
         try:
             chunks = manager.load_chunks()
-            self.assertEqual(len(chunks), 1)
-            self.assertEqual(chunks[0]["speaker"], "Narrator")
-            self.assertEqual(chunks[0]["text"], "Hello world.")
+            self.assertEqual(chunks, [])
+            self.assertFalse(manager.script_store.has_script_entries())
             self.assertTrue(os.path.exists(manager.chunks_db_path))
         finally:
             manager.shutdown_script_store(flush=True)
 
     def test_exports_chunks_via_store(self):
         root = self._make_root()
-        with open(os.path.join(root, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({"entries": [], "dictionary": []}, f)
-
         manager = ProjectManager(root)
         try:
             manager.save_chunks(
@@ -89,9 +84,6 @@ class ScriptProviderTests(unittest.TestCase):
 
     def test_resolve_generation_targets_includes_error_rows_when_pending_only(self):
         root = self._make_root()
-        with open(os.path.join(root, "annotated_script.json"), "w", encoding="utf-8") as f:
-            json.dump({"entries": [], "dictionary": []}, f)
-
         manager = ProjectManager(root)
         try:
             manager.save_chunks(

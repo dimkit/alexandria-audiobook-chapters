@@ -1,5 +1,4 @@
 import copy
-import json
 import re
 
 
@@ -88,36 +87,6 @@ def normalize_script_document(data):
         }
 
     return {"entries": [], "dictionary": [], "sanity_cache": {"phrase_decisions": {}}}
-
-
-def load_script_document(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return normalize_script_document(json.load(f))
-
-
-def save_script_document(path, entries=None, dictionary=None, sanity_cache=None):
-    try:
-        current = load_script_document(path)
-    except FileNotFoundError:
-        current = {"entries": [], "dictionary": [], "sanity_cache": {"phrase_decisions": {}}}
-
-    resolved_sanity_cache = current.get("sanity_cache", {"phrase_decisions": {}})
-    if isinstance(sanity_cache, dict):
-        phrase_decisions = sanity_cache.get("phrase_decisions")
-        resolved_sanity_cache = {
-            "phrase_decisions": phrase_decisions if isinstance(phrase_decisions, dict) else {},
-        }
-
-    document = {
-        "entries": current["entries"] if entries is None else _normalize_script_entries(entries),
-        "dictionary": current["dictionary"] if dictionary is None else clean_dictionary_entries(dictionary),
-        "sanity_cache": resolved_sanity_cache,
-    }
-
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(document, f, indent=2, ensure_ascii=False)
-
-    return document
 
 
 def _match_case(alias, matched_text):
