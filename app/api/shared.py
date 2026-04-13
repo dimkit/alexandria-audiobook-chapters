@@ -1168,6 +1168,8 @@ def _new_audio_heartbeat_state():
         "interval_seconds": AUDIO_HEARTBEAT_INTERVAL_SECONDS,
         "last_check_at": None,
         "last_output_at": None,
+        "last_generation_activity_at": None,
+        "last_finalize_activity_at": None,
         "last_recovery_at": None,
         "recovery_count": 0,
         "last_recovery_reason": None,
@@ -1339,6 +1341,8 @@ def _format_audio_heartbeat_locked():
         "interval_seconds": heartbeat["interval_seconds"],
         "last_check_at": heartbeat["last_check_at"],
         "last_output_at": heartbeat["last_output_at"],
+        "last_generation_activity_at": heartbeat.get("last_generation_activity_at"),
+        "last_finalize_activity_at": heartbeat.get("last_finalize_activity_at"),
         "last_recovery_at": heartbeat["last_recovery_at"],
         "recovery_count": heartbeat["recovery_count"],
         "last_recovery_reason": heartbeat["last_recovery_reason"],
@@ -1377,6 +1381,21 @@ def _job_pending_uids(job):
     return [str(uid).strip() for uid in (job.get("pending_uids") or job.get("pending_indices") or []) if str(uid).strip()]
 
 
+def _job_generation_pending_uids(job):
+    if not job:
+        return []
+    raw = job.get("generation_pending_uids")
+    if raw is None:
+        raw = _job_pending_uids(job)
+    return [str(uid).strip() for uid in (raw or []) if str(uid).strip()]
+
+
+def _job_pending_finalize_uids(job):
+    if not job:
+        return []
+    return [str(uid).strip() for uid in (job.get("pending_finalize_uids") or []) if str(uid).strip()]
+
+
 def _job_word_counts(job):
     raw = job.get("word_counts_by_uid")
     if raw is None:
@@ -1396,6 +1415,8 @@ def _resolve_uid_ordinals(uids):
 def _serialize_audio_job(job):
     uids = _job_uids(job)
     pending_uids = _job_pending_uids(job)
+    generation_pending_uids = _job_generation_pending_uids(job)
+    pending_finalize_uids = _job_pending_finalize_uids(job)
     ordinals = _resolve_uid_ordinals(uids) if uids else {}
     return {
         "id": job["id"],
@@ -1408,18 +1429,27 @@ def _serialize_audio_job(job):
         "chapter": job.get("chapter"),
         "uids": uids,
         "pending_uids": pending_uids,
+        "generation_pending_uids": generation_pending_uids,
+        "pending_finalize_uids": pending_finalize_uids,
         "indices": [ordinals[uid] for uid in uids if uid in ordinals],
         "total_chunks": job["total_chunks"],
         "total_words": job.get("total_words", 0),
         "remaining_words": job.get("remaining_words", 0),
         "processed_clips": job.get("processed_clips", 0),
         "error_clips": job.get("error_clips", 0),
+        "generation_finished": bool(job.get("generation_finished", False)),
+        "finalized_clips": int(job.get("finalized_clips", 0) or 0),
+        "finalizer_failures": int(job.get("finalizer_failures", 0) or 0),
+        "retry_uids": [str(uid).strip() for uid in (job.get("retry_uids") or []) if str(uid).strip()],
         "pending_indices": [ordinals[uid] for uid in pending_uids if uid in ordinals],
         "recovery_count": job.get("recovery_count", 0),
         "queued_at": job.get("queued_at"),
         "started_at": job.get("started_at"),
         "finished_at": job.get("finished_at"),
         "last_output_at": job.get("last_output_at"),
+        "last_generation_activity_at": job.get("last_generation_activity_at"),
+        "last_finalize_activity_at": job.get("last_finalize_activity_at"),
+        "run_token": job.get("run_token"),
     }
 
 
@@ -2559,8 +2589,10 @@ def _hard_wipe_audio_runtime_locked(reason):
             indices=_job_uids(active_job),
             generation_token=active_job.get("run_token"),
         )
+        project_manager.clear_audio_finalize_tasks(generation_token=active_job.get("run_token"))
     else:
         reset_count = project_manager.reset_generating_chunks()
+        project_manager.clear_audio_finalize_tasks()
 
     _write_audio_cancel_tombstone_locked(reason, active_job)
 
@@ -2577,6 +2609,8 @@ def _hard_wipe_audio_runtime_locked(reason):
         _record_audio_recent_job_locked(active_job)
 
     _force_kill_active_audio_runner_locked()
+    if active_job is not None:
+        project_manager.unregister_audio_finalization_listener(active_job.get("run_token"))
 
     audio_current_job = None
     audio_current_runner_thread = None
@@ -2673,6 +2707,61 @@ def _record_audio_sample_locked(job, chunk_uid, elapsed_seconds, input_words, ou
     job["last_output_at"] = now
     process_state["audio"]["heartbeat"]["last_output_at"] = now
     _recompute_audio_metrics_locked()
+
+
+def _mark_audio_generation_activity_locked(job, when=None):
+    now = when or time.time()
+    job["last_generation_activity_at"] = now
+    process_state["audio"]["heartbeat"]["last_generation_activity_at"] = now
+
+
+def _mark_audio_finalize_activity_locked(job, when=None):
+    now = when or time.time()
+    job["last_finalize_activity_at"] = now
+    process_state["audio"]["heartbeat"]["last_finalize_activity_at"] = now
+
+
+def _record_audio_finalize_submission_locked(job, chunk_uid):
+    normalized_uid = str(chunk_uid or "").strip()
+    if not normalized_uid:
+        return
+    generation_pending = _job_generation_pending_uids(job)
+    if normalized_uid in generation_pending:
+        generation_pending.remove(normalized_uid)
+    job["generation_pending_uids"] = generation_pending
+
+    pending_finalize = _job_pending_finalize_uids(job)
+    if normalized_uid not in pending_finalize:
+        pending_finalize.append(normalized_uid)
+    job["pending_finalize_uids"] = pending_finalize
+    _mark_audio_generation_activity_locked(job)
+
+
+def _record_audio_finalize_result_locked(job, chunk_uid, success, meta=None):
+    meta = dict(meta or {})
+    normalized_uid = str(chunk_uid or "").strip()
+    pending_finalize = _job_pending_finalize_uids(job)
+    if normalized_uid in pending_finalize:
+        pending_finalize.remove(normalized_uid)
+    job["pending_finalize_uids"] = pending_finalize
+    job["finalized_clips"] = int(job.get("finalized_clips", 0) or 0) + 1
+    if not success:
+        job["finalizer_failures"] = int(job.get("finalizer_failures", 0) or 0) + 1
+        if meta.get("retry_requested"):
+            retry_uids = [str(uid).strip() for uid in (job.get("retry_uids") or []) if str(uid).strip()]
+            if normalized_uid and normalized_uid not in retry_uids:
+                retry_uids.append(normalized_uid)
+            job["retry_uids"] = retry_uids
+    _mark_audio_finalize_activity_locked(job)
+
+
+def _audio_job_ready_to_finish_locked(job):
+    return bool(
+        job
+        and job.get("generation_finished")
+        and not _job_generation_pending_uids(job)
+        and not _job_pending_finalize_uids(job)
+    )
 
 
 def _restore_job_progress_from_chunks(raw_job, chunks=None):
@@ -2868,12 +2957,18 @@ def _enqueue_audio_job(kind, indices, label=None, scope=None, scope_mode=None, c
             "kind": kind,
             "uids": valid_uids,
             "pending_uids": list(valid_uids),
+            "generation_pending_uids": list(valid_uids),
+            "pending_finalize_uids": [],
             "word_counts_by_uid": word_counts,
             "total_chunks": len(valid_uids),
             "total_words": sum(word_counts.values()),
             "remaining_words": sum(word_counts.values()),
             "processed_clips": 0,
             "error_clips": 0,
+            "generation_finished": False,
+            "finalized_clips": 0,
+            "finalizer_failures": 0,
+            "retry_uids": [],
             "recovery_count": 0,
             "label": label or f"Audio Job {audio_job_counter}",
             "scope": scope or "custom",
@@ -2884,6 +2979,8 @@ def _enqueue_audio_job(kind, indices, label=None, scope=None, scope_mode=None, c
             "started_at": None,
             "finished_at": None,
             "last_output_at": None,
+            "last_generation_activity_at": None,
+            "last_finalize_activity_at": None,
             "run_token": None,
         }
         audio_queue.append(job)
@@ -2922,12 +3019,18 @@ def _clone_audio_job_for_retry(job, pending_uids, reason):
         "kind": job["kind"],
         "uids": list(pending_uids),
         "pending_uids": list(pending_uids),
+        "generation_pending_uids": list(pending_uids),
+        "pending_finalize_uids": [],
         "word_counts_by_uid": word_counts,
         "total_chunks": len(pending_uids),
         "total_words": sum(word_counts.values()),
         "remaining_words": sum(word_counts.values()),
         "processed_clips": 0,
         "error_clips": 0,
+        "generation_finished": False,
+        "finalized_clips": 0,
+        "finalizer_failures": 0,
+        "retry_uids": [],
         "recovery_count": retry_count,
         "label": f"{job['label']} (resume {retry_count})",
         "scope": job["scope"],
@@ -2938,10 +3041,29 @@ def _clone_audio_job_for_retry(job, pending_uids, reason):
         "started_at": None,
         "finished_at": None,
         "last_output_at": None,
+        "last_generation_activity_at": None,
+        "last_finalize_activity_at": None,
         "run_token": None,
         "resume_of": job["id"],
         "resume_reason": reason,
     }
+
+
+def _queue_follow_on_retry_job_locked(job):
+    retry_uids = [uid for uid in (job.get("retry_uids") or []) if uid in _job_word_counts(job)]
+    if not retry_uids:
+        return None
+    retry_job = _clone_audio_job_for_retry(job, retry_uids, "finalizer invalid clip retry")
+    if retry_job is None:
+        return None
+    retry_job["label"] = f"{job['label']} (invalid clip retry)"
+    retry_job["scope"] = "custom"
+    retry_job["resume_of"] = job["id"]
+    audio_queue.append(retry_job)
+    _append_audio_log_locked(
+        f"[QUEUE] Follow-on retry job #{retry_job['id']} ({retry_job['corr_id']}) queued for {len(retry_uids)} invalid clip(s)"
+    )
+    return retry_job
 
 
 def _restore_audio_queue_state():
@@ -3010,6 +3132,8 @@ def _restore_audio_queue_state():
         saved_heartbeat = payload.get("heartbeat") or {}
         process_state["audio"]["heartbeat"]["last_check_at"] = saved_heartbeat.get("last_check_at")
         process_state["audio"]["heartbeat"]["last_output_at"] = saved_heartbeat.get("last_output_at")
+        process_state["audio"]["heartbeat"]["last_generation_activity_at"] = saved_heartbeat.get("last_generation_activity_at")
+        process_state["audio"]["heartbeat"]["last_finalize_activity_at"] = saved_heartbeat.get("last_finalize_activity_at")
         process_state["audio"]["heartbeat"]["last_recovery_at"] = saved_heartbeat.get("last_recovery_at")
         process_state["audio"]["heartbeat"]["recovery_count"] = int(saved_heartbeat.get("recovery_count", 0) or 0)
         process_state["audio"]["heartbeat"]["last_recovery_reason"] = saved_heartbeat.get("last_recovery_reason")
@@ -3025,12 +3149,27 @@ def _restore_audio_queue_state():
                 "kind": raw_job.get("kind", "parallel"),
                 "uids": progress["uids"],
                 "pending_uids": progress["pending_uids"],
+                "generation_pending_uids": [
+                    uid for uid in (_job_generation_pending_uids(raw_job) or progress["pending_uids"])
+                    if uid in progress["pending_uids"]
+                ] if not raw_job.get("generation_finished") else [],
+                "pending_finalize_uids": [
+                    uid for uid in (_job_pending_finalize_uids(raw_job) or [])
+                    if uid in progress["pending_uids"]
+                ] if raw_job.get("generation_finished") else [
+                    uid for uid in (_job_pending_finalize_uids(raw_job) or [])
+                    if uid in progress["pending_uids"]
+                ],
                 "word_counts_by_uid": progress["word_counts_by_uid"],
                 "total_chunks": progress["total_chunks"],
                 "total_words": progress["total_words"],
                 "remaining_words": progress["remaining_words"],
                 "processed_clips": progress["processed_clips"],
                 "error_clips": progress["error_clips"],
+                "generation_finished": bool(raw_job.get("generation_finished", False)),
+                "finalized_clips": int(raw_job.get("finalized_clips", 0) or progress["processed_clips"]),
+                "finalizer_failures": int(raw_job.get("finalizer_failures", 0) or 0),
+                "retry_uids": [uid for uid in (raw_job.get("retry_uids") or []) if uid in progress["pending_uids"]],
                 "recovery_count": int(raw_job.get("recovery_count", 0) or 0),
                 "label": raw_job.get("label", "Recovered audio job"),
                 "scope": raw_job.get("scope", "custom"),
@@ -3041,7 +3180,9 @@ def _restore_audio_queue_state():
                 "started_at": None,
                 "finished_at": None,
                 "last_output_at": None,
-                "run_token": None,
+                "last_generation_activity_at": raw_job.get("last_generation_activity_at"),
+                "last_finalize_activity_at": raw_job.get("last_finalize_activity_at"),
+                "run_token": raw_job.get("run_token"),
             })
 
         raw_current = payload.get("current_job")
@@ -3055,12 +3196,24 @@ def _restore_audio_queue_state():
                     "kind": raw_current.get("kind", "parallel"),
                     "uids": progress["uids"],
                     "pending_uids": progress["pending_uids"],
+                    "generation_pending_uids": [
+                        uid for uid in (_job_generation_pending_uids(raw_current) or progress["pending_uids"])
+                        if uid in progress["pending_uids"]
+                    ] if not raw_current.get("generation_finished") else [],
+                    "pending_finalize_uids": [
+                        uid for uid in (_job_pending_finalize_uids(raw_current) or [])
+                        if uid in progress["pending_uids"]
+                    ],
                     "word_counts_by_uid": progress["word_counts_by_uid"],
                     "total_chunks": progress["total_chunks"],
                     "total_words": progress["total_words"],
                     "remaining_words": progress["remaining_words"],
                     "processed_clips": progress["processed_clips"],
                     "error_clips": progress["error_clips"],
+                    "generation_finished": bool(raw_current.get("generation_finished", False)),
+                    "finalized_clips": int(raw_current.get("finalized_clips", 0) or progress["processed_clips"]),
+                    "finalizer_failures": int(raw_current.get("finalizer_failures", 0) or 0),
+                    "retry_uids": [uid for uid in (raw_current.get("retry_uids") or []) if uid in progress["pending_uids"]],
                     "recovery_count": int(raw_current.get("recovery_count", 0) or 0) + 1,
                     "label": f"{raw_current.get('label', 'Recovered audio job')} (resumed after restart)",
                     "scope": raw_current.get("scope", "custom"),
@@ -3071,7 +3224,9 @@ def _restore_audio_queue_state():
                     "started_at": None,
                     "finished_at": None,
                     "last_output_at": None,
-                    "run_token": None,
+                    "last_generation_activity_at": raw_current.get("last_generation_activity_at"),
+                    "last_finalize_activity_at": raw_current.get("last_finalize_activity_at"),
+                    "run_token": raw_current.get("run_token"),
                 }
                 restored_jobs.insert(0, resumed_job)
                 _append_audio_log_locked(
@@ -3113,6 +3268,8 @@ def _perform_audio_recovery_locked(job, run_token, reason):
 
     pending_uids = list(_job_pending_uids(job))
     project_manager.reset_generating_chunks(indices=_job_uids(job), generation_token=run_token)
+    project_manager.clear_audio_finalize_tasks(generation_token=run_token)
+    project_manager.unregister_audio_finalization_listener(run_token)
 
     job["status"] = "stalled"
     job["finished_at"] = time.time()
@@ -3159,6 +3316,8 @@ def _abandon_audio_job_locked(job, run_token, reason, *, status="cancelled"):
         indices=_job_uids(job),
         generation_token=run_token,
     )
+    project_manager.clear_audio_finalize_tasks(generation_token=run_token)
+    project_manager.unregister_audio_finalization_listener(run_token)
     job["status"] = status
     job["finished_at"] = time.time()
     _record_audio_recent_job_locked(job)
@@ -3179,7 +3338,7 @@ def _abandon_audio_job_locked(job, run_token, reason, *, status="cancelled"):
 
 def _audio_job_runner(job, settings, run_token, result_holder, done_event):
     job_prefix = f"[JOB {job['id']}|{job.get('corr_id', 'no-cid')}]"
-    execution_uids = list(_job_pending_uids(job) or _job_uids(job))
+    execution_uids = list(_job_generation_pending_uids(job) or _job_uids(job))
 
     def is_active():
         with audio_queue_lock:
@@ -3190,16 +3349,52 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
             )
 
     def progress_callback(completed, failed, total):
-        if is_active():
-            _append_audio_log(
-                f"{job_prefix} Progress: {completed + failed}/{total} ({completed} done, {failed} failed)"
+        with audio_queue_lock:
+            if not is_active():
+                return
+            _mark_audio_generation_activity_locked(job)
+            _append_audio_log_locked(
+                f"{job_prefix} Progress: {completed + failed}/{total} ({completed} submitted, {failed} failed)"
             )
+            _refresh_audio_process_state_locked(persist=True)
 
     def item_callback(uid, success, elapsed_seconds, input_words, output_words):
         with audio_queue_lock:
             if not is_active():
                 return
+            generation_pending = _job_generation_pending_uids(job)
+            if uid in generation_pending:
+                generation_pending.remove(uid)
+            job["generation_pending_uids"] = generation_pending
+            _mark_audio_generation_activity_locked(job)
             _record_audio_sample_locked(job, uid, elapsed_seconds, input_words, output_words, success)
+            _refresh_audio_process_state_locked(persist=True)
+
+    def submission_callback(uid, task):
+        with audio_queue_lock:
+            if not is_active():
+                return
+            _record_audio_finalize_submission_locked(job, uid)
+            _refresh_audio_process_state_locked(persist=True)
+            audio_queue_condition.notify_all()
+
+    def finalization_item_callback(uid, success, elapsed_seconds, input_words, output_words, meta):
+        with audio_queue_lock:
+            if not is_active():
+                return
+            _record_audio_finalize_result_locked(job, uid, success, meta)
+            _record_audio_sample_locked(job, uid, elapsed_seconds, input_words, output_words, success)
+            _refresh_audio_process_state_locked(persist=True)
+            audio_queue_condition.notify_all()
+
+    def activity_callback(kind, uid):
+        with audio_queue_lock:
+            if not is_active():
+                return
+            if kind == "finalizer_started":
+                _mark_audio_finalize_activity_locked(job)
+            else:
+                _mark_audio_generation_activity_locked(job)
             _refresh_audio_process_state_locked(persist=True)
 
     def cancel_check():
@@ -3209,6 +3404,12 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
             return process_state["audio"]["cancel"] or audio_cancel_event.is_set()
 
     try:
+        project_manager.register_audio_finalization_listener(
+            run_token,
+            submission_callback=submission_callback,
+            item_callback=finalization_item_callback,
+            activity_callback=activity_callback,
+        )
         if job["kind"] == "parallel":
             result_holder["results"] = project_manager.generate_chunks_parallel(
                 execution_uids,
@@ -3248,9 +3449,10 @@ def _prepare_job_indices_for_execution_locked(job, settings):
     if reordered == _job_uids(job):
         return
 
-    pending_lookup = set(_job_pending_uids(job))
+    pending_lookup = set(_job_generation_pending_uids(job))
     job["uids"] = reordered
-    job["pending_uids"] = [uid for uid in reordered if uid in pending_lookup]
+    job["pending_uids"] = [uid for uid in reordered if uid in pending_lookup or uid in set(_job_pending_finalize_uids(job))]
+    job["generation_pending_uids"] = [uid for uid in reordered if uid in pending_lookup]
     _append_audio_log_locked(
         f"[JOB {job['id']}] Reordered external job by speaker for clone/cache locality"
     )
@@ -3262,6 +3464,8 @@ def _audio_queue_worker():
     while True:
         with audio_queue_condition:
             while not audio_queue:
+                if audio_current_job is not None:
+                    project_manager.unregister_audio_finalization_listener(audio_current_job.get("run_token"))
                 audio_current_job = None
                 audio_current_runner_thread = None
                 audio_current_runner_token = None
@@ -3275,7 +3479,15 @@ def _audio_queue_worker():
             audio_current_job = job
             job["status"] = "running"
             job["started_at"] = time.time()
-            job["run_token"] = uuid.uuid4().hex
+            job["run_token"] = job.get("run_token") or uuid.uuid4().hex
+            job.setdefault("generation_pending_uids", list(_job_pending_uids(job)))
+            job.setdefault("pending_finalize_uids", [])
+            job.setdefault("generation_finished", False)
+            job.setdefault("finalized_clips", 0)
+            job.setdefault("finalizer_failures", 0)
+            job.setdefault("retry_uids", [])
+            job["last_generation_activity_at"] = time.time()
+            job["last_finalize_activity_at"] = None
             process_state["audio"]["cancel"] = False
             audio_cancel_event.clear()
             audio_recovery_request = None
@@ -3326,34 +3538,72 @@ def _audio_queue_worker():
         with audio_queue_condition:
             if audio_current_job is None or audio_current_job["id"] != job["id"] or audio_current_job.get("run_token") != job.get("run_token"):
                 continue
+            job["generation_finished"] = True
+            if "error" in result_holder:
+                job["generation_pending_uids"] = []
+            _mark_audio_generation_activity_locked(job)
+            _refresh_audio_process_state_locked(persist=True)
 
+        while True:
+            with audio_queue_condition:
+                if audio_current_job is None or audio_current_job["id"] != job["id"] or audio_current_job.get("run_token") != job.get("run_token"):
+                    abandoned = True
+                    break
+                if _audio_job_ready_to_finish_locked(job):
+                    break
+                if (
+                    audio_recovery_request is not None
+                    and audio_recovery_request.get("job_id") == job["id"]
+                    and audio_recovery_request.get("run_token") == job.get("run_token")
+                ):
+                    abandoned = _perform_audio_recovery_locked(job, job.get("run_token"), audio_recovery_request["reason"])
+                    break
+                audio_queue_condition.wait(timeout=AUDIO_RECOVERY_POLL_SECONDS)
+
+        if abandoned:
+            project_manager.unregister_audio_finalization_listener(job.get("run_token"))
+            continue
+
+        with audio_queue_condition:
+            if audio_current_job is None or audio_current_job["id"] != job["id"] or audio_current_job.get("run_token") != job.get("run_token"):
+                project_manager.unregister_audio_finalization_listener(job.get("run_token"))
+                continue
+
+            results = result_holder.get("results", {"completed": [], "failed": [], "cancelled": 0})
+            cancelled = results.get("cancelled", 0)
             if "error" in result_holder:
                 logger.error(f"Audio queue job error: {result_holder['error']}")
-                job["status"] = "failed"
                 _append_audio_log_locked(f"{job_prefix} Batch generation error: {result_holder['error']}")
+                for uid in list(_job_generation_pending_uids(job)):
+                    word_count = _job_word_counts(job).get(uid, 0)
+                    _record_audio_sample_locked(job, uid, 0.0, word_count, 0, False)
+                job["generation_pending_uids"] = []
+                if not job.get("retry_uids"):
+                    job["retry_uids"] = []
+                job["status"] = "completed_with_errors"
+            elif cancelled:
+                job["status"] = "cancelled"
+            elif int(job.get("error_clips", 0) or 0) > 0 or int(job.get("finalizer_failures", 0) or 0) > 0:
+                job["status"] = "completed_with_errors"
             else:
-                results = result_holder.get("results", {"completed": [], "failed": [], "cancelled": 0})
-                completed = len(results["completed"])
-                failed = len(results["failed"])
-                cancelled = results.get("cancelled", 0)
+                job["status"] = "completed"
 
-                if cancelled:
-                    job["status"] = "cancelled"
-                elif failed:
-                    job["status"] = "completed_with_errors"
-                else:
-                    job["status"] = "completed"
-
-                msg = f"{job_prefix} Complete: {completed} succeeded, {failed} failed"
-                if cancelled:
-                    msg += f", {cancelled} cancelled"
-                _append_audio_log_locked(msg)
-                if results["failed"]:
-                    for idx, err in results["failed"]:
-                        _append_audio_log_locked(f"{job_prefix} Chunk {idx} failed: {err}")
+            msg = (
+                f"{job_prefix} Complete: {int(job.get('processed_clips', 0) or 0) - int(job.get('error_clips', 0) or 0)} succeeded, "
+                f"{int(job.get('error_clips', 0) or 0)} failed"
+            )
+            if cancelled:
+                msg += f", {cancelled} cancelled"
+            _append_audio_log_locked(msg)
+            if results["failed"]:
+                for idx, err in results["failed"]:
+                    _append_audio_log_locked(f"{job_prefix} Chunk {idx} failed: {err}")
+            if job["status"] != "cancelled":
+                _queue_follow_on_retry_job_locked(job)
 
             job["finished_at"] = time.time()
             _record_audio_recent_job_locked(job)
+            project_manager.unregister_audio_finalization_listener(job.get("run_token"))
             audio_current_job = None
             audio_current_runner_thread = None
             audio_current_runner_token = None
@@ -3378,7 +3628,16 @@ def _audio_heartbeat_daemon():
             if current is None:
                 _refresh_audio_process_state_locked(persist=True)
                 continue
-            last_activity_at = current.get("last_output_at") or current.get("started_at")
+            last_activity_at = max(
+                value
+                for value in [
+                    current.get("last_output_at"),
+                    current.get("last_generation_activity_at"),
+                    current.get("last_finalize_activity_at"),
+                    current.get("started_at"),
+                ]
+                if value is not None
+            )
             if last_activity_at is None:
                 _refresh_audio_process_state_locked(persist=True)
                 continue

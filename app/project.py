@@ -104,6 +104,7 @@ class ProjectManager(
         self.chunks_latest_backup_path = os.path.join(self.chunks_backups_dir, "chunks.latest.json")
         self.chunks_best_backup_path = os.path.join(self.chunks_backups_dir, "chunks.most_audio.json")
         self.voicelines_dir = os.path.join(root_dir, "voicelines")
+        self.audio_finalize_spool_dir = os.path.join(self.voicelines_dir, ".finalize_spool")
         self.voice_config_path = os.path.join(root_dir, "voice_config.json")
         self.config_path = os.path.join(root_dir, "app", "config.json")
         self.transcription_cache_path = os.path.join(root_dir, "transcription_cache.json")
@@ -111,6 +112,7 @@ class ProjectManager(
 
         # Ensure voicelines dir exists
         os.makedirs(self.voicelines_dir, exist_ok=True)
+        os.makedirs(self.audio_finalize_spool_dir, exist_ok=True)
         os.makedirs(self.chunks_backups_dir, exist_ok=True)
 
         self.engine = None
@@ -127,11 +129,12 @@ class ProjectManager(
         self._transcription_cache = None
         self.voice_audit_logging_enabled = VOICE_AUDIT_LOG_ENABLED_DEFAULT
         runtime_settings = self._load_chunk_runtime_settings()
-        self._postprocess_workers = runtime_settings["saveback_workers"]
+        self._finalizer_workers = runtime_settings["finalizer_workers"]
         self._chunk_state_flush_interval_s = runtime_settings["chunk_state_flush_ms"] / 1000.0
         self._chunk_state_flush_batch_size = runtime_settings["chunk_state_flush_batch_size"]
-        self._postprocess_queue: queue.Queue = queue.Queue(maxsize=self._postprocess_workers * 2)
-        self._postprocess_threads = []
+        self._audio_finalize_listener_lock = threading.Lock()
+        self._audio_finalize_listeners = {}
+        self._audio_finalize_threads = []
         self.script_store = None
         self._init_script_store()
         self._chunks_flush_thread = threading.Thread(
@@ -140,14 +143,14 @@ class ProjectManager(
             name=f"chunk-flush-{os.path.basename(self.root_dir)}",
         )
         self._chunks_flush_thread.start()
-        for worker_index in range(self._postprocess_workers):
+        for worker_index in range(self._finalizer_workers):
             thread = threading.Thread(
-                target=self._postprocess_worker_loop,
+                target=self._audio_finalize_worker_loop,
                 daemon=True,
-                name=f"postprocess-{os.path.basename(self.root_dir)}-{worker_index + 1}",
+                name=f"audio-finalizer-{os.path.basename(self.root_dir)}-{worker_index + 1}",
             )
             thread.start()
-            self._postprocess_threads.append(thread)
+            self._audio_finalize_threads.append(thread)
         atexit.register(self.flush_dirty_chunks, True)
         atexit.register(self.shutdown_script_store)
 

@@ -217,7 +217,7 @@ class ProjectGenerationMixin:
                 "proofread_cleared": True,
             }
 
-        def generate_chunk_audio(self, index, attempt=0, generation_token=None):
+        def _generate_chunk_audio_internal(self, index, attempt=0, generation_token=None, async_finalize=False):
             chunk = self.get_chunk_raw(index)
             if chunk is None:
                 return False, "Invalid chunk index"
@@ -258,8 +258,7 @@ class ProjectGenerationMixin:
                     f"instruct='{instruct}', text='{transformed_text[:50]}...'"
                 )
 
-                # Generate to temp file (unique per chunk for parallel processing)
-                temp_path = os.path.join(self.root_dir, f"temp_chunk_{sanitize_filename(chunk_uid) or display_index}.wav")
+                temp_path = self._spool_audio_full_path(chunk_uid, generation_token, attempt=attempt)
 
                 success = engine.generate_voice(transformed_text, instruct, resolved_speaker, voice_config, temp_path)
 
@@ -268,31 +267,47 @@ class ProjectGenerationMixin:
                     return False, "Generation abandoned"
 
                 if success:
-                    fut = self._enqueue_postprocess(
-                        index=display_index,
-                        speaker=speaker,
-                        text=transformed_text,
-                        temp_path=temp_path,
+                    if async_finalize:
+                        task = self._enqueue_audio_finalize_task(
+                            chunk_uid,
+                            generation_token,
+                            temp_path,
+                            attempt=attempt,
+                            speaker=speaker,
+                            text=transformed_text,
+                        )
+                        if task is None:
+                            return False, "Generation abandoned"
+                        return True, "finalization queued"
+
+                    result = self._finalize_generated_audio(
+                        display_index,
+                        speaker,
+                        transformed_text,
+                        temp_path,
                         attempt=attempt,
                         chunk_uid=chunk_uid,
-                        generation_token=generation_token,
                     )
-                    # Block this TTS thread until saveback completes; other TTS
-                    # threads in the executor can run their GPU work concurrently.
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        return False, str(e)
-
-                    if result["status"] == "cancelled":
+                    updated_chunk = self._update_chunk_fields_if_token(
+                        chunk_uid,
+                        generation_token,
+                        audio_path=result["audio_path"],
+                        audio_validation=result["audio_validation"],
+                        status=result["status"],
+                        auto_regen_count=attempt,
+                        generation_token=None,
+                    )
+                    self._cleanup_temp_file(temp_path)
+                    if updated_chunk is None:
                         return False, "Generation abandoned"
-
                     if result["status"] == "error" and auto_regen_retry_attempts > 0 and attempt < auto_regen_retry_attempts:
-                        # Saveback wrote status="error"; _claim_chunk_generation in
-                        # the recursive call will re-claim it to "generating".
                         print(f"Chunk {display_index} failed sanity check; auto-regenerating attempt {attempt + 1}/{auto_regen_retry_attempts}")
-                        return self.generate_chunk_audio(chunk_uid, attempt=attempt + 1, generation_token=generation_token)
-
+                        return self._generate_chunk_audio_internal(
+                            chunk_uid,
+                            attempt=attempt + 1,
+                            generation_token=generation_token,
+                            async_finalize=False,
+                        )
                     if generation_token is None:
                         self.flush_dirty_chunks(force=True)
                     return result["status"] == "done", result["audio_path"] if result["status"] == "done" else result["error"]
@@ -322,10 +337,18 @@ class ProjectGenerationMixin:
                     )
                 except Exception as update_err:
                     print(f"Warning: Failed to update chunk {display_index} status to error: {update_err}")
-                self._cleanup_temp_file(os.path.join(self.root_dir, f"temp_chunk_{sanitize_filename(chunk_uid) or display_index}.wav"))
+                self._cleanup_temp_file(self._spool_audio_full_path(chunk_uid, generation_token, attempt=attempt))
                 if generation_token is None:
                     self.flush_dirty_chunks(force=True)
                 return False, str(e)
+
+        def generate_chunk_audio(self, index, attempt=0, generation_token=None):
+            return self._generate_chunk_audio_internal(
+                index,
+                attempt=attempt,
+                generation_token=generation_token,
+                async_finalize=False,
+            )
 
         def generate_chunks_parallel(self, indices, max_workers=2, progress_callback=None,
                                       cancel_check=None, item_callback=None, generation_token=None):
@@ -368,7 +391,14 @@ class ProjectGenerationMixin:
             def _timed_generate(uid):
                 start = time.time()
                 try:
-                    success, msg = self.generate_chunk_audio(uid, generation_token=generation_token)
+                    chunk = self.get_chunk_raw(uid)
+                    attempt = int((chunk or {}).get("auto_regen_count") or 0)
+                    success, msg = self._generate_chunk_audio_internal(
+                        uid,
+                        attempt=attempt,
+                        generation_token=generation_token,
+                        async_finalize=True,
+                    )
                     return success, msg, time.time() - start
                 except Exception as e:
                     return False, str(e), time.time() - start
@@ -391,9 +421,7 @@ class ProjectGenerationMixin:
                     success, msg, elapsed_seconds = future.result()
                     if success:
                         results["completed"].append(uid)
-                        print(f"Chunk {uid} completed: {msg}")
-                        if item_callback:
-                            item_callback(uid, True, elapsed_seconds, word_counts.get(uid, 0), word_counts.get(uid, 0))
+                        print(f"Chunk {uid} submitted for finalization: {msg}")
                     else:
                         results["failed"].append((uid, msg))
                         print(f"Chunk {uid} failed: {msg}")
@@ -582,8 +610,6 @@ class ProjectGenerationMixin:
             }
             voice_config = self.prepare_runtime_voice_config(voice_config, resolved_speakers)
             dictionary_entries = self.load_dictionary_entries()
-            auto_regen_retry_attempts = self._get_auto_regen_retry_attempts()
-
             # Get TTS engine
             engine = self.get_engine()
             if not engine:
@@ -600,6 +626,7 @@ class ProjectGenerationMixin:
                 target_uids = self._group_indices_by_voice_type(target_uids, target_chunks, voice_config)
 
             # Split indices into batches
+            spool_run_token = generation_token or uuid.uuid4().hex
             batches = [target_uids[i:i + batch_size] for i in range(0, len(target_uids), batch_size)]
             print(f"Processing {len(batches)} batches...")
 
@@ -637,15 +664,46 @@ class ProjectGenerationMixin:
 
                 # Call batch TTS with single seed
                 batch_start = time.time()
+                batch_output_dir = os.path.join(
+                    self.audio_finalize_spool_dir,
+                    sanitize_filename(spool_run_token) or "manual",
+                    f"batch_{batch_num + 1:04d}",
+                )
+                os.makedirs(batch_output_dir, exist_ok=True)
                 batch_results = engine.generate_batch(
                     batch_chunks,
                     voice_config,
-                    self.root_dir,
+                    batch_output_dir,
                     batch_seed,
                     cancel_check=cancel_check,
                 )
 
-                # Process completed chunks - convert to MP3 and update status
+                # Some backends have been observed to materialize temp audio
+                # files without reporting those chunk ids in the batch result.
+                # Reconcile against the temp artifacts here so saveback and job
+                # progress follow the actual generated outputs.
+                reported_completed = list(batch_results.get("completed") or [])
+                reported_failed = list(batch_results.get("failed") or [])
+                reported_terminal = set(reported_completed)
+                reported_terminal.update(uid for uid, _ in reported_failed)
+                for uid in batch_uids:
+                    if uid in reported_terminal:
+                        continue
+                    temp_path = os.path.join(batch_output_dir, f"temp_batch_{uid}.wav")
+                    if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                        print(
+                            f"Batch backend did not report completion for chunk {uid}; "
+                            "recovering from temp audio artifact"
+                        )
+                        reported_completed.append(uid)
+                    else:
+                        reported_failed.append((uid, "Batch backend returned no result for requested chunk"))
+                batch_results = {
+                    "completed": reported_completed,
+                    "failed": reported_failed,
+                }
+
+                # Process completed chunks - queue async finalization for each output
                 live_rows = {chunk.get("uid"): chunk for chunk in self._load_generation_chunks(batch_uids)}
                 if cancel_check and cancel_check():
                     cancelled = True
@@ -653,11 +711,10 @@ class ProjectGenerationMixin:
                 processed_in_batch = len(batch_results["completed"]) + len(batch_results["failed"])
                 shared_elapsed = (time.time() - batch_start) / processed_in_batch if processed_in_batch > 0 else 0.0
 
-                postprocess_futures = {}
                 for uid in batch_results["completed"]:
                     if cancel_check and cancel_check():
                         cancelled = True
-                        temp_path = os.path.join(self.root_dir, f"temp_batch_{uid}.wav")
+                        temp_path = os.path.join(batch_output_dir, f"temp_batch_{uid}.wav")
                         self._cleanup_temp_file(temp_path)
                         continue
                     chunk = live_rows.get(uid) or self.get_chunk_raw(uid)
@@ -666,7 +723,7 @@ class ProjectGenerationMixin:
                         results["failed"].append((uid, "Chunk missing after reload"))
                         continue
 
-                    temp_path = os.path.join(self.root_dir, f"temp_batch_{uid}.wav")
+                    temp_path = os.path.join(batch_output_dir, f"temp_batch_{uid}.wav")
 
                     if not os.path.exists(temp_path):
                         results["failed"].append((uid, "Temp audio file not found"))
@@ -684,70 +741,22 @@ class ProjectGenerationMixin:
                             self._cleanup_temp_file(temp_path)
                             continue
                         speaker = chunk.get("speaker", "unknown")
-                        will_retry_on_error = auto_regen_retry_attempts > 0
-
-                        fut = self._enqueue_postprocess(
-                            index=int(chunk.get("id") or 0),
+                        attempt = int(chunk.get("auto_regen_count") or 0)
+                        task = self._enqueue_audio_finalize_task(
+                            chunk.get("uid"),
+                            generation_token,
+                            temp_path,
+                            attempt=attempt,
                             speaker=speaker,
                             text=transformed_texts.get(uid, chunk.get("text", "")),
-                            temp_path=temp_path,
-                            attempt=0,
-                            chunk_uid=chunk.get("uid"),
-                            generation_token=generation_token,
-                            error_status_override="pending" if will_retry_on_error else None,
-                            keep_token=will_retry_on_error,
                         )
-                        postprocess_futures[fut] = (uid, will_retry_on_error)
-                    except Exception as e:
-                        print(f"Error queueing postprocess for chunk {uid}: {e}")
-                        results["failed"].append((uid, str(e)))
-                        self._update_chunk_fields_if_token(
-                            uid,
-                            generation_token,
-                            status="error",
-                            audio_validation=None,
-                            generation_token=None,
-                        )
-                        self._cleanup_temp_file(temp_path)
-                        if item_callback:
-                            item_callback(uid, False, shared_elapsed, word_counts.get(uid, 0), 0)
-
-                for fut in concurrent.futures.as_completed(list(postprocess_futures)):
-                    uid, will_retry_on_error = postprocess_futures[fut]
-                    try:
-                        result = fut.result()
-                        if result["status"] == "cancelled":
+                        if task is None:
+                            results["failed"].append((uid, "Generation abandoned"))
                             continue
-
-                        live_chunk = self.get_chunk_view(uid)
-
-                        if result["status"] == "done":
-                            results["completed"].append(uid)
-                            print(f"Chunk {uid} completed: {(live_chunk or {}).get('audio_path')}")
-                            if item_callback:
-                                item_callback(uid, True, shared_elapsed, word_counts.get(uid, 0), word_counts.get(uid, 0))
-                        elif will_retry_on_error and not (cancel_check and cancel_check()):
-                            print(f"Chunk {uid} failed validation in batch; retrying immediately at the front of the queue")
-                            retry_start = time.time()
-                            retry_success, retry_msg = self.generate_chunk_audio(uid, attempt=1, generation_token=generation_token)
-                            retry_elapsed = time.time() - retry_start
-                            if retry_success:
-                                results["completed"].append(uid)
-                                print(f"Chunk {uid} completed after auto-regeneration: {retry_msg}")
-                                if item_callback:
-                                    item_callback(uid, True, shared_elapsed + retry_elapsed, word_counts.get(uid, 0), word_counts.get(uid, 0))
-                            else:
-                                results["failed"].append((uid, retry_msg))
-                                print(f"Chunk {uid} failed after auto-regeneration: {retry_msg}")
-                                if item_callback:
-                                    item_callback(uid, False, shared_elapsed + retry_elapsed, word_counts.get(uid, 0), 0)
-                        else:
-                            results["failed"].append((uid, result["error"]))
-                            print(f"Chunk {uid} failed validation: {result['error']}")
-                            if item_callback:
-                                item_callback(uid, False, shared_elapsed, word_counts.get(uid, 0), 0)
+                        results["completed"].append(uid)
+                        print(f"Chunk {uid} submitted for finalization")
                     except Exception as e:
-                        print(f"Error processing chunk {uid}: {e}")
+                        print(f"Error queueing async finalization for chunk {uid}: {e}")
                         results["failed"].append((uid, str(e)))
                         self._update_chunk_fields_if_token(
                             uid,

@@ -14,7 +14,7 @@ from project_core.constants import VOICE_AUDIT_LOG_ENABLED_DEFAULT
 from script_store import load_script_document
 
 
-SCRIPT_STORE_SCHEMA_VERSION = 2
+SCRIPT_STORE_SCHEMA_VERSION = 3
 
 
 class ScriptStore(ABC):
@@ -206,6 +206,34 @@ class ScriptStore(ABC):
     def replace_voice_state_snapshot(self, snapshot, *, reason="replace_voice_state_snapshot", wait=True):
         raise NotImplementedError
 
+    @abstractmethod
+    def enqueue_audio_finalize_task(self, task, *, reason="enqueue_audio_finalize_task", wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def claim_next_audio_finalize_task(self, *, reason="claim_next_audio_finalize_task", wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def complete_audio_finalize_task(self, task_id, *, reason="complete_audio_finalize_task", wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def fail_audio_finalize_task(self, task_id, error=None, requeue=False, *, reason="fail_audio_finalize_task", wait=True):
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_audio_finalize_tasks(self, generation_token=None, statuses=None):
+        raise NotImplementedError
+
+    @abstractmethod
+    def count_audio_finalize_tasks(self, generation_token=None):
+        raise NotImplementedError
+
+    @abstractmethod
+    def clear_audio_finalize_tasks(self, generation_token=None, uids=None, *, reason="clear_audio_finalize_tasks", wait=True):
+        raise NotImplementedError
+
 
 class SQLiteScriptStore(ScriptStore):
     _RESERVED_FIELDS = {
@@ -265,6 +293,7 @@ class SQLiteScriptStore(ScriptStore):
         self._initialize_db()
         self._bootstrap_if_needed()
         self._bootstrap_voice_state_if_needed()
+        self._requeue_processing_audio_finalize_tasks()
         self._writer_thread = threading.Thread(
             target=self._writer_loop,
             daemon=True,
@@ -870,6 +899,88 @@ class SQLiteScriptStore(ScriptStore):
             wait=wait,
         )
 
+    def enqueue_audio_finalize_task(self, task, *, reason="enqueue_audio_finalize_task", wait=True):
+        normalized = self._normalize_audio_finalize_task(task)
+        if normalized is None:
+            return None
+        return self._submit_command(
+            "enqueue_audio_finalize_task",
+            {"task": normalized, "reason": reason},
+            wait=wait,
+        )
+
+    def claim_next_audio_finalize_task(self, *, reason="claim_next_audio_finalize_task", wait=True):
+        return self._submit_command(
+            "claim_next_audio_finalize_task",
+            {"reason": reason},
+            wait=wait,
+        )
+
+    def complete_audio_finalize_task(self, task_id, *, reason="complete_audio_finalize_task", wait=True):
+        return self._submit_command(
+            "complete_audio_finalize_task",
+            {"task_id": int(task_id or 0), "reason": reason},
+            wait=wait,
+        )
+
+    def fail_audio_finalize_task(self, task_id, error=None, requeue=False, *, reason="fail_audio_finalize_task", wait=True):
+        return self._submit_command(
+            "fail_audio_finalize_task",
+            {
+                "task_id": int(task_id or 0),
+                "error": "" if error is None else str(error),
+                "requeue": bool(requeue),
+                "reason": reason,
+            },
+            wait=wait,
+        )
+
+    def list_audio_finalize_tasks(self, generation_token=None, statuses=None):
+        query = (
+            "SELECT id, chunk_uid, generation_token, temp_wav_path, attempt, speaker, text, "
+            "status, created_at, updated_at, last_error "
+            "FROM audio_finalize_queue"
+        )
+        params = []
+        clauses = []
+        normalized_token = str(generation_token or "").strip()
+        if normalized_token:
+            clauses.append("generation_token = ?")
+            params.append(normalized_token)
+        normalized_statuses = [str(status).strip() for status in (statuses or []) if str(status).strip()]
+        if normalized_statuses:
+            clauses.append("status IN (" + ",".join("?" for _ in normalized_statuses) + ")")
+            params.extend(normalized_statuses)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._row_to_audio_finalize_task(row) for row in rows]
+
+    def count_audio_finalize_tasks(self, generation_token=None):
+        query = "SELECT COUNT(*) AS count FROM audio_finalize_queue"
+        params = []
+        normalized_token = str(generation_token or "").strip()
+        if normalized_token:
+            query += " WHERE generation_token = ?"
+            params.append(normalized_token)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row["count"] or 0) if row is not None else 0
+
+    def clear_audio_finalize_tasks(self, generation_token=None, uids=None, *, reason="clear_audio_finalize_tasks", wait=True):
+        normalized_uids = [str(uid).strip() for uid in (uids or []) if str(uid).strip()]
+        return self._submit_command(
+            "clear_audio_finalize_tasks",
+            {
+                "generation_token": str(generation_token or "").strip(),
+                "uids": normalized_uids,
+                "reason": reason,
+            },
+            wait=wait,
+        )
+
     def export_chunks(self, target_path):
         chunks = self.load_chunks()
         os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
@@ -963,10 +1074,45 @@ class SQLiteScriptStore(ScriptStore):
                 """
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audio_finalize_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chunk_uid TEXT NOT NULL,
+                    generation_token TEXT,
+                    temp_wav_path TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    speaker TEXT,
+                    text TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    last_error TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audio_finalize_queue_status_id ON audio_finalize_queue(status, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audio_finalize_queue_generation_token ON audio_finalize_queue(generation_token)"
+            )
+            conn.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCRIPT_STORE_SCHEMA_VERSION),),
             )
             conn.commit()
+
+    def _requeue_processing_audio_finalize_tasks(self):
+        with self._connect() as conn:
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE audio_finalize_queue
+                    SET status = 'queued', updated_at = ?, last_error = NULL
+                    WHERE status = 'processing'
+                    """,
+                    (time.time(),),
+                )
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
@@ -1160,6 +1306,25 @@ class SQLiteScriptStore(ScriptStore):
             result = self._replace_voice_state_snapshot_tx(conn, payload.get("snapshot") or {})
             self._audit_voice_state_write(conn, name, payload)
             return result
+        if name == "enqueue_audio_finalize_task":
+            return self._enqueue_audio_finalize_task_tx(conn, payload.get("task") or {})
+        if name == "claim_next_audio_finalize_task":
+            return self._claim_next_audio_finalize_task_tx(conn)
+        if name == "complete_audio_finalize_task":
+            return self._complete_audio_finalize_task_tx(conn, payload.get("task_id"))
+        if name == "fail_audio_finalize_task":
+            return self._fail_audio_finalize_task_tx(
+                conn,
+                payload.get("task_id"),
+                error=payload.get("error"),
+                requeue=bool(payload.get("requeue")),
+            )
+        if name == "clear_audio_finalize_tasks":
+            return self._clear_audio_finalize_tasks_tx(
+                conn,
+                generation_token=payload.get("generation_token"),
+                uids=payload.get("uids") or [],
+            )
         if name == "barrier":
             return True
         raise ValueError(f"Unsupported script store command: {name}")
@@ -1345,7 +1510,7 @@ class SQLiteScriptStore(ScriptStore):
                 chunk = self._row_to_chunk(row)
                 if token is not None and chunk.get("generation_token") != token:
                     continue
-                if chunk.get("status") != "generating" and token is not None:
+                if chunk.get("status") not in {"generating", "finalizing"} and token is not None:
                     continue
                 chunk["status"] = target_status
                 chunk.pop("generation_token", None)
@@ -1387,6 +1552,164 @@ class SQLiteScriptStore(ScriptStore):
                     (str(time.time()),),
                 )
         return updated
+
+    def _enqueue_audio_finalize_task_tx(self, conn, task):
+        normalized = self._normalize_audio_finalize_task(task)
+        if normalized is None:
+            return None
+        now = time.time()
+        with conn:
+            row = conn.execute(
+                """
+                SELECT id, chunk_uid, generation_token, temp_wav_path, attempt, speaker, text,
+                       status, created_at, updated_at, last_error
+                FROM audio_finalize_queue
+                WHERE chunk_uid = ? AND generation_token = ? AND temp_wav_path = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    normalized.get("chunk_uid"),
+                    normalized.get("generation_token"),
+                    normalized.get("temp_wav_path"),
+                ),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    """
+                    UPDATE audio_finalize_queue
+                    SET attempt = ?, speaker = ?, text = ?, status = 'queued',
+                        updated_at = ?, last_error = NULL
+                    WHERE id = ?
+                    """,
+                    (
+                        int(normalized.get("attempt") or 0),
+                        normalized.get("speaker"),
+                        normalized.get("text"),
+                        now,
+                        int(row["id"]),
+                    ),
+                )
+                claimed_row = conn.execute(
+                    """
+                    SELECT id, chunk_uid, generation_token, temp_wav_path, attempt, speaker, text,
+                           status, created_at, updated_at, last_error
+                    FROM audio_finalize_queue
+                    WHERE id = ?
+                    """,
+                    (int(row["id"]),),
+                ).fetchone()
+                return self._row_to_audio_finalize_task(claimed_row)
+
+            conn.execute(
+                """
+                INSERT INTO audio_finalize_queue(
+                    chunk_uid, generation_token, temp_wav_path, attempt, speaker, text,
+                    status, created_at, updated_at, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL)
+                """,
+                (
+                    normalized.get("chunk_uid"),
+                    normalized.get("generation_token"),
+                    normalized.get("temp_wav_path"),
+                    int(normalized.get("attempt") or 0),
+                    normalized.get("speaker"),
+                    normalized.get("text"),
+                    now,
+                    now,
+                ),
+            )
+            task_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        with conn:
+            row = conn.execute(
+                """
+                SELECT id, chunk_uid, generation_token, temp_wav_path, attempt, speaker, text,
+                       status, created_at, updated_at, last_error
+                FROM audio_finalize_queue
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        return self._row_to_audio_finalize_task(row)
+
+    def _claim_next_audio_finalize_task_tx(self, conn):
+        now = time.time()
+        with conn:
+            row = conn.execute(
+                """
+                SELECT id, chunk_uid, generation_token, temp_wav_path, attempt, speaker, text,
+                       status, created_at, updated_at, last_error
+                FROM audio_finalize_queue
+                WHERE status = 'queued'
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """
+                UPDATE audio_finalize_queue
+                SET status = 'processing', updated_at = ?, last_error = NULL
+                WHERE id = ?
+                """,
+                (now, int(row["id"])),
+            )
+            claimed_row = conn.execute(
+                """
+                SELECT id, chunk_uid, generation_token, temp_wav_path, attempt, speaker, text,
+                       status, created_at, updated_at, last_error
+                FROM audio_finalize_queue
+                WHERE id = ?
+                """,
+                (int(row["id"]),),
+            ).fetchone()
+        return self._row_to_audio_finalize_task(claimed_row)
+
+    def _complete_audio_finalize_task_tx(self, conn, task_id):
+        normalized_id = int(task_id or 0)
+        if normalized_id <= 0:
+            return False
+        with conn:
+            conn.execute("DELETE FROM audio_finalize_queue WHERE id = ?", (normalized_id,))
+        return True
+
+    def _fail_audio_finalize_task_tx(self, conn, task_id, error=None, requeue=False):
+        normalized_id = int(task_id or 0)
+        if normalized_id <= 0:
+            return False
+        now = time.time()
+        with conn:
+            if requeue:
+                conn.execute(
+                    """
+                    UPDATE audio_finalize_queue
+                    SET status = 'queued', updated_at = ?, last_error = ?
+                    WHERE id = ?
+                    """,
+                    (now, "" if error is None else str(error), normalized_id),
+                )
+            else:
+                conn.execute("DELETE FROM audio_finalize_queue WHERE id = ?", (normalized_id,))
+        return True
+
+    def _clear_audio_finalize_tasks_tx(self, conn, generation_token=None, uids=None):
+        clauses = []
+        params = []
+        normalized_token = str(generation_token or "").strip()
+        normalized_uids = [str(uid).strip() for uid in (uids or []) if str(uid).strip()]
+        if normalized_token:
+            clauses.append("generation_token = ?")
+            params.append(normalized_token)
+        if normalized_uids:
+            clauses.append("chunk_uid IN (" + ",".join("?" for _ in normalized_uids) + ")")
+            params.extend(normalized_uids)
+        query = "DELETE FROM audio_finalize_queue"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with conn:
+            cursor = conn.execute(query, params)
+        return int(cursor.rowcount or 0)
 
     def _prepare_chunk_for_regeneration_tx(self, conn, uid):
         normalized = str(uid or "").strip()
@@ -1879,6 +2202,39 @@ class SQLiteScriptStore(ScriptStore):
         if "silence_duration_s" in normalized and normalized["silence_duration_s"] is not None:
             normalized["silence_duration_s"] = float(normalized["silence_duration_s"])
         return normalized
+
+    def _normalize_audio_finalize_task(self, task):
+        payload = dict(task or {})
+        chunk_uid = str(payload.get("chunk_uid") or "").strip()
+        temp_wav_path = str(payload.get("temp_wav_path") or "").strip()
+        if not chunk_uid or not temp_wav_path:
+            return None
+        return {
+            "chunk_uid": chunk_uid,
+            "generation_token": str(payload.get("generation_token") or "").strip() or None,
+            "temp_wav_path": temp_wav_path,
+            "attempt": int(payload.get("attempt") or 0),
+            "speaker": str(payload.get("speaker") or "").strip() or None,
+            "text": str(payload.get("text") or ""),
+        }
+
+    @staticmethod
+    def _row_to_audio_finalize_task(row):
+        if row is None:
+            return None
+        return {
+            "id": int(row["id"]),
+            "chunk_uid": row["chunk_uid"],
+            "generation_token": row["generation_token"],
+            "temp_wav_path": row["temp_wav_path"],
+            "attempt": int(row["attempt"] or 0),
+            "speaker": row["speaker"],
+            "text": row["text"] or "",
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "last_error": row["last_error"],
+        }
 
     @staticmethod
     def _chunk_audio_fingerprint(chunk):

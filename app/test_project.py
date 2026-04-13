@@ -332,55 +332,40 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
         self.assertEqual(view_chunks[0]["status"], "pending")
         self.assertIsNone(view_chunks[0]["audio_path"])
 
-    def test_postprocess_workers_can_finish_multiple_tasks_in_parallel(self):
+    def test_script_store_finalize_queue_claim_complete_cycle(self):
         self.manager.save_chunks([
             self._make_chunk(0, "chunk-1"),
             self._make_chunk(1, "chunk-2"),
         ])
-        self.manager._claim_chunks_generation([0, 1], generation_token="run-token")
+        task_one = self.manager.script_store.enqueue_audio_finalize_task({
+            "chunk_uid": "chunk-1",
+            "generation_token": "run-token",
+            "temp_wav_path": "voicelines/.finalize_spool/run-token/chunk-1.wav",
+            "attempt": 0,
+            "speaker": "Narrator",
+            "text": "alpha beta gamma",
+        })
+        task_two = self.manager.script_store.enqueue_audio_finalize_task({
+            "chunk_uid": "chunk-2",
+            "generation_token": "run-token",
+            "temp_wav_path": "voicelines/.finalize_spool/run-token/chunk-2.wav",
+            "attempt": 1,
+            "speaker": "Narrator",
+            "text": "delta epsilon zeta",
+        })
 
-        def fake_finalize(index, speaker, text, temp_path, attempt=0, chunk_uid=None):
-            time.sleep(0.2)
-            return {
-                "status": "done",
-                "audio_path": f"voicelines/{chunk_uid}.mp3",
-                "audio_validation": {"is_valid": True, "file_size_bytes": 10, "actual_duration_sec": 1.0},
-                "error": None,
-            }
+        claimed_one = self.manager.script_store.claim_next_audio_finalize_task()
+        claimed_two = self.manager.script_store.claim_next_audio_finalize_task()
+        self.manager.script_store.complete_audio_finalize_task(claimed_one["id"])
+        self.manager.script_store.fail_audio_finalize_task(claimed_two["id"], error="boom", requeue=False)
 
-        start = time.time()
-        with patch.object(self.manager, "_finalize_generated_audio", side_effect=fake_finalize):
-            future_one = self.manager._enqueue_postprocess(
-                index=0,
-                speaker="Narrator",
-                text="alpha beta gamma",
-                temp_path=os.path.join(self.root_dir, "temp_one.wav"),
-                attempt=0,
-                chunk_uid="chunk-1",
-                generation_token="run-token",
-            )
-            future_two = self.manager._enqueue_postprocess(
-                index=1,
-                speaker="Narrator",
-                text="delta epsilon zeta",
-                temp_path=os.path.join(self.root_dir, "temp_two.wav"),
-                attempt=0,
-                chunk_uid="chunk-2",
-                generation_token="run-token",
-            )
-            result_one = future_one.result(timeout=2.0)
-            result_two = future_two.result(timeout=2.0)
-        elapsed = time.time() - start
+        pending = self.manager.script_store.list_audio_finalize_tasks()
 
-        live_chunks = self.manager.load_chunks_view()
-
-        self.assertLess(elapsed, 0.35)
-        self.assertEqual(result_one["status"], "done")
-        self.assertEqual(result_two["status"], "done")
-        self.assertEqual(live_chunks[0]["status"], "done")
-        self.assertEqual(live_chunks[1]["status"], "done")
-        self.assertEqual(live_chunks[0]["audio_path"], "voicelines/chunk-1.mp3")
-        self.assertEqual(live_chunks[1]["audio_path"], "voicelines/chunk-2.mp3")
+        self.assertEqual(task_one["status"], "queued")
+        self.assertEqual(task_two["status"], "queued")
+        self.assertEqual(claimed_one["chunk_uid"], "chunk-1")
+        self.assertEqual(claimed_two["chunk_uid"], "chunk-2")
+        self.assertEqual(pending, [])
 
     def test_reset_generating_chunks_clears_runtime_overlay(self):
         self.manager.save_chunks([self._make_chunk(0, "chunk-1")])
@@ -1123,6 +1108,111 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
         self.assertEqual(results["failed"], [])
         self.assertEqual(results["completed"], ["jordan-11"])
         self.assertEqual(fake_engine.batch_speakers, ["Jordan"])
+
+    def test_generate_chunks_batch_recovers_unreported_backend_temp_outputs(self):
+        chunks = [
+            {
+                "id": 0,
+                "uid": "clip-0",
+                "speaker": "Jordan",
+                "text": "Jordan line zero has enough words to validate correctly.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 1,
+                "uid": "clip-1",
+                "speaker": "Jordan",
+                "text": "Jordan line one has enough words to validate correctly.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+            },
+        ]
+        self.manager.save_chunks(chunks)
+
+        class FakeBatchEngine:
+            def generate_batch(self, batch_chunks, voice_config, output_dir, batch_seed, cancel_check=None):
+                sample_rate = 24000
+                samples = np.zeros(int(sample_rate * 2.0), dtype=np.float32)
+                for chunk in batch_chunks:
+                    sf.write(os.path.join(output_dir, f"temp_batch_{chunk['index']}.wav"), samples, sample_rate)
+                return {"completed": [], "failed": []}
+
+        self.manager.get_engine = lambda: FakeBatchEngine()
+        self.manager._load_voice_config = lambda: {"Jordan": {}}
+
+        results = self.manager.generate_chunks_batch(["clip-0", "clip-1"], batch_size=2)
+        deadline = time.time() + 2.0
+        stored = {}
+        while time.time() < deadline:
+            stored = {chunk["uid"]: chunk for chunk in self.manager.load_chunks()}
+            if stored["clip-0"]["status"] == "done" and stored["clip-1"]["status"] == "done":
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(results["failed"], [])
+        self.assertEqual(results["completed"], ["clip-0", "clip-1"])
+        self.assertEqual(stored["clip-0"]["status"], "done")
+        self.assertEqual(stored["clip-1"]["status"], "done")
+        self.assertTrue(str(stored["clip-0"].get("audio_path") or "").endswith(".mp3"))
+        self.assertTrue(str(stored["clip-1"].get("audio_path") or "").endswith(".mp3"))
+
+    def test_generate_chunks_batch_marks_chunk_finalizing_before_async_saveback(self):
+        chunks = [{
+            "id": 0,
+            "uid": "clip-finalizing",
+            "speaker": "Jordan",
+            "text": "Jordan line has enough words to validate correctly.",
+            "chapter": "Chapter 1",
+            "instruct": "",
+            "status": "pending",
+        }]
+        self.manager.save_chunks(chunks)
+
+        class FakeBatchEngine:
+            def generate_batch(self, batch_chunks, voice_config, output_dir, batch_seed, cancel_check=None):
+                sample_rate = 24000
+                samples = np.zeros(int(sample_rate * 2.0), dtype=np.float32)
+                for chunk in batch_chunks:
+                    sf.write(os.path.join(output_dir, f"temp_batch_{chunk['index']}.wav"), samples, sample_rate)
+                return {"completed": [chunk["index"] for chunk in batch_chunks], "failed": []}
+
+        original_process = self.manager._process_audio_finalize_task
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_process(task):
+            started.set()
+            release.wait(timeout=2.0)
+            return original_process(task)
+
+        self.manager._process_audio_finalize_task = blocked_process
+        self.manager.get_engine = lambda: FakeBatchEngine()
+        self.manager._load_voice_config = lambda: {"Jordan": {}}
+        try:
+            results = self.manager.generate_chunks_batch(["clip-finalizing"], batch_size=1)
+            deadline = time.time() + 2.0
+            chunk = None
+            while time.time() < deadline:
+                chunk = self.manager.get_chunk_raw("clip-finalizing")
+                if chunk and chunk.get("status") == "finalizing":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(results["completed"], ["clip-finalizing"])
+            self.assertIsNotNone(chunk)
+            self.assertEqual(chunk["status"], "finalizing")
+            self.assertTrue(started.wait(timeout=2.0))
+        finally:
+            release.set()
+            self.manager._process_audio_finalize_task = original_process
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            chunk = self.manager.get_chunk_raw("clip-finalizing")
+            if chunk and chunk.get("status") == "done":
+                break
+            time.sleep(0.02)
 
     def test_recovers_interrupted_generating_chunk_with_valid_audio(self):
         self._write_wav("voicelines/recovered.wav", duration_seconds=3.0)

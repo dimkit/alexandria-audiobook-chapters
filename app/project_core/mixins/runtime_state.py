@@ -61,7 +61,7 @@ class ProjectRuntimeStateMixin:
                 return parsed if parsed > 0 else default
 
             return {
-                "saveback_workers": _coerce_positive_int(tts_settings.get("saveback_workers", 2), 2),
+                "finalizer_workers": 1,
                 "chunk_state_flush_ms": _coerce_positive_int(tts_settings.get("chunk_state_flush_ms", 250), 250),
                 "chunk_state_flush_batch_size": _coerce_positive_int(
                     tts_settings.get("chunk_state_flush_batch_size", 25),
@@ -309,17 +309,59 @@ class ProjectRuntimeStateMixin:
             live_chunk = self._runtime_chunk_state(chunk)
             return live_chunk.get("generation_token") == expected_token
 
-        def _postprocess_worker_loop(self):
+        def register_audio_finalization_listener(
+            self,
+            generation_token,
+            *,
+            submission_callback=None,
+            item_callback=None,
+            activity_callback=None,
+        ):
+            token = str(generation_token or "").strip()
+            if not token:
+                return
+            with self._audio_finalize_listener_lock:
+                self._audio_finalize_listeners[token] = {
+                    "submission_callback": submission_callback,
+                    "item_callback": item_callback,
+                    "activity_callback": activity_callback,
+                }
+
+        def unregister_audio_finalization_listener(self, generation_token):
+            token = str(generation_token or "").strip()
+            if not token:
+                return
+            with self._audio_finalize_listener_lock:
+                self._audio_finalize_listeners.pop(token, None)
+
+        def _notify_audio_finalize_listener(self, generation_token, callback_name, *args):
+            token = str(generation_token or "").strip()
+            if not token:
+                return
+            with self._audio_finalize_listener_lock:
+                listener = dict(self._audio_finalize_listeners.get(token) or {})
+            callback = listener.get(callback_name)
+            if callback is None:
+                return
+            try:
+                callback(*args)
+            except Exception as exc:
+                print(f"Warning: audio finalize listener '{callback_name}' failed for {token}: {exc}")
+
+        def _audio_finalize_worker_loop(self):
             while True:
-                task = self._postprocess_queue.get()
+                task = self.script_store.claim_next_audio_finalize_task(wait=True)
+                if not task:
+                    time.sleep(0.25)
+                    continue
                 try:
-                    self._process_postprocess_task(task)
+                    self._process_audio_finalize_task(task)
                 except BaseException as e:
-                    fut = task.get("future")
-                    if fut is not None and not fut.done():
-                        fut.set_exception(e)
-                finally:
-                    self._postprocess_queue.task_done()
+                    try:
+                        self.script_store.fail_audio_finalize_task(task.get("id"), error=str(e), requeue=False, wait=True)
+                    except Exception:
+                        pass
+                    print(f"Warning: audio finalizer failed for task {task.get('id')}: {e}")
 
         def _apply_runtime_patch_to_chunk(self, chunk, runtime_state):
             patched = dict(chunk)
@@ -391,81 +433,184 @@ class ProjectRuntimeStateMixin:
                             self._dirty_chunk_uids.discard(uid)
                 return flushed_count
 
-        def _process_postprocess_task(self, task):
-            index = task["index"]
-            temp_path = task["temp_path"]
-            generation_token = task["generation_token"]
-            fut = task["future"]
-            chunk_uid = task["chunk_uid"]
+        def _finalize_retry_requested(self, attempt):
+            return attempt < self._get_auto_regen_retry_attempts()
 
-            try:
-                result = self._finalize_generated_audio(
-                    index,
-                    task["speaker"],
-                    task["text"],
-                    temp_path,
-                    attempt=task["attempt"],
-                    chunk_uid=task["chunk_uid"],
+        def _spool_audio_relative_path(self, chunk_uid, generation_token, attempt=0):
+            token_slug = sanitize_filename(generation_token or "manual") or "manual"
+            chunk_slug = sanitize_filename(chunk_uid or uuid.uuid4().hex) or uuid.uuid4().hex
+            return os.path.join(
+                "voicelines",
+                ".finalize_spool",
+                token_slug,
+                f"{chunk_slug}_attempt{int(attempt or 0)}.wav",
+            )
+
+        def _spool_audio_full_path(self, chunk_uid, generation_token, attempt=0):
+            relative_path = self._spool_audio_relative_path(chunk_uid, generation_token, attempt=attempt)
+            full_path = os.path.join(self.root_dir, relative_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            return full_path
+
+        def _enqueue_audio_finalize_task(self, chunk_uid, generation_token, temp_path, *, attempt=0, speaker="", text=""):
+            normalized_uid = str(chunk_uid or "").strip()
+            if not normalized_uid:
+                return None
+            normalized_path = str(temp_path or "").strip()
+            if not normalized_path:
+                return None
+            relative_path = os.path.relpath(normalized_path, self.root_dir)
+            task = self.script_store.enqueue_audio_finalize_task(
+                {
+                    "chunk_uid": normalized_uid,
+                    "generation_token": generation_token,
+                    "temp_wav_path": relative_path,
+                    "attempt": int(attempt or 0),
+                    "speaker": speaker,
+                    "text": text,
+                },
+                wait=True,
+            )
+            updated = self._update_chunk_fields_if_token(
+                normalized_uid,
+                generation_token,
+                status="finalizing",
+                auto_regen_count=int(attempt or 0),
+                generation_token=generation_token,
+            )
+            if updated is None:
+                self.script_store.clear_audio_finalize_tasks(
+                    generation_token=generation_token,
+                    uids=[normalized_uid],
+                    wait=True,
                 )
+                self._cleanup_temp_file(normalized_path)
+                return None
+            self._notify_audio_finalize_listener(
+                generation_token,
+                "submission_callback",
+                normalized_uid,
+                task,
+            )
+            return task
 
-                if result["status"] == "error" and task.get("error_status_override"):
-                    updated_status = task["error_status_override"]
-                    keep_token = task.get("keep_token", False)
-                else:
-                    updated_status = result["status"]
-                    keep_token = False
+        def list_audio_finalize_tasks(self, generation_token=None, statuses=None):
+            return self.script_store.list_audio_finalize_tasks(generation_token=generation_token, statuses=statuses)
 
-                updated_chunk = self._update_chunk_fields_if_token(
+        def has_pending_audio_finalize_tasks(self, generation_token=None):
+            if generation_token is None:
+                return self.script_store.count_audio_finalize_tasks() > 0
+            return self.script_store.count_audio_finalize_tasks(generation_token=generation_token) > 0
+
+        def clear_audio_finalize_tasks(self, generation_token=None, uids=None, cleanup_files=True):
+            tasks = self.script_store.list_audio_finalize_tasks(generation_token=generation_token)
+            if uids:
+                normalized_uids = {str(uid).strip() for uid in (uids or []) if str(uid).strip()}
+                tasks = [task for task in tasks if str(task.get("chunk_uid") or "").strip() in normalized_uids]
+            if cleanup_files:
+                for task in tasks:
+                    relative_temp_path = str(task.get("temp_wav_path") or "").strip()
+                    if not relative_temp_path:
+                        continue
+                    temp_path = (
+                        relative_temp_path
+                        if os.path.isabs(relative_temp_path)
+                        else os.path.join(self.root_dir, relative_temp_path)
+                    )
+                    self._cleanup_temp_file(temp_path)
+            return self.script_store.clear_audio_finalize_tasks(
+                generation_token=generation_token,
+                uids=uids,
+                wait=True,
+            )
+
+        def _process_audio_finalize_task(self, task):
+            chunk_uid = str(task.get("chunk_uid") or "").strip()
+            generation_token = str(task.get("generation_token") or "").strip() or None
+            task_id = int(task.get("id") or 0)
+            relative_temp_path = str(task.get("temp_wav_path") or "").strip()
+            temp_path = (
+                relative_temp_path
+                if os.path.isabs(relative_temp_path)
+                else os.path.join(self.root_dir, relative_temp_path)
+            )
+            attempt = int(task.get("attempt") or 0)
+
+            self._notify_audio_finalize_listener(generation_token, "activity_callback", "finalizer_started", chunk_uid)
+
+            chunk = self.get_chunk_raw(chunk_uid)
+            if chunk is None:
+                self._cleanup_temp_file(temp_path)
+                self.script_store.complete_audio_finalize_task(task_id, wait=True)
+                return
+            if generation_token is not None and chunk.get("generation_token") != generation_token:
+                self._cleanup_temp_file(temp_path)
+                self.script_store.complete_audio_finalize_task(task_id, wait=True)
+                return
+            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                next_attempt = attempt + 1 if self._finalize_retry_requested(attempt) else attempt
+                self._update_chunk_fields_if_token(
                     chunk_uid,
                     generation_token,
-                    audio_path=result["audio_path"],
-                    audio_validation=result["audio_validation"],
-                    status=updated_status,
-                    auto_regen_count=task["attempt"],
-                    generation_token=generation_token if keep_token else None,
+                    status="error",
+                    audio_validation=None,
+                    auto_regen_count=next_attempt,
+                    generation_token=None,
                 )
+                self.script_store.complete_audio_finalize_task(task_id, wait=True)
+                self._notify_audio_finalize_listener(
+                    generation_token,
+                    "item_callback",
+                    chunk_uid,
+                    False,
+                    0.0,
+                    len(re.findall(r"\b\w+\b", task.get("text", ""))),
+                    0,
+                    {
+                        "retry_requested": self._finalize_retry_requested(attempt),
+                        "attempt": attempt,
+                        "error": "Generated audio file is missing or empty",
+                    },
+                )
+                return
 
-                self._cleanup_temp_file(temp_path)
+            start = time.time()
+            result = self._finalize_generated_audio(
+                int(chunk.get("id") or 0),
+                task.get("speaker") or chunk.get("speaker") or "unknown",
+                task.get("text") or chunk.get("text") or "",
+                temp_path,
+                attempt=attempt,
+                chunk_uid=chunk_uid,
+            )
+            elapsed = time.time() - start
+            next_attempt = attempt + 1 if result["status"] == "error" and self._finalize_retry_requested(attempt) else attempt
+            updated_chunk = self._update_chunk_fields_if_token(
+                chunk_uid,
+                generation_token,
+                audio_path=result["audio_path"],
+                audio_validation=result["audio_validation"],
+                status=result["status"],
+                auto_regen_count=next_attempt,
+                generation_token=None,
+            )
+            self._cleanup_temp_file(temp_path)
+            self.script_store.complete_audio_finalize_task(task_id, wait=True)
 
-                if updated_chunk is None:
-                    fut.set_result({"status": "cancelled", "audio_path": None, "audio_validation": None, "error": "cancelled"})
-                    return
+            if updated_chunk is None:
+                return
 
-                fut.set_result({
-                    **result,
-                    "uid": chunk_uid,
-                    "index": index,
-                    "generation_token": generation_token,
-                })
-            except Exception as e:
-                try:
-                    self._update_chunk_fields_if_token(
-                        chunk_uid,
-                        generation_token,
-                        status="error",
-                        audio_validation=None,
-                        auto_regen_count=task["attempt"],
-                        generation_token=None,
-                    )
-                except Exception:
-                    pass
-                self._cleanup_temp_file(temp_path)
-                fut.set_exception(e)
-
-        def _enqueue_postprocess(self, index, speaker, text, temp_path, attempt,
-                                 chunk_uid, generation_token,
-                                 error_status_override=None, keep_token=False):
-            fut = concurrent.futures.Future()
-            self._postprocess_queue.put({
-                "index": index,
-                "speaker": speaker,
-                "text": text,
-                "temp_path": temp_path,
-                "attempt": attempt,
-                "chunk_uid": chunk_uid,
-                "generation_token": generation_token,
-                "error_status_override": error_status_override,
-                "keep_token": keep_token,
-                "future": fut,
-            })
-            return fut
+            self._notify_audio_finalize_listener(
+                generation_token,
+                "item_callback",
+                chunk_uid,
+                result["status"] == "done",
+                elapsed,
+                len(re.findall(r"\b\w+\b", task.get("text", ""))),
+                len(re.findall(r"\b\w+\b", task.get("text", ""))) if result["status"] == "done" else 0,
+                {
+                    "retry_requested": result["status"] == "error" and self._finalize_retry_requested(attempt),
+                    "attempt": attempt,
+                    "error": result.get("error"),
+                },
+            )
