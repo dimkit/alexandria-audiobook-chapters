@@ -1110,6 +1110,217 @@ class EditorTabChunkPollTests(unittest.TestCase):
             """
         )
 
+    def test_update_narrator_selector_uses_backend_candidate_order(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                context.__editorTabTestHooks.setSelectedEditorChapter('Chapter 6');
+                context.__editorTabTestHooks.setCachedChunks([
+                    { id: 1, speaker: 'NARRATOR', text: 'Ryan looks over. Blake answers. Blake waits beside Ryan while Blake nods.', chapter: 'Chapter 6', audio_path: null },
+                ]);
+
+                context.API.get = async (url) => {
+                    if (url === '/api/voices') {
+                        return [
+                            { name: 'NARRATOR', config: { narrates: true } },
+                            { name: 'Ryan', config: { narrates: true } },
+                            { name: 'Blake', config: { narrates: true } },
+                        ];
+                    }
+                    if (url === '/api/narrator_candidates?chapter=Chapter%206') {
+                        return { chapter: 'Chapter 6', voices: ['NARRATOR', 'Blake', 'Ryan'] };
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                await context.updateNarratorSelector(context.__editorTabTestHooks.getCachedChunks());
+
+                const select = context.document.getElementById('editor-narrator-select');
+                assert.ok(select.innerHTML.indexOf('value="Blake"') < select.innerHTML.indexOf('value="Ryan"'));
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_update_narrator_selector_does_not_reinsert_disabled_narrator(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                context.__editorTabTestHooks.setSelectedEditorChapter('Chapter 6');
+                context.__editorTabTestHooks.setCachedChunks([
+                    { id: 1, speaker: 'NARRATOR', text: 'Ryan looks over. Blake answers. Blake waits beside Ryan while Blake nods.', chapter: 'Chapter 6', audio_path: null },
+                ]);
+
+                context.API.get = async (url) => {
+                    if (url === '/api/voices') {
+                        return [
+                            { name: 'NARRATOR', config: { narrates: false } },
+                            { name: 'Ryan', config: { narrates: true } },
+                            { name: 'Blake', config: { narrates: true } },
+                        ];
+                    }
+                    if (url === '/api/narrator_candidates?chapter=Chapter%206') {
+                        return { chapter: 'Chapter 6', voices: ['Blake', 'Ryan'] };
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                await context.updateNarratorSelector(context.__editorTabTestHooks.getCachedChunks());
+
+                const select = context.document.getElementById('editor-narrator-select');
+                assert.ok(!select.innerHTML.includes('value="NARRATOR"'));
+                assert.ok(select.innerHTML.includes('value="Blake" selected'));
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_update_narrator_selector_local_fallback_excludes_disabled_narrator(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                context.__editorTabTestHooks.setSelectedEditorChapter('Chapter 6');
+                context.__editorTabTestHooks.setCachedChunks([
+                    { id: 1, speaker: 'NARRATOR', text: 'Ryan looks over. Blake answers. Blake waits beside Ryan while Blake nods.', chapter: 'Chapter 6', audio_path: null },
+                ]);
+
+                context.API.get = async (url) => {
+                    if (url === '/api/voices') {
+                        return [
+                            { name: 'NARRATOR', config: { narrates: false } },
+                            { name: 'Ryan', config: { narrates: true } },
+                            { name: 'Blake', config: { narrates: true } },
+                        ];
+                    }
+                    if (url === '/api/narrator_candidates?chapter=Chapter%206') {
+                        throw new Error('backend unavailable');
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                await context.updateNarratorSelector(context.__editorTabTestHooks.getCachedChunks());
+
+                const select = context.document.getElementById('editor-narrator-select');
+                assert.ok(!select.innerHTML.includes('value="NARRATOR"'));
+                assert.ok(select.innerHTML.includes('value="Blake" selected'));
+                assert.ok(select.innerHTML.indexOf('value="Blake"') < select.innerHTML.indexOf('value="Ryan"'));
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_editor_chapter_options_show_non_default_narrator_label(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                context.__editorTabTestHooks.setSelectedEditorChapter('Chapter 1');
+                context.API.get = async (url) => {
+                    if (url === '/api/chunks/chapters') {
+                        return {
+                            chapters: [
+                                { chapter: 'Chapter 1', chunk_count: 1, narrator_label: 'Alice' },
+                                { chapter: 'Chapter 2', chunk_count: 1, narrator_label: '' },
+                            ],
+                        };
+                    }
+                    if (url === '/api/chunks/view?chapter=Chapter%201') {
+                        return [
+                            { id: 1, uid: 'chunk-1', speaker: 'Narrator', chapter: 'Chapter 1', text: 'one', instruct: '', status: 'done', audio_path: null, audio_validation: null },
+                        ];
+                    }
+                    if (url === '/api/voices') {
+                        return [];
+                    }
+                    if (url === '/api/narrator_candidates?chapter=Chapter%201') {
+                        return { chapter: 'Chapter 1', voices: ['NARRATOR'] };
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                await context.loadChunks(true);
+                await flushTicks();
+
+                const select = context.document.getElementById('editor-chapter-select');
+                assert.ok(select.innerHTML.includes('Chapter 1 N: Alice (1)'));
+                assert.ok(select.innerHTML.includes('Chapter 2 (1)'));
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_editor_chapter_options_rerender_when_only_narrator_label_changes(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                const chapters = [
+                    { chapter: 'Chapter 1', chunk_count: 1, narrator_label: '' },
+                ];
+
+                context.__editorTabTestHooks.setSelectedEditorChapter('Chapter 1');
+                context.API.get = async (url) => {
+                    if (url === '/api/chunks/chapters') {
+                        return { chapters };
+                    }
+                    if (url === '/api/chunks/view?chapter=Chapter%201') {
+                        return [
+                            { id: 1, uid: 'chunk-1', speaker: 'Narrator', chapter: 'Chapter 1', text: 'one', instruct: '', status: 'done', audio_path: null, audio_validation: null },
+                        ];
+                    }
+                    if (url === '/api/voices') {
+                        return [];
+                    }
+                    if (url === '/api/narrator_candidates?chapter=Chapter%201') {
+                        return { chapter: 'Chapter 1', voices: ['NARRATOR'] };
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                await context.loadChunks(true);
+                await flushTicks();
+
+                const select = context.document.getElementById('editor-chapter-select');
+                assert.ok(select.innerHTML.includes('Chapter 1 (1)'));
+
+                chapters[0].narrator_label = 'Alice';
+                context.syncEditorChapterState(context.__editorTabTestHooks.getCachedChunks());
+                await flushTicks();
+
+                assert.ok(select.innerHTML.includes('Chapter 1 N: Alice (1)'));
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
     def test_sync_narrator_selections_from_backend_replaces_stale_local_entries(self):
         self._run_node_test(
             """

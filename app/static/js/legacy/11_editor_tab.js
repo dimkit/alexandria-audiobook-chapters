@@ -348,7 +348,7 @@
                 count: total
             }, ...summaries.map(chapter => ({
                 id: String(chapter?.chapter || ''),
-                label: String(chapter?.chapter || ''),
+                label: `${String(chapter?.chapter || '')}${String(chapter?.narrator_label || '').trim() ? ` N: ${String(chapter?.narrator_label || '').trim()}` : ''}`,
                 count: Number(chapter?.chunk_count) || 0
             }))];
         }
@@ -400,6 +400,7 @@
             `).join('');
             const optionsSignature = JSON.stringify(options.map(option => ({
                 id: option.id,
+                label: option.label,
                 count: option.count,
                 selected: option.id === selectedEditorChapter,
             })));
@@ -1505,12 +1506,19 @@
             try {
                 const voices = await API.get('/api/voices');
                 window._narratingVoicesCache = voices
-                    .filter(v => (v.name || '').trim().toUpperCase() === 'NARRATOR' || v.config?.narrates === true)
+                    .filter(v => v.config?.narrates === true)
                     .map(v => v.name);
             } catch (e) {
-                window._narratingVoicesCache = ['NARRATOR'];
+                window._narratingVoicesCache = [];
             }
             return window._narratingVoicesCache;
+        }
+
+        function getPrimaryNarratorOption(voiceNames) {
+            const names = Array.isArray(voiceNames)
+                ? voiceNames.map(v => String(v || '').trim()).filter(Boolean)
+                : [];
+            return names.find(v => v.toUpperCase() === 'NARRATOR') || names[0] || '';
         }
 
         function setNarratorSelectorVisible(group, visible) {
@@ -1526,33 +1534,52 @@
                 return;
             }
 
-            const narratingVoices = await getNarratingVoices();
-            const hasExtra = narratingVoices.some(v => v.trim().toUpperCase() !== 'NARRATOR');
-            if (!hasExtra) {
+            const sourceChunks = chunks || cachedChunks;
+            let ordered = [];
+            try {
+                const response = await API.get(`/api/narrator_candidates?chapter=${encodeURIComponent(selectedEditorChapter)}`);
+                ordered = Array.isArray(response?.voices)
+                    ? response.voices.map(v => String(v || '').trim()).filter(Boolean)
+                    : [];
+            } catch (_e) {
+                ordered = [];
+            }
+
+            if (ordered.length === 0) {
+                const narratingVoices = await getNarratingVoices();
+                const chapterText = sourceChunks
+                    .filter(c => getChunkChapterName(c) === selectedEditorChapter)
+                    .map(c => c.text || '')
+                    .join(' ');
+                const narratorName = narratingVoices.find(v => v.trim().toUpperCase() === 'NARRATOR') || '';
+                const others = narratingVoices.filter(v => v.trim().toUpperCase() !== 'NARRATOR');
+                const countMentions = name => {
+                    try {
+                        const re = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                        return (chapterText.match(re) || []).length;
+                    } catch { return 0; }
+                };
+                others.sort((a, b) => {
+                    const delta = countMentions(b) - countMentions(a);
+                    if (delta !== 0) return delta;
+                    return a.localeCompare(b, undefined, { sensitivity: 'base' });
+                });
+                ordered = narratorName ? [narratorName, ...others] : others;
+            }
+
+            ordered = Array.from(new Set(ordered));
+            const narratorName = ordered.find(v => v.trim().toUpperCase() === 'NARRATOR') || '';
+            ordered = narratorName
+                ? [narratorName, ...ordered.filter(v => v.trim().toUpperCase() !== 'NARRATOR')]
+                : ordered.filter(v => v.trim().toUpperCase() !== 'NARRATOR');
+
+            if (ordered.length <= 1) {
                 setNarratorSelectorVisible(group, false);
                 return;
             }
 
-            const sourceChunks = chunks || cachedChunks;
-            const chapterText = sourceChunks
-                .filter(c => getChunkChapterName(c) === selectedEditorChapter)
-                .map(c => c.text || '')
-                .join(' ');
-
-            const narratorName = narratingVoices.find(v => v.trim().toUpperCase() === 'NARRATOR') || 'NARRATOR';
-            const others = narratingVoices.filter(v => v.trim().toUpperCase() !== 'NARRATOR');
-
-            const countMentions = name => {
-                try {
-                    const re = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-                    return (chapterText.match(re) || []).length;
-                } catch { return 0; }
-            };
-            others.sort((a, b) => countMentions(b) - countMentions(a));
-
-            const ordered = [narratorName, ...others];
             const saved = getNarratorSelections()[selectedEditorChapter];
-            const selected = ordered.includes(saved) ? saved : narratorName;
+            const selected = ordered.includes(saved) ? saved : getPrimaryNarratorOption(ordered);
 
             const select = document.getElementById('editor-narrator-select');
             if (!select) return;

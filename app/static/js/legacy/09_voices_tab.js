@@ -69,7 +69,14 @@
 
         function getNarratorName(cards) {
             const narratorCard = cards.find(card => normalizeVoiceName(card.dataset.voice) === normalizeVoiceName('NARRATOR'));
-            return narratorCard ? narratorCard.dataset.voice : '';
+            if (!narratorCard) return '';
+            const narratesInput = narratorCard.querySelector('.voice-narrates');
+            if (narratesInput && !narratesInput.checked) return '';
+            return narratorCard.dataset.voice;
+        }
+
+        function isNarratorVoiceCard(card) {
+            return normalizeVoiceName(card?.dataset?.voice) === normalizeVoiceName('NARRATOR');
         }
 
         async function loadVoiceSettings() {
@@ -276,7 +283,7 @@
             const lineCount = Number(voice.line_count || 0);
             const lineLabel = `${lineCount} ${lineCount === 1 ? 'line' : 'lines'}`;
             const isNarratorCard = normalizeVoiceName(voice.name) === normalizeVoiceName('NARRATOR');
-            const narratesChecked = isNarratorCard || config.narrates === true;
+            const narratesChecked = isNarratorCard ? config.narrates !== false : config.narrates === true;
 
             return `
                 <div class="card voice-card mb-3" data-voice="${safeName}" data-line-count="${lineCount}" data-paragraph-count="${Number(voice.paragraph_count || 0)}" data-suggested-sample="${escapeHtml(voice.suggested_sample_text || '')}">
@@ -287,7 +294,7 @@
                                     <span>${safeName}</span>
                                     <span class="badge text-bg-secondary" style="cursor:pointer;" title="Jump to first line in Editor" onclick="jumpToFirstChunkForVoice('${safeName}')">${lineLabel}</span>
                                     <div class="form-check form-check-inline mb-0">
-                                        <input class="form-check-input voice-narrates" type="checkbox" id="narrates_${index}" ${narratesChecked ? 'checked' : ''} ${isNarratorCard ? 'disabled' : ''} onchange="debouncedSaveVoices()">
+                                        <input class="form-check-input voice-narrates" type="checkbox" id="narrates_${index}" ${narratesChecked ? 'checked' : ''}>
                                         <label class="form-check-label small" for="narrates_${index}">Narrates</label>
                                     </div>
                                 </h5>
@@ -476,7 +483,7 @@
 
             const voices = await API.get('/api/voices');
             window._narratingVoicesCache = voices
-                .filter(v => (v.name || '').trim().toUpperCase() === 'NARRATOR' || v.config?.narrates === true)
+                .filter(v => v.config?.narrates === true)
                 .map(v => v.name);
             const container = document.getElementById('voices-list');
             if (voices.length === 0) {
@@ -751,6 +758,47 @@
             return _voiceSaveFlushPromise;
         }
 
+        async function disableNarratorNarration(card, checkbox) {
+            const statusEl = document.getElementById('voice-save-status');
+            const previousChecked = true;
+            const narratorName = getVoiceCardName(card);
+            checkbox.disabled = true;
+            statusEl.innerHTML = '<i class="fas fa-circle-notch fa-spin text-warning me-1"></i>saving';
+            try {
+                const config = collectVoiceConfig();
+                const result = await API.post('/api/voices/narrator/disable', { config });
+                _dirtyVoiceNames.clear();
+                window._narratingVoicesCache = null;
+                if (typeof syncNarratorSelectionsFromBackend === 'function') {
+                    await syncNarratorSelectionsFromBackend();
+                }
+                await loadVoices();
+                const chapterCount = Number(result?.changed_chapters || 0);
+                const invalidatedCount = Number(result?.invalidated_clips || 0);
+                showToast(
+                    `Updated ${chapterCount} chapter narrator${chapterCount === 1 ? '' : 's'} and invalidated ${invalidatedCount} clip${invalidatedCount === 1 ? '' : 's'}.`,
+                    'warning',
+                    6000
+                );
+                statusEl.innerHTML = '<i class="fas fa-check text-success me-1"></i>saved';
+                setTimeout(() => { statusEl.innerHTML = ''; }, 2000);
+                return result;
+            } catch (e) {
+                checkbox.checked = previousChecked;
+                _dirtyVoiceNames.delete(narratorName);
+                if (e?.detail?.code === 'narrator_disable_requires_other_narrator') {
+                    statusEl.innerHTML = '';
+                    showToast('Enable narration on another character before disabling the narrator.', 'warning', 5000);
+                    return null;
+                }
+                statusEl.innerHTML = `<i class="fas fa-times text-danger me-1"></i>save failed${e?.message ? `: ${e.message}` : ''}`;
+                showToast(`Failed to disable narrator narration: ${e.message}`, 'error');
+                throw e;
+            } finally {
+                checkbox.disabled = false;
+            }
+        }
+
         function debouncedSaveVoices(options = {}) {
             clearTimeout(_voiceSaveTimer);
             queueVoiceSaveOptions({
@@ -802,6 +850,10 @@
             if (voiceCard) {
                 markVoiceDirty(voiceCard);
             }
+            if (event.target.classList.contains('voice-narrates') && isNarratorVoiceCard(voiceCard) && !event.target.checked) {
+                disableNarratorNarration(voiceCard, event.target).catch(() => {});
+                return;
+            }
             if (event.target.classList.contains('voice-alias-input')) {
                 updateVoiceAliasStates();
                 debouncedSaveVoices({
@@ -816,6 +868,9 @@
             const voiceCard = event.target.closest('.voice-card');
             if (voiceCard) {
                 markVoiceDirty(voiceCard);
+            }
+            if (event.target.classList.contains('voice-narrates') && isNarratorVoiceCard(voiceCard) && !event.target.checked) {
+                return;
             }
             if (event.target.classList.contains('voice-alias-input')) {
                 updateVoiceAliasStates();

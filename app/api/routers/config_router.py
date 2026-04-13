@@ -707,6 +707,27 @@ async def get_narrator_overrides():
     return project_manager.get_narrator_overrides()
 
 
+@router.get("/api/narrator_candidates")
+async def get_narrator_candidates(chapter: str):
+    voices = []
+    for voice in project_manager.script_store.list_voice_rows() if getattr(project_manager, "script_store", None) is not None else []:
+        name = str((voice or {}).get("name") or "").strip()
+        if not name:
+            continue
+        if bool(((voice or {}).get("config") or {}).get("narrates")):
+            voices.append(name)
+    include_narrator = any(
+        project_manager._normalize_speaker_name(name) == project_manager._normalize_speaker_name("NARRATOR")
+        for name in voices
+    )
+    ordered = project_manager.rank_chapter_narration_candidates(
+        chapter,
+        voices,
+        include_narrator=include_narrator,
+    )
+    return {"chapter": chapter, "voices": ordered}
+
+
 class NarratorOverrideRequest(BaseModel):
     chapter: str
     voice: str

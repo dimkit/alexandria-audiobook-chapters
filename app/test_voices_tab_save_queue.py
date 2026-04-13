@@ -77,7 +77,7 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
 
                 const controls = {{
                     aliasInput: createControl(options.alias || '', ['voice-alias-input']),
-                    narrates: createControl(''),
+                    narrates: createControl('', ['voice-narrates']),
                     customVoice: createControl('Aiden'),
                     customStyle: createControl(''),
                     builtinLoraSelect: createControl(''),
@@ -409,6 +409,95 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
                 assert.strictEqual(savePayloads.length, 2, 'expected a follow-up save request');
                 assert.strictEqual(savePayloads[0].config.Aerial.description, '');
                 assert.strictEqual(savePayloads[1].config.Aerial.description, 'Warm, composed contralto');
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_disabling_narrator_uses_dedicated_endpoint_and_refreshes_state(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const narrator = createVoiceCard('NARRATOR', { type: 'custom', narrates: true });
+                const aerial = createVoiceCard('Aerial', { type: 'custom', narrates: true });
+                const apiCalls = [];
+                const context = createContext([narrator, aerial], async (url, payload) => {
+                    apiCalls.push({ url, payload: JSON.parse(JSON.stringify(payload || {})) });
+                    if (url === '/api/voices/narrator/disable') {
+                        return {
+                            status: 'saved',
+                            changed_chapters: 2,
+                            invalidated_clips: 3,
+                            deleted_files: 3,
+                            chapter_assignments: { 'Chapter 1': 'Aerial', 'Chapter 2': 'Aerial' },
+                        };
+                    }
+                    if (url === '/api/voices/batch') {
+                        throw new Error('generic voice save should not be used');
+                    }
+                    return { status: 'ok' };
+                });
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+                let synced = 0;
+                let reloaded = 0;
+                context.syncNarratorSelectionsFromBackend = async () => { synced += 1; };
+                context.loadVoices = async () => { reloaded += 1; };
+
+                narrator.controls.narrates.checked = false;
+                await context.__voicesListListeners.change({ target: narrator.controls.narrates });
+                await waitFor(() => reloaded === 1);
+
+                assert.strictEqual(apiCalls.length, 1);
+                assert.strictEqual(apiCalls[0].url, '/api/voices/narrator/disable');
+                assert.strictEqual(apiCalls[0].payload.config.NARRATOR.narrates, false);
+                assert.strictEqual(apiCalls[0].payload.config.Aerial.narrates, true);
+                assert.strictEqual(synced, 1);
+                assert.strictEqual(reloaded, 1);
+                assert.ok(
+                    context.__toasts.some((entry) => entry.message.includes('Updated 2 chapter narrator') && entry.level === 'warning'),
+                    'expected completion toast'
+                );
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_disabling_narrator_rechecks_box_when_no_alternate_narrator_exists(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const narrator = createVoiceCard('NARRATOR', { type: 'custom', narrates: true });
+                const aerial = createVoiceCard('Aerial', { type: 'custom', narrates: false });
+                const context = createContext([narrator, aerial], async (url) => {
+                    if (url === '/api/voices/narrator/disable') {
+                        const error = new Error('Enable narration on another character before disabling the narrator.');
+                        error.detail = {
+                            code: 'narrator_disable_requires_other_narrator',
+                            message: 'Enable narration on another character before disabling the narrator.',
+                        };
+                        throw error;
+                    }
+                    throw new Error(`Unexpected API call: ${url}`);
+                });
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                narrator.controls.narrates.checked = false;
+                await context.__voicesListListeners.change({ target: narrator.controls.narrates });
+                await tick();
+
+                assert.strictEqual(narrator.controls.narrates.checked, true);
+                assert.ok(
+                    context.__toasts.some((entry) => entry.message.includes('Enable narration on another character before disabling the narrator.') && entry.level === 'warning'),
+                    'expected warning toast'
+                );
             })().catch((error) => {
                 console.error(error);
                 process.exit(1);

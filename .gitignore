@@ -94,3 +94,7 @@ chunks.queue.log
 chunks.sqlite3
 chunks.sqlite3-shm
 chunks.sqlite3-wal
+data/state_store.db/mem%3Ahealth.bin
+data/state_store.db/mem%3Aindex%3Abm25.bin
+package-lock.json
+package.json

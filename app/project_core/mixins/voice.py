@@ -536,6 +536,182 @@ class ProjectVoiceMixin:
             state["narrator_overrides"] = overrides
             self._save_state(state)
 
+        @staticmethod
+        def _count_name_mentions_in_text(text, name):
+            chapter_text = str(text or "")
+            candidate = str(name or "").strip()
+            if not chapter_text or not candidate:
+                return 0
+            try:
+                return len(re.findall(re.escape(candidate), chapter_text, flags=re.IGNORECASE))
+            except re.error:
+                return 0
+
+        def rank_chapter_narration_candidates(self, chapter, voice_names, *, include_narrator=True):
+            normalized_chapter = str(chapter or "").strip()
+            if not normalized_chapter:
+                return []
+
+            narrator_name = None
+            normalized_names = []
+            seen = set()
+            for raw_name in (voice_names or []):
+                name = str(raw_name or "").strip()
+                if not name:
+                    continue
+                normalized = self._normalize_speaker_name(name)
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                if normalized == self._normalize_speaker_name("NARRATOR"):
+                    narrator_name = name
+                    if not include_narrator:
+                        continue
+                if not include_narrator and normalized == self._normalize_speaker_name("NARRATOR"):
+                    continue
+                normalized_names.append(name)
+
+            if not normalized_names:
+                return []
+
+            chapter_text = " ".join(
+                str((chunk or {}).get("text") or "")
+                for chunk in self.load_chunks(chapter=normalized_chapter)
+                if str((chunk or {}).get("text") or "").strip()
+            )
+
+            ranked = sorted(
+                [
+                    name for name in normalized_names
+                    if self._normalize_speaker_name(name) != self._normalize_speaker_name("NARRATOR")
+                ],
+                key=lambda voice_name: (
+                    -self._count_name_mentions_in_text(chapter_text, voice_name),
+                    voice_name.casefold(),
+                ),
+            )
+            if include_narrator and narrator_name:
+                return [narrator_name, *ranked]
+            return ranked
+
+        def disable_narrator_narration_and_reassign_chapters(self, draft_config=None):
+            narrator_key = self._normalize_speaker_name("NARRATOR")
+            print("[VOICE] Attempting narrator disable and chapter reassignment")
+
+            persisted_config = copy.deepcopy(self._load_voice_config() or {})
+            effective_config = copy.deepcopy(persisted_config)
+
+            for speaker_name, draft_profile in dict(draft_config or {}).items():
+                normalized_name = self._normalize_speaker_name(speaker_name)
+                if not normalized_name:
+                    continue
+                canonical_name = speaker_name
+                for existing_name in effective_config.keys():
+                    if self._normalize_speaker_name(existing_name) == normalized_name:
+                        canonical_name = existing_name
+                        break
+                profile = dict(effective_config.get(canonical_name) or {})
+                if (draft_profile or {}).get("narrates") is not None:
+                    profile["narrates"] = bool((draft_profile or {}).get("narrates"))
+                effective_config[canonical_name] = profile
+
+            narrator_name = None
+            for existing_name in effective_config.keys():
+                if self._normalize_speaker_name(existing_name) == narrator_key:
+                    narrator_name = existing_name
+                    break
+            narrator_name = narrator_name or "NARRATOR"
+            narrator_profile = dict(effective_config.get(narrator_name) or {})
+            narrator_profile["narrates"] = False
+            effective_config[narrator_name] = narrator_profile
+
+            eligible_narrators = sorted(
+                [
+                    speaker_name
+                    for speaker_name, profile in effective_config.items()
+                    if self._normalize_speaker_name(speaker_name) != narrator_key and bool((profile or {}).get("narrates"))
+                ],
+                key=lambda value: value.casefold(),
+            )
+            if not eligible_narrators:
+                print("[VOICE] Narrator disable rejected: no alternate narrators are enabled")
+                return {
+                    "status": "rejected",
+                    "code": "narrator_disable_requires_other_narrator",
+                    "message": "Enable narration on another character before disabling the narrator.",
+                }
+
+            chapter_order = []
+            seen_chapters = set()
+            chunks = self.load_chunks()
+            for chunk in chunks:
+                chapter = str((chunk or {}).get("chapter") or "").strip()
+                if not chapter:
+                    continue
+                if chapter not in seen_chapters:
+                    seen_chapters.add(chapter)
+                    chapter_order.append(chapter)
+
+            overrides = dict(self.get_narrator_overrides() or {})
+            chapter_assignments = {}
+            for chapter in chapter_order:
+                current_narrator = str(overrides.get(chapter) or "NARRATOR").strip() or "NARRATOR"
+                if self._normalize_speaker_name(current_narrator) != narrator_key:
+                    continue
+                ranked = self.rank_chapter_narration_candidates(
+                    chapter,
+                    eligible_narrators,
+                    include_narrator=False,
+                )
+                if ranked:
+                    chapter_assignments[chapter] = ranked[0]
+
+            self._save_voice_config(effective_config)
+            for chapter, voice_name in chapter_assignments.items():
+                self.set_narrator_override(chapter, voice_name)
+
+            files_to_delete = set()
+            invalidated_clips = 0
+            for chunk in chunks:
+                chapter = str((chunk or {}).get("chapter") or "").strip()
+                if chapter not in chapter_assignments:
+                    continue
+                if self._normalize_speaker_name((chunk or {}).get("speaker") or "") != narrator_key:
+                    continue
+                audio_path = str((chunk or {}).get("audio_path") or "").strip()
+                if not audio_path:
+                    continue
+                if self.prepare_chunk_for_regeneration_by_uid((chunk or {}).get("uid")) is None:
+                    continue
+                invalidated_clips += 1
+                files_to_delete.add(audio_path)
+
+            deleted_files = 0
+            root_abs = os.path.abspath(self.root_dir)
+            for relative_path in files_to_delete:
+                full_path = os.path.abspath(os.path.join(self.root_dir, relative_path))
+                if not (full_path == root_abs or full_path.startswith(root_abs + os.sep)):
+                    continue
+                if not os.path.exists(full_path):
+                    continue
+                try:
+                    os.remove(full_path)
+                    deleted_files += 1
+                except OSError:
+                    pass
+
+            print(
+                f"[VOICE] Narrator disabled; reassigned {len(chapter_assignments)} chapter narrator(s), "
+                f"invalidated {invalidated_clips} clip(s), deleted {deleted_files} file(s)"
+            )
+            return {
+                "status": "saved",
+                "changed_chapters": len(chapter_assignments),
+                "invalidated_clips": invalidated_clips,
+                "deleted_files": deleted_files,
+                "chapter_assignments": chapter_assignments,
+            }
+
         def ensure_chapter_narrator_voice_can_narrate(self, chapter):
             """Persist chapter narrator overrides back into voice state.
 

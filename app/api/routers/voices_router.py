@@ -20,6 +20,10 @@ class VoiceProfileBatchRequest(BaseModel):
     confirm_invalidation: bool = False
 
 
+class DisableNarratorNarrationRequest(BaseModel):
+    config: Dict[str, VoiceConfigItem]
+
+
 def _normalized_speaker(name: str) -> str:
     return project_manager._normalize_speaker_name(name)
 
@@ -416,6 +420,15 @@ async def patch_voice_profile(speaker: str, request: VoiceProfilePatchRequest):
             confirm_invalidation=bool(request.confirm_invalidation),
         )
     )
+
+
+@router.post("/api/voices/narrator/disable")
+async def disable_narrator_narration(request: DisableNarratorNarrationRequest):
+    effective_config = _merge_voice_config_patch(request.config)
+    result = project_manager.disable_narrator_narration_and_reassign_chapters(effective_config)
+    if result.get("status") == "rejected":
+        raise HTTPException(status_code=400, detail=result)
+    return result
 
 
 def _load_runtime_config() -> Dict[str, dict]:

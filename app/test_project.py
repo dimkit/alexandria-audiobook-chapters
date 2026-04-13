@@ -784,6 +784,236 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
         self.assertTrue(refreshed["Alice"]["narrates"])
         self.assertEqual(self.manager.get_narrator_overrides().get("Chapter 1"), "Alice")
 
+    def test_disable_narrator_narration_rejects_without_alternate_narrator(self):
+        self.manager._save_voice_config({
+            "NARRATOR": {"type": "builtin", "voice": "NarratorVoice", "narrates": True},
+            "Alice": {"type": "builtin", "voice": "AliceVoice", "narrates": False},
+        })
+        self.manager.set_narrator_override("Chapter 1", "NARRATOR")
+
+        result = self.manager.disable_narrator_narration_and_reassign_chapters({
+            "NARRATOR": {"narrates": False},
+            "Alice": {"narrates": False},
+        })
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["code"], "narrator_disable_requires_other_narrator")
+        refreshed = self.manager._load_voice_config()
+        self.assertTrue(refreshed["NARRATOR"]["narrates"])
+        self.assertNotIn("Chapter 1", self.manager.get_narrator_overrides())
+
+    def test_disable_narrator_narration_reassigns_effective_narrator_chapters_and_invalidates_audio(self):
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "ch1-narrator",
+                "speaker": "NARRATOR",
+                "text": "Narrator audio in chapter one.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "done",
+                "audio_path": "voicelines/ch1-narrator.wav",
+                "audio_validation": {"is_valid": True},
+            },
+            {
+                "id": 1,
+                "uid": "ch1-alice",
+                "speaker": "Alice",
+                "text": "Alice appears twice in chapter one.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 2,
+                "uid": "ch1-alice-2",
+                "speaker": "Alice",
+                "text": "Alice appears twice in chapter one again.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 3,
+                "uid": "ch1-blake",
+                "speaker": "Blake",
+                "text": "Blake appears once in chapter one.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 4,
+                "uid": "ch2-narrator",
+                "speaker": "NARRATOR",
+                "text": "Narrator audio in chapter two.",
+                "chapter": "Chapter 2",
+                "instruct": "",
+                "status": "done",
+                "audio_path": "voicelines/ch2-narrator.wav",
+                "audio_validation": {"is_valid": True},
+            },
+            {
+                "id": 5,
+                "uid": "ch2-blake",
+                "speaker": "Blake",
+                "text": "Blake appears twice in chapter two.",
+                "chapter": "Chapter 2",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 6,
+                "uid": "ch2-blake-2",
+                "speaker": "Blake",
+                "text": "Blake appears twice in chapter two again.",
+                "chapter": "Chapter 2",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 7,
+                "uid": "ch2-alice",
+                "speaker": "Alice",
+                "text": "Alice appears once in chapter two.",
+                "chapter": "Chapter 2",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 8,
+                "uid": "ch3-narrator",
+                "speaker": "NARRATOR",
+                "text": "Narrator only audio in chapter three.",
+                "chapter": "Chapter 3",
+                "instruct": "",
+                "status": "done",
+                "audio_path": "voicelines/ch3-narrator.wav",
+                "audio_validation": {"is_valid": True},
+            },
+        ])
+        self._write_wav("voicelines/ch1-narrator.wav", duration_seconds=2.0)
+        self._write_wav("voicelines/ch2-narrator.wav", duration_seconds=2.0)
+        self._write_wav("voicelines/ch3-narrator.wav", duration_seconds=2.0)
+        self.manager._save_voice_config({
+            "NARRATOR": {"type": "builtin", "voice": "NarratorVoice", "narrates": True},
+            "Alice": {"type": "builtin", "voice": "AliceVoice", "narrates": True},
+            "Blake": {"type": "builtin", "voice": "BlakeVoice", "narrates": True},
+        })
+        self.manager.set_narrator_override("Chapter 2", "NARRATOR")
+        self.manager.set_narrator_override("Chapter 4", "Alice")
+
+        result = self.manager.disable_narrator_narration_and_reassign_chapters({
+            "NARRATOR": {"narrates": False},
+            "Alice": {"narrates": True},
+            "Blake": {"narrates": True},
+        })
+
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(result["changed_chapters"], 3)
+        self.assertEqual(result["invalidated_clips"], 3)
+        self.assertEqual(result["deleted_files"], 3)
+        self.assertEqual(result["chapter_assignments"]["Chapter 1"], "Alice")
+        self.assertEqual(result["chapter_assignments"]["Chapter 2"], "Blake")
+        self.assertEqual(result["chapter_assignments"]["Chapter 3"], "Alice")
+        self.assertEqual(self.manager.get_narrator_overrides()["Chapter 1"], "Alice")
+        self.assertEqual(self.manager.get_narrator_overrides()["Chapter 2"], "Blake")
+        self.assertEqual(self.manager.get_narrator_overrides()["Chapter 3"], "Alice")
+        self.assertEqual(self.manager.get_narrator_overrides()["Chapter 4"], "Alice")
+
+        refreshed = self.manager._load_voice_config()
+        self.assertFalse(refreshed["NARRATOR"]["narrates"])
+        self.assertTrue(refreshed["Alice"]["narrates"])
+        self.assertTrue(refreshed["Blake"]["narrates"])
+
+        chunks = {chunk["uid"]: chunk for chunk in self.manager.load_chunks()}
+        self.assertEqual(chunks["ch1-narrator"]["status"], "pending")
+        self.assertIsNone(chunks["ch1-narrator"]["audio_path"])
+        self.assertEqual(chunks["ch2-narrator"]["status"], "pending")
+        self.assertIsNone(chunks["ch2-narrator"]["audio_path"])
+        self.assertEqual(chunks["ch3-narrator"]["status"], "pending")
+        self.assertIsNone(chunks["ch3-narrator"]["audio_path"])
+        self.assertFalse(os.path.exists(os.path.join(self.root_dir, "voicelines/ch1-narrator.wav")))
+        self.assertFalse(os.path.exists(os.path.join(self.root_dir, "voicelines/ch2-narrator.wav")))
+        self.assertFalse(os.path.exists(os.path.join(self.root_dir, "voicelines/ch3-narrator.wav")))
+
+    def test_rank_chapter_narration_candidates_matches_editor_mention_sorting(self):
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "chapter-6-narrator",
+                "speaker": "NARRATOR",
+                "text": "Ryan looks over. Blake answers. Blake waits beside Ryan while Blake nods.",
+                "chapter": "Chapter 6",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 1,
+                "uid": "chapter-6-ryan",
+                "speaker": "Ryan",
+                "text": "Ryan speaks only once as a chunk speaker.",
+                "chapter": "Chapter 6",
+                "instruct": "",
+                "status": "pending",
+            },
+        ])
+
+        ranked = self.manager.rank_chapter_narration_candidates("Chapter 6", ["NARRATOR", "Ryan", "Blake"])
+
+        self.assertEqual(ranked, ["NARRATOR", "Blake", "Ryan"])
+
+    def test_rank_chapter_narration_candidates_excludes_narrator_when_disabled(self):
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "chapter-6-narrator",
+                "speaker": "NARRATOR",
+                "text": "Ryan looks over. Blake answers. Blake waits beside Ryan while Blake nods.",
+                "chapter": "Chapter 6",
+                "instruct": "",
+                "status": "pending",
+            },
+        ])
+
+        ranked = self.manager.rank_chapter_narration_candidates(
+            "Chapter 6",
+            ["Blake", "Ryan"],
+            include_narrator=False,
+        )
+
+        self.assertEqual(ranked, ["Blake", "Ryan"])
+
+    def test_get_chapter_list_includes_non_default_narrator_label_only(self):
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "chapter-1-narrator",
+                "speaker": "NARRATOR",
+                "text": "Opening narration line.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+            },
+            {
+                "id": 1,
+                "uid": "chapter-2-narrator",
+                "speaker": "NARRATOR",
+                "text": "Second chapter narration line.",
+                "chapter": "Chapter 2",
+                "instruct": "",
+                "status": "pending",
+            },
+        ])
+        self.manager.set_narrator_override("Chapter 1", "Alice")
+
+        chapters = self.manager.get_chapter_list()
+
+        self.assertEqual(chapters[0]["chapter"], "Chapter 1")
+        self.assertEqual(chapters[0]["narrator_label"], "Alice")
+        self.assertEqual(chapters[1]["chapter"], "Chapter 2")
+        self.assertEqual(chapters[1]["narrator_label"], "")
+
     def test_generate_chunks_batch_uses_stored_auto_narrator_aliases(self):
         self.manager.set_narrator_threshold(10)
         self.manager.set_narrator_override("Chapter 1", "Alice")

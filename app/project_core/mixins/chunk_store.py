@@ -176,7 +176,20 @@ class ProjectChunkStoreMixin:
             return self.script_store.get_chapter_chunks(chapter)
 
         def get_chapter_list(self):
-            return self.script_store.get_chapter_list()
+            chapters = list(self.script_store.get_chapter_list() or [])
+            overrides = dict(self.get_narrator_overrides() or {})
+            narrator_key = self._normalize_speaker_name("NARRATOR")
+            enriched = []
+            for chapter in chapters:
+                entry = dict(chapter or {})
+                chapter_name = str(entry.get("chapter") or "").strip()
+                override = str(overrides.get(chapter_name) or "").strip()
+                if override and self._normalize_speaker_name(override) != narrator_key:
+                    entry["narrator_label"] = override
+                else:
+                    entry["narrator_label"] = ""
+                enriched.append(entry)
+            return enriched
 
         def resolve_generation_targets(self, scope_mode="project", chapter=None, pending_only=True):
             return self.script_store.resolve_generation_targets(
