@@ -86,3 +86,41 @@ class ScriptProviderTests(unittest.TestCase):
             self.assertEqual(summary["chunk_count"], 1)
         finally:
             manager.shutdown_script_store(flush=True)
+
+    def test_resolve_generation_targets_includes_error_rows_when_pending_only(self):
+        root = self._make_root()
+        with open(os.path.join(root, "annotated_script.json"), "w", encoding="utf-8") as f:
+            json.dump({"entries": [], "dictionary": []}, f)
+
+        manager = ProjectManager(root)
+        try:
+            manager.save_chunks(
+                [
+                    {
+                        "id": 0,
+                        "uid": "pending-1",
+                        "speaker": "Narrator",
+                        "text": "Pending row.",
+                        "status": "pending",
+                    },
+                    {
+                        "id": 1,
+                        "uid": "error-1",
+                        "speaker": "Narrator",
+                        "text": "Errored row should still be retried.",
+                        "status": "error",
+                    },
+                    {
+                        "id": 2,
+                        "uid": "done-1",
+                        "speaker": "Narrator",
+                        "text": "Completed row.",
+                        "status": "done",
+                    },
+                ]
+            )
+
+            targets = manager.resolve_generation_targets(scope_mode="project", pending_only=True)
+            self.assertEqual([chunk["uid"] for chunk in targets], ["pending-1", "error-1"])
+        finally:
+            manager.shutdown_script_store(flush=True)

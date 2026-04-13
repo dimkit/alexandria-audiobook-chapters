@@ -238,6 +238,22 @@ def _save_runtime_voice_config(config: Dict[str, dict]):
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
+def _voice_config_is_blank_for_reuse(config: Dict[str, object] | None) -> bool:
+    cfg = dict(config or {})
+    if str(cfg.get("alias") or "").strip():
+        return False
+    meaningful_fields = (
+        cfg.get("ref_audio"),
+        cfg.get("ref_text"),
+        cfg.get("generated_ref_text"),
+        cfg.get("description"),
+        cfg.get("adapter_id"),
+        cfg.get("adapter_path"),
+        cfg.get("voice") if str(cfg.get("type") or "").strip() not in {"", "design"} else "",
+    )
+    return not any(str(value or "").strip() for value in meaningful_fields)
+
+
 @router.get("/api/voices")
 async def get_voices():
     chunks = project_manager.load_chunks() if _can_use_project_chunk_store() else []
@@ -268,6 +284,32 @@ async def get_voices():
 
     if not voice_rows:
         return []
+
+    updated_runtime_voice_config = _canonicalize_voice_config_keys(runtime_voice_config)
+    runtime_config_changed = False
+    for voice in voice_rows:
+        voice_name = str((voice or {}).get("name") or "").strip()
+        if not voice_name:
+            continue
+        config = dict((voice or {}).get("config") or {})
+        if not _voice_config_is_blank_for_reuse(config):
+            continue
+        reusable_match = _find_saved_voice_option_for_speaker(voice_name)
+        if not reusable_match:
+            continue
+        config.update({
+            "type": reusable_match.get("type") or "clone",
+            "ref_audio": reusable_match.get("ref_audio") or config.get("ref_audio"),
+            "ref_text": reusable_match.get("ref_text") or config.get("ref_text"),
+            "generated_ref_text": reusable_match.get("generated_ref_text") or config.get("generated_ref_text"),
+            "description": reusable_match.get("description") or config.get("description"),
+        })
+        voice["config"] = config
+        updated_runtime_voice_config[voice_name] = config
+        runtime_config_changed = True
+
+    if runtime_config_changed:
+        _save_runtime_voice_config(updated_runtime_voice_config)
 
     # Count paragraphs per speaker from paragraphs.json (new pipeline only)
     para_counts_by_norm: dict[str, int] = {}
@@ -572,6 +614,10 @@ def run_voice_processing_task(run_id: str, stop_check=None, relay_fn=None):
                 entry["ref_audio"] = reusable_match["ref_audio"]
                 if reusable_match.get("ref_text") and not (entry.get("ref_text") or "").strip():
                     entry["ref_text"] = reusable_match["ref_text"]
+                if reusable_match.get("generated_ref_text") and not (entry.get("generated_ref_text") or "").strip():
+                    entry["generated_ref_text"] = reusable_match["generated_ref_text"]
+                if reusable_match.get("description") and not (entry.get("description") or "").strip():
+                    entry["description"] = reusable_match["description"]
                 changed = True
                 log(
                     f"Auto-populated {speaker} from saved voice '{reusable_match.get('source_name') or reusable_match['ref_audio']}'."

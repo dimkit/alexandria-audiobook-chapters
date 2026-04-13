@@ -100,13 +100,17 @@ async def reset_project():
         except ValueError:
             pass
 
-    files_to_remove = [
+    paths_to_report = [
         state_path,
         SCRIPT_PATH,
         VOICES_PATH,
         VOICE_CONFIG_PATH,
         CHUNKS_PATH,
-        project_manager.transcription_cache_path,
+        os.path.join(ROOT_DIR, "chunks.sqlite3"),
+        os.path.join(ROOT_DIR, "chunks.sqlite3-wal"),
+        os.path.join(ROOT_DIR, "chunks.sqlite3-shm"),
+        os.path.join(ROOT_DIR, "chunks.queue.log"),
+        os.path.join(ROOT_DIR, "transcription_cache.json"),
         SCRIPT_REPAIR_TRACE_PATH,
         AUDIOBOOK_PATH,
         M4B_PATH,
@@ -119,27 +123,14 @@ async def reset_project():
         os.path.join(ROOT_DIR, "m4b_cover.jpg"),
     ]
 
-    for path in files_to_remove:
+    for path in paths_to_report:
         if os.path.exists(path):
-            os.remove(path)
             removed.append(os.path.basename(path))
+    for dirname in (VOICELINES_DIR, UPLOADS_DIR, CLONE_VOICES_DIR, DESIGNED_VOICES_DIR):
+        if os.path.isdir(dirname) and os.listdir(dirname):
+            removed.append(f"{os.path.basename(dirname)}/*")
 
-    if os.path.isdir(VOICELINES_DIR):
-        for entry in os.listdir(VOICELINES_DIR):
-            entry_path = os.path.join(VOICELINES_DIR, entry)
-            if os.path.isdir(entry_path):
-                shutil.rmtree(entry_path)
-            else:
-                os.remove(entry_path)
-    os.makedirs(VOICELINES_DIR, exist_ok=True)
-
-    if os.path.isdir(UPLOADS_DIR):
-        for entry in os.listdir(UPLOADS_DIR):
-            entry_path = os.path.join(UPLOADS_DIR, entry)
-            if os.path.isdir(entry_path):
-                shutil.rmtree(entry_path)
-            else:
-                os.remove(entry_path)
+    _clear_project_derived_state(preserve_input_file=False)
 
     with audio_queue_condition:
         audio_queue.clear()
@@ -155,6 +146,7 @@ async def reset_project():
         process_state["audio"]["merge_running"] = False
         process_state["audio"]["metrics"] = _new_audio_metrics()
         process_state["audio"]["heartbeat"] = _new_audio_heartbeat_state()
+        _refresh_audio_process_state_locked(persist=False)
 
     with project_manager._transcription_cache_lock:
         project_manager._transcription_cache = None
@@ -175,9 +167,10 @@ async def reset_project():
         _persist_new_mode_workflow_state_locked()
 
     project_manager.engine = None
+    project_manager.asr_engine = None
 
     logger.info("Project state reset")
-    return {"status": "reset", "removed": removed}
+    return {"status": "reset", "removed": sorted(set(removed))}
 
 @router.post("/api/assign_dialogue")
 async def start_assign_dialogue(background_tasks: BackgroundTasks):

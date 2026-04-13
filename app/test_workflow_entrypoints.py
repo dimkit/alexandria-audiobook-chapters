@@ -1,6 +1,7 @@
 import copy
 import importlib.util
 import os
+import sqlite3
 import tempfile
 import unittest
 import asyncio
@@ -233,6 +234,147 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
             self.assertFalse(result["preserved_voices"])
             self.assertFalse(os.path.exists(voice_config_path))
             self.assertEqual(os.listdir(voicelines_dir), [])
+
+    def test_reset_project_clears_db_runtime_artifacts_and_reinitializes_store(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            voicelines_dir = os.path.join(temp_root, "voicelines")
+            uploads_dir = os.path.join(temp_root, "uploads")
+            clone_dir = os.path.join(temp_root, "clone_voices")
+            designed_dir = os.path.join(temp_root, "designed_voices")
+            os.makedirs(voicelines_dir, exist_ok=True)
+            os.makedirs(uploads_dir, exist_ok=True)
+            os.makedirs(clone_dir, exist_ok=True)
+            os.makedirs(designed_dir, exist_ok=True)
+
+            state_path = os.path.join(temp_root, "state.json")
+            chunks_db_path = os.path.join(temp_root, "chunks.sqlite3")
+            queue_log_path = os.path.join(temp_root, "chunks.queue.log")
+            transcription_cache_path = os.path.join(temp_root, "transcription_cache.json")
+            for path, payload in (
+                (state_path, {"input_file_path": os.path.join(uploads_dir, "story.txt"), "loaded_script_name": "demo"}),
+                (os.path.join(temp_root, "annotated_script.json"), {"entries": [], "dictionary": []}),
+                (os.path.join(temp_root, "voice_config.json"), {"Narrator": {}}),
+                (os.path.join(temp_root, "paragraphs.json"), {"paragraphs": []}),
+                (transcription_cache_path, {"entries": []}),
+                (os.path.join(temp_root, "audio_queue_state.json"), {"queue": []}),
+                (os.path.join(temp_root, "processing_workflow_state.json"), {"running": True}),
+                (os.path.join(temp_root, "new_mode_workflow_state.json"), {"running": True}),
+            ):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f)
+
+            with open(os.path.join(uploads_dir, "story.txt"), "w", encoding="utf-8") as f:
+                f.write("source")
+            with open(os.path.join(voicelines_dir, "clip.wav"), "w", encoding="utf-8") as f:
+                f.write("audio")
+            with open(os.path.join(clone_dir, "voice.wav"), "w", encoding="utf-8") as f:
+                f.write("audio")
+            with open(os.path.join(designed_dir, "voice.wav"), "w", encoding="utf-8") as f:
+                f.write("audio")
+            with open(queue_log_path, "w", encoding="utf-8") as f:
+                f.write("queued")
+            with sqlite3.connect(chunks_db_path) as conn:
+                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+                conn.execute("INSERT INTO t(value) VALUES ('ok')")
+                conn.commit()
+            with open(f"{chunks_db_path}-wal", "w", encoding="utf-8") as f:
+                f.write("wal")
+            with open(f"{chunks_db_path}-shm", "w", encoding="utf-8") as f:
+                f.write("shm")
+
+            original_root = app_module.ROOT_DIR
+            original_script = app_module.SCRIPT_PATH
+            original_voice = app_module.VOICE_CONFIG_PATH
+            original_chunks = app_module.CHUNKS_PATH
+            original_voicelines = app_module.VOICELINES_DIR
+            original_uploads = app_module.UPLOADS_DIR
+            original_clone = app_module.CLONE_VOICES_DIR
+            original_designed = app_module.DESIGNED_VOICES_DIR
+            original_processing_path = app_module.PROCESSING_WORKFLOW_STATE_PATH
+            original_new_mode_path = app_module.NEW_MODE_WORKFLOW_STATE_PATH
+            original_audio_queue_path = app_module.AUDIO_QUEUE_STATE_PATH
+            original_manager = app_module.project_manager
+            original_audio_state = copy.deepcopy(app_module.process_state["audio"])
+            try:
+                class ResetStubManager:
+                    def __init__(self, root_dir):
+                        self.root_dir = root_dir
+                        self.chunks_db_path = os.path.join(root_dir, "chunks.sqlite3")
+                        self.chunks_queue_log_path = os.path.join(root_dir, "chunks.queue.log")
+                        self.transcription_cache_path = os.path.join(root_dir, "transcription_cache.json")
+                        self._transcription_cache_lock = app_module.threading.Lock()
+                        self._transcription_cache = {"stale": True}
+                        self.engine = object()
+                        self.asr_engine = object()
+                        self.reload_calls = 0
+
+                    def reload_script_store(self):
+                        self.reload_calls += 1
+                        with open(self.chunks_queue_log_path, "w", encoding="utf-8"):
+                            pass
+                        with sqlite3.connect(self.chunks_db_path) as conn:
+                            conn.execute("CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY)")
+                            conn.commit()
+
+                stub_manager = ResetStubManager(temp_root)
+
+                app_module.ROOT_DIR = temp_root
+                app_module.SCRIPT_PATH = os.path.join(temp_root, "annotated_script.json")
+                app_module.VOICE_CONFIG_PATH = os.path.join(temp_root, "voice_config.json")
+                app_module.CHUNKS_PATH = os.path.join(temp_root, "chunks.json")
+                app_module.VOICELINES_DIR = voicelines_dir
+                app_module.UPLOADS_DIR = uploads_dir
+                app_module.CLONE_VOICES_DIR = clone_dir
+                app_module.DESIGNED_VOICES_DIR = designed_dir
+                app_module.PROCESSING_WORKFLOW_STATE_PATH = os.path.join(temp_root, "processing_workflow_state.json")
+                app_module.NEW_MODE_WORKFLOW_STATE_PATH = os.path.join(temp_root, "new_mode_workflow_state.json")
+                app_module.AUDIO_QUEUE_STATE_PATH = os.path.join(temp_root, "audio_queue_state.json")
+                app_module.project_manager = stub_manager
+
+                app_module.process_state["audio"]["running"] = True
+                app_module.process_state["audio"]["queue"] = [{"uid": "a"}]
+                app_module.process_state["audio"]["current_job"] = {"uid": "a"}
+                app_module.process_state["audio"]["recent_jobs"] = [{"uid": "a"}]
+                app_module.process_state["audio"]["logs"] = ["busy"]
+
+                result = asyncio.run(app_module.reset_project())
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.SCRIPT_PATH = original_script
+                app_module.VOICE_CONFIG_PATH = original_voice
+                app_module.CHUNKS_PATH = original_chunks
+                app_module.VOICELINES_DIR = original_voicelines
+                app_module.UPLOADS_DIR = original_uploads
+                app_module.CLONE_VOICES_DIR = original_clone
+                app_module.DESIGNED_VOICES_DIR = original_designed
+                app_module.PROCESSING_WORKFLOW_STATE_PATH = original_processing_path
+                app_module.NEW_MODE_WORKFLOW_STATE_PATH = original_new_mode_path
+                app_module.AUDIO_QUEUE_STATE_PATH = original_audio_queue_path
+                app_module.project_manager = original_manager
+                app_module.process_state["audio"].clear()
+                app_module.process_state["audio"].update(original_audio_state)
+
+            self.assertEqual(result["status"], "reset")
+            self.assertTrue(os.path.exists(chunks_db_path))
+            self.assertTrue(os.path.exists(queue_log_path))
+            self.assertFalse(os.path.exists(f"{chunks_db_path}-wal"))
+            self.assertFalse(os.path.exists(f"{chunks_db_path}-shm"))
+            self.assertFalse(os.path.exists(os.path.join(temp_root, "annotated_script.json")))
+            self.assertFalse(os.path.exists(os.path.join(temp_root, "voice_config.json")))
+            self.assertEqual(os.listdir(voicelines_dir), [])
+            self.assertEqual(os.listdir(uploads_dir), [])
+            self.assertEqual(os.listdir(clone_dir), [])
+            self.assertEqual(os.listdir(designed_dir), [])
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            self.assertEqual(state, {"render_prep_complete": False})
+            self.assertFalse(app_module.process_state["audio"]["running"])
+            self.assertEqual(app_module.process_state["audio"]["queue"], [])
+            self.assertIsNone(app_module.process_state["audio"]["current_job"])
+            self.assertEqual(stub_manager.reload_calls, 1)
+            self.assertIsNone(stub_manager._transcription_cache)
+            self.assertIsNone(stub_manager.engine)
+            self.assertIsNone(stub_manager.asr_engine)
 
     def test_script_info_reports_voice_state_without_script_file(self):
         with tempfile.TemporaryDirectory() as temp_root:

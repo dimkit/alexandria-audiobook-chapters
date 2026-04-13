@@ -24,6 +24,7 @@ import aiofiles
 import uuid
 import urllib.request
 import urllib.error
+import sqlite3
 from openai import OpenAI
 from chunk_events import chunk_event_broker
 
@@ -84,7 +85,7 @@ DATASET_BUILDER_DIR = os.path.join(ROOT_DIR, "dataset_builder")
 DESIGNED_VOICES_MANIFEST = os.path.join(DESIGNED_VOICES_DIR, "manifest.json")
 CLONE_VOICES_MANIFEST = os.path.join(CLONE_VOICES_DIR, "manifest.json")
 ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg"}
-PROJECT_ARCHIVE_VERSION = 2
+PROJECT_ARCHIVE_VERSION = 3
 PROJECT_ARCHIVE_MANIFEST_NAME = "project_archive_manifest.json"
 PROJECT_ARCHIVE_ALLOWED_FILES = {
     "annotated_script.json",
@@ -92,6 +93,7 @@ PROJECT_ARCHIVE_ALLOWED_FILES = {
     "voice_config.json",
     "voices.json",
     "chunks.json",
+    "chunks.sqlite3",
     "script_sanity_check.json",
     "state.json",
     "transcription_cache.json",
@@ -262,64 +264,156 @@ def _normalize_saved_voice_name(name: str) -> str:
     return project_manager._normalize_speaker_name(name)
 
 
+def _current_loaded_project_name() -> str:
+    state_path = os.path.join(ROOT_DIR, "state.json")
+    if not os.path.exists(state_path):
+        return ""
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return ""
+    return str(state.get("loaded_project_name") or "").strip()
+
+
+def _match_project_prefixed_saved_voice_name(candidate: str, project_name: str, speaker_name: str) -> bool:
+    raw_candidate = str(candidate or "").strip()
+    raw_project = str(project_name or "").strip()
+    raw_speaker = str(speaker_name or "").strip()
+    if not raw_candidate or not raw_project or not raw_speaker:
+        return False
+    normalized_project = _normalize_saved_voice_name(raw_project)
+    normalized_speaker = _normalize_saved_voice_name(raw_speaker)
+    if not normalized_project or not normalized_speaker:
+        return False
+    normalized_candidate = _normalize_saved_voice_name(raw_candidate)
+    for separator in (".", "_", " "):
+        prefix = f"{normalized_project}{separator}"
+        if normalized_candidate.startswith(prefix):
+            suffix = normalized_candidate[len(prefix):]
+            return suffix == normalized_speaker
+    return False
+
+
 def _find_saved_voice_option_for_speaker(speaker: str):
     normalized_speaker = _normalize_saved_voice_name(speaker)
     if not normalized_speaker or normalized_speaker == _normalize_saved_voice_name("NARRATOR"):
         return None
-    current_script_title = _normalize_saved_voice_name(project_manager._current_script_title() or "Project")
+    current_script_title_fn = getattr(project_manager, "_current_script_title", None)
+    current_script_title = _normalize_saved_voice_name(
+        current_script_title_fn() if callable(current_script_title_fn) else "Project"
+    )
+    current_project_name = _normalize_saved_voice_name(_current_loaded_project_name())
 
     def _build_rel_audio(directory_name: str, entry: dict) -> str:
         filename = (entry.get("filename") or "").strip()
         return f"{directory_name}/{filename}" if filename else ""
 
-    def _match_score(entry: dict, fields):
+    def _match_score(entry: dict, fields, *, allow_filename_fallback: bool, allow_project_prefixed_exact_match: bool, project_name: str):
         for priority, field in enumerate(fields):
-            candidate = _normalize_saved_voice_name(entry.get(field, ""))
+            raw_candidate = entry.get(field, "")
+            candidate = _normalize_saved_voice_name(raw_candidate)
             if candidate and candidate == normalized_speaker:
                 return priority
+            if allow_project_prefixed_exact_match and _match_project_prefixed_saved_voice_name(raw_candidate, project_name, speaker):
+                return priority
+        if allow_filename_fallback:
+            filename = os.path.splitext(str(entry.get("filename") or "").strip())[0]
+            if filename:
+                filename_parts = [part for part in re.split(r"[._-]+", filename) if part]
+                if filename_parts:
+                    trailing = _normalize_saved_voice_name(filename_parts[-1])
+                    if trailing and trailing == normalized_speaker:
+                        return len(fields)
+        if allow_project_prefixed_exact_match:
+            filename = os.path.splitext(str(entry.get("filename") or "").strip())[0]
+            if _match_project_prefixed_saved_voice_name(filename, project_name, speaker):
+                return len(fields)
         return None
+
+    title_candidates = [current_script_title]
+    if current_project_name and current_project_name not in title_candidates:
+        title_candidates.append(current_project_name)
 
     best = None
 
-    for entry in _load_manifest(CLONE_VOICES_MANIFEST):
-        rel_audio = _build_rel_audio("clone_voices", entry)
-        if not rel_audio or not os.path.exists(os.path.join(ROOT_DIR, rel_audio)):
-            continue
-        entry_script_title = _normalize_saved_voice_name(entry.get("script_title", ""))
-        if not entry_script_title or entry_script_title != current_script_title:
-            continue
-        score = _match_score(entry, ("speaker", "name"))
-        if score is None:
-            continue
-        candidate = {
-            "type": "clone",
-            "ref_audio": rel_audio,
-            "ref_text": (entry.get("sample_text") or "").strip(),
-            "source_name": (entry.get("speaker") or entry.get("name") or "").strip(),
-            "priority": (0, score),
-        }
-        if best is None or candidate["priority"] < best["priority"]:
-            best = candidate
+    for title_priority, candidate_title in enumerate(title_candidates):
+        allow_filename_fallback = title_priority == 0
+        allow_project_prefixed_exact_match = bool(current_project_name) and title_priority > 0
 
-    for entry in _load_manifest(DESIGNED_VOICES_MANIFEST):
-        rel_audio = _build_rel_audio("designed_voices", entry)
-        if not rel_audio or not os.path.exists(os.path.join(ROOT_DIR, rel_audio)):
-            continue
-        entry_script_title = _normalize_saved_voice_name(entry.get("script_title", ""))
-        if not entry_script_title or entry_script_title != current_script_title:
-            continue
-        score = _match_score(entry, ("speaker", "name"))
-        if score is None:
-            continue
-        candidate = {
-            "type": "clone",
-            "ref_audio": rel_audio,
-            "ref_text": (entry.get("sample_text") or "").strip(),
-            "source_name": (entry.get("speaker") or entry.get("name") or "").strip(),
-            "priority": (1, score),
-        }
-        if best is None or candidate["priority"] < best["priority"]:
-            best = candidate
+        for entry in _load_manifest(CLONE_VOICES_MANIFEST):
+            rel_audio = _build_rel_audio("clone_voices", entry)
+            if not rel_audio or not os.path.exists(os.path.join(ROOT_DIR, rel_audio)):
+                continue
+            entry_script_title = _normalize_saved_voice_name(entry.get("script_title", ""))
+            entry_matches_loaded_project_name = allow_project_prefixed_exact_match and (
+                _match_project_prefixed_saved_voice_name(entry.get("speaker", ""), current_project_name, speaker)
+                or _match_project_prefixed_saved_voice_name(entry.get("name", ""), current_project_name, speaker)
+                or _match_project_prefixed_saved_voice_name(
+                    os.path.splitext(str(entry.get("filename") or "").strip())[0],
+                    current_project_name,
+                    speaker,
+                )
+            )
+            if (not entry_script_title or entry_script_title != candidate_title) and not entry_matches_loaded_project_name:
+                continue
+            score = _match_score(
+                entry,
+                ("speaker", "name"),
+                allow_filename_fallback=allow_filename_fallback,
+                allow_project_prefixed_exact_match=allow_project_prefixed_exact_match,
+                project_name=current_project_name,
+            )
+            if score is None:
+                continue
+            candidate = {
+                "type": "clone",
+                "ref_audio": rel_audio,
+                "ref_text": (entry.get("sample_text") or "").strip(),
+                "generated_ref_text": (entry.get("sample_text") or "").strip(),
+                "description": (entry.get("description") or "").strip(),
+                "source_name": (entry.get("speaker") or entry.get("name") or "").strip(),
+                "priority": (title_priority, 0, score),
+            }
+            if best is None or candidate["priority"] < best["priority"]:
+                best = candidate
+
+        for entry in _load_manifest(DESIGNED_VOICES_MANIFEST):
+            rel_audio = _build_rel_audio("designed_voices", entry)
+            if not rel_audio or not os.path.exists(os.path.join(ROOT_DIR, rel_audio)):
+                continue
+            entry_script_title = _normalize_saved_voice_name(entry.get("script_title", ""))
+            entry_matches_loaded_project_name = allow_project_prefixed_exact_match and (
+                _match_project_prefixed_saved_voice_name(entry.get("speaker", ""), current_project_name, speaker)
+                or _match_project_prefixed_saved_voice_name(entry.get("name", ""), current_project_name, speaker)
+                or _match_project_prefixed_saved_voice_name(
+                    os.path.splitext(str(entry.get("filename") or "").strip())[0],
+                    current_project_name,
+                    speaker,
+                )
+            )
+            if (not entry_script_title or entry_script_title != candidate_title) and not entry_matches_loaded_project_name:
+                continue
+            score = _match_score(
+                entry,
+                ("speaker", "name"),
+                allow_filename_fallback=allow_filename_fallback,
+                allow_project_prefixed_exact_match=allow_project_prefixed_exact_match,
+                project_name=current_project_name,
+            )
+            if score is None:
+                continue
+            candidate = {
+                "type": "clone",
+                "ref_audio": rel_audio,
+                "ref_text": (entry.get("sample_text") or "").strip(),
+                "generated_ref_text": (entry.get("sample_text") or "").strip(),
+                "description": (entry.get("description") or "").strip(),
+                "source_name": (entry.get("speaker") or entry.get("name") or "").strip(),
+                "priority": (title_priority, 1, score),
+            }
+            if best is None or candidate["priority"] < best["priority"]:
+                best = candidate
 
     if best:
         best.pop("priority", None)
@@ -1701,15 +1795,28 @@ def _clear_directory_contents(directory):
 def _clear_project_derived_state(preserve_input_file=True):
     state = _load_project_state_payload()
     input_file_path = (state.get("input_file_path") or "").strip()
+    manager_root = os.path.abspath(getattr(project_manager, "root_dir", ROOT_DIR))
+    current_root = os.path.abspath(ROOT_DIR)
+    if manager_root == current_root:
+        chunks_db_path = project_manager.chunks_db_path
+        chunks_queue_log_path = project_manager.chunks_queue_log_path
+        transcription_cache_path = project_manager.transcription_cache_path
+    else:
+        chunks_db_path = os.path.join(ROOT_DIR, "chunks.sqlite3")
+        chunks_queue_log_path = os.path.join(ROOT_DIR, "chunks.queue.log")
+        transcription_cache_path = os.path.join(ROOT_DIR, "transcription_cache.json")
 
     files_to_remove = [
         SCRIPT_PATH,
         VOICES_PATH,
         VOICE_CONFIG_PATH,
         CHUNKS_PATH,
-        project_manager.chunks_db_path,
-        project_manager.chunks_queue_log_path,
-        project_manager.transcription_cache_path,
+        chunks_db_path,
+        f"{chunks_db_path}-wal",
+        f"{chunks_db_path}-shm",
+        chunks_queue_log_path,
+        transcription_cache_path,
+        SCRIPT_REPAIR_TRACE_PATH,
         AUDIOBOOK_PATH,
         M4B_PATH,
         AUDIO_QUEUE_STATE_PATH,
@@ -1953,6 +2060,88 @@ def _ensure_voice_compat_exports():
         project_manager.export_voice_state_compat(os.path.join(ROOT_DIR, "state.json"))
 
 
+def _project_archive_metadata():
+    summary = {}
+    get_summary = getattr(project_manager, "get_chunk_chapter_summary", None)
+    if callable(get_summary):
+        try:
+            summary = dict(get_summary() or {})
+        except Exception:
+            summary = {}
+    if not summary:
+        summary = _chunk_chapter_summary()
+
+    has_audio_fn = getattr(project_manager, "has_generated_chunk_audio", None)
+    if callable(has_audio_fn):
+        try:
+            has_audio = bool(has_audio_fn())
+        except Exception:
+            has_audio = _project_has_generated_audio()
+    else:
+        has_audio = _project_has_generated_audio()
+
+    has_voice_fn = getattr(project_manager, "has_voice_config", None)
+    if callable(has_voice_fn):
+        try:
+            has_voice_config = bool(has_voice_fn())
+        except Exception:
+            has_voice_config = os.path.exists(VOICE_CONFIG_PATH)
+    else:
+        has_voice_config = os.path.exists(VOICE_CONFIG_PATH)
+
+    return {
+        "kind": "project",
+        "has_audio": has_audio,
+        "has_voice_config": has_voice_config,
+        "chunk_count": int(summary.get("chunk_count") or 0),
+        "chapter_count": int(summary.get("chapter_count") or 0),
+        "last_chapter": summary.get("last_chapter"),
+    }
+
+
+def _load_project_archive_manifest(zip_path: str):
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            if PROJECT_ARCHIVE_MANIFEST_NAME not in zf.namelist():
+                return None
+            with zf.open(PROJECT_ARCHIVE_MANIFEST_NAME) as manifest_file:
+                payload = json.load(manifest_file)
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _copy_sqlite_database_snapshot(source_path: str, target_path: str):
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    with sqlite3.connect(source_path, timeout=30.0) as source_conn:
+        with sqlite3.connect(target_path, timeout=30.0) as target_conn:
+            source_conn.backup(target_conn)
+
+
+def _prepare_project_archive_sqlite_snapshot():
+    db_path = getattr(project_manager, "chunks_db_path", os.path.join(ROOT_DIR, "chunks.sqlite3"))
+    if not db_path or not os.path.exists(db_path):
+        return None
+
+    script_store = getattr(project_manager, "script_store", None)
+    manager_root = os.path.abspath(getattr(project_manager, "root_dir", ROOT_DIR))
+    current_root = os.path.abspath(ROOT_DIR)
+    if manager_root == current_root and script_store is not None:
+        try:
+            script_store.flush(timeout=5.0)
+        except Exception:
+            pass
+
+    temp_dir = tempfile.mkdtemp(prefix="threadspeak_archive_db_")
+    backup_path = os.path.join(temp_dir, "chunks.sqlite3")
+    try:
+        _copy_sqlite_database_snapshot(db_path, backup_path)
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    return temp_dir, backup_path
+
+
 def _project_archive_entries():
     entries = {}
 
@@ -1964,7 +2153,7 @@ def _project_archive_entries():
         if os.path.exists(absolute_path):
             entries[normalized] = absolute_path
 
-    for relative_path in sorted(PROJECT_ARCHIVE_ALLOWED_FILES - {"chunks.json"}):
+    for relative_path in sorted(PROJECT_ARCHIVE_ALLOWED_FILES - {"chunks.json", "chunks.sqlite3"}):
         add_relative_path(relative_path)
 
     state = _archive_state_with_relative_paths()
@@ -2025,6 +2214,7 @@ def _build_project_archive_manifest(entries):
         "kind": "threadspeak_project_archive",
         "version": PROJECT_ARCHIVE_VERSION,
         "created_at": time.time(),
+        "metadata": _project_archive_metadata(),
         "entries": [relative_path for relative_path, _ in entries],
     }
 
@@ -2067,8 +2257,19 @@ def _project_has_generated_audio() -> bool:
 
 def _write_project_archive(zip_path: str):
     _ensure_voice_compat_exports()
-    entries = _project_archive_entries()
-    manifest = _build_project_archive_manifest(entries)
+    sqlite_snapshot = None
+    try:
+        entries = dict(_project_archive_entries())
+        sqlite_snapshot = _prepare_project_archive_sqlite_snapshot()
+        if sqlite_snapshot is not None:
+            _, sqlite_backup_path = sqlite_snapshot
+            entries["chunks.sqlite3"] = sqlite_backup_path
+        sorted_entries = sorted(entries.items())
+        manifest = _build_project_archive_manifest(sorted_entries)
+    except Exception:
+        if sqlite_snapshot is not None:
+            shutil.rmtree(sqlite_snapshot[0], ignore_errors=True)
+        raise
     os.makedirs(os.path.dirname(zip_path), exist_ok=True)
     temp_zip_path = f"{zip_path}.tmp"
     if os.path.exists(temp_zip_path):
@@ -2077,7 +2278,7 @@ def _write_project_archive(zip_path: str):
     try:
         with zipfile.ZipFile(temp_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(PROJECT_ARCHIVE_MANIFEST_NAME, json.dumps(manifest, indent=2, ensure_ascii=False))
-            for relative_path, absolute_path in entries:
+            for relative_path, absolute_path in sorted_entries:
                 if relative_path == "state.json":
                     zf.writestr(relative_path, json.dumps(_archive_state_with_relative_paths(), indent=2, ensure_ascii=False))
                 elif relative_path == "chunks.json":
@@ -2088,6 +2289,8 @@ def _write_project_archive(zip_path: str):
     finally:
         if os.path.exists(temp_zip_path):
             os.remove(temp_zip_path)
+        if sqlite_snapshot is not None:
+            shutil.rmtree(sqlite_snapshot[0], ignore_errors=True)
     return {"entries": manifest["entries"], "path": zip_path}
 
 
@@ -2098,6 +2301,8 @@ def _clear_project_archive_targets():
         "voices.json",
         "chunks.json",
         "chunks.sqlite3",
+        "chunks.sqlite3-wal",
+        "chunks.sqlite3-shm",
         "chunks.queue.log",
         "script_sanity_check.json",
         "state.json",
@@ -2160,7 +2365,7 @@ def _reset_runtime_state_after_project_load():
     project_manager.reconcile_chunk_audio_states()
 
 
-def _restore_project_archive(extracted_dir: str):
+def _restore_project_archive(extracted_dir: str, *, loaded_project_name: str = ""):
     _clear_project_archive_targets()
 
     for relative_path in sorted(PROJECT_ARCHIVE_ALLOWED_FILES):
@@ -2180,6 +2385,21 @@ def _restore_project_archive(extracted_dir: str):
         else:
             shutil.copy2(source_path, target_path)
 
+    if loaded_project_name:
+        state_path = os.path.join(ROOT_DIR, "state.json")
+        state = {}
+        if os.path.exists(state_path):
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if isinstance(payload, dict):
+                    state = payload
+            except (json.JSONDecodeError, ValueError, OSError):
+                state = {}
+        state["loaded_project_name"] = loaded_project_name
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+
     for dirname in sorted(PROJECT_ARCHIVE_ALLOWED_DIRS):
         source_dir = os.path.join(extracted_dir, dirname)
         target_dir = os.path.join(ROOT_DIR, dirname)
@@ -2191,10 +2411,19 @@ def _restore_project_archive(extracted_dir: str):
 
     if hasattr(project_manager, "reload_script_store"):
         project_manager.reload_script_store()
+    if hasattr(project_manager, "import_voice_compat"):
+        try:
+            project_manager.import_voice_compat(
+                voice_config_path=VOICE_CONFIG_PATH,
+                state_path=os.path.join(ROOT_DIR, "state.json"),
+                replace=False,
+            )
+        except Exception as exc:
+            logger.warning("Failed to import archived voice compatibility state after restore: %s", exc)
     _reset_runtime_state_after_project_load()
 
 
-def _restore_project_archive_zip(zip_path: str):
+def _restore_project_archive_zip(zip_path: str, *, loaded_project_name: str = ""):
     temp_root = tempfile.mkdtemp(prefix="threadspeak_project_import_")
     extract_root = os.path.join(temp_root, "extracted")
     os.makedirs(extract_root, exist_ok=True)
@@ -2228,7 +2457,7 @@ def _restore_project_archive_zip(zip_path: str):
                 with zf.open(info, "r") as source, open(target_path, "wb") as target:
                     shutil.copyfileobj(source, target)
 
-        _restore_project_archive(extract_root)
+        _restore_project_archive(extract_root, loaded_project_name=loaded_project_name)
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 

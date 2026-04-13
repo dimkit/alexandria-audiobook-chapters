@@ -316,11 +316,13 @@
                     const date = new Date(s.created * 1000).toLocaleDateString('en-US', {
                         month: 'short', day: 'numeric', year: 'numeric'
                     });
-                    const badge = (s.kind === 'project' || s.has_audio)
+                    const badge = s.kind === 'script'
+                        ? '<span class="badge bg-secondary me-2" title="Legacy script snapshot">Legacy</span>'
+                        : s.has_audio
                         ? '<span class="badge bg-warning text-dark me-2" title="Includes generated audio">Audio</span>'
                         : s.has_voice_config
                         ? '<span class="badge bg-info me-2" title="Includes voice configuration">Voices</span>'
-                        : '';
+                        : '<span class="badge bg-primary me-2" title="Full saved project">Project</span>';
                     return `
                         <div class="d-flex align-items-center py-2 border-bottom">
                             <div class="d-flex align-items-center flex-grow-1 overflow-hidden">

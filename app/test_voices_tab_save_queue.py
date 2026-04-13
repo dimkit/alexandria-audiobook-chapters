@@ -724,6 +724,53 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
             """
         )
 
+    def test_targeted_alias_save_keeps_other_dirty_voice_rows(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const aerial = createVoiceCard('Aerial', {
+                    type: 'design',
+                    description: 'Warm, composed contralto',
+                    sampleText: 'line',
+                    alias: '',
+                });
+                const blake = createVoiceCard('Blake', {
+                    type: 'design',
+                    description: 'Low, steady tenor',
+                    sampleText: 'line',
+                    alias: '',
+                    narrates: false,
+                });
+                const savePayloads = [];
+                const context = createContext([aerial, blake], async (url, payload) => {
+                    if (url !== '/api/voices/batch') {
+                        throw new Error(`Unexpected API call: ${url}`);
+                    }
+                    savePayloads.push(JSON.parse(JSON.stringify(payload)));
+                    return { status: 'saved' };
+                });
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                blake.controls.narrates.checked = true;
+                await context.__voicesListListeners.change({ target: blake.controls.narrates });
+                aerial.controls.aliasInput.value = 'Blake';
+                await context.__voicesListListeners.change({ target: aerial.controls.aliasInput });
+                await tick();
+                await tick();
+
+                assert.ok(savePayloads.length >= 1, 'expected at least one save payload');
+                const lastPayload = savePayloads[savePayloads.length - 1];
+                assert.strictEqual(lastPayload.config.Aerial.alias, 'Blake');
+                assert.strictEqual(lastPayload.config.Blake.narrates, true);
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

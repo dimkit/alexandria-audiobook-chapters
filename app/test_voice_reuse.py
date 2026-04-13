@@ -224,6 +224,288 @@ class SavedVoiceReuseTests(unittest.TestCase):
                 app_module.project_manager = original_pm
                 app_module.suggest_voice_description_sync = original_suggest
 
+    def test_saved_voice_reuse_falls_back_to_loaded_project_name_with_exact_speaker_match(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            clone_dir = os.path.join(temp_root, "clone_voices")
+            designed_dir = os.path.join(temp_root, "designed_voices")
+            os.makedirs(clone_dir, exist_ok=True)
+            os.makedirs(designed_dir, exist_ok=True)
+
+            clone_filename = "demo_save_twilight.wav"
+            with open(os.path.join(clone_dir, clone_filename), "wb") as f:
+                f.write(b"wav")
+
+            with open(os.path.join(clone_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {
+                            "id": "demo_save_twilight",
+                            "name": "Twilight Sparkle",
+                            "speaker": "Twilight Sparkle",
+                            "script_title": "demo_save",
+                            "filename": clone_filename,
+                            "sample_text": "Friendship is magic.",
+                            "description": "Warm voice",
+                        }
+                    ],
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            with open(os.path.join(designed_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump([], f)
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"loaded_project_name": "demo_save"}, f)
+
+            original_root = app_module.ROOT_DIR
+            original_clone_manifest = app_module.CLONE_VOICES_MANIFEST
+            original_designed_manifest = app_module.DESIGNED_VOICES_MANIFEST
+            original_pm = app_module.project_manager
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.CLONE_VOICES_MANIFEST = os.path.join(clone_dir, "manifest.json")
+                app_module.DESIGNED_VOICES_MANIFEST = os.path.join(designed_dir, "manifest.json")
+
+                class FakeProjectManager:
+                    def _normalize_speaker_name(self, value):
+                        return (value or "").strip().lower()
+
+                    def _current_script_title(self):
+                        return "Book One"
+
+                app_module.project_manager = FakeProjectManager()
+                result = app_module._find_saved_voice_option_for_speaker("Twilight Sparkle")
+                self.assertIsNotNone(result)
+                self.assertEqual(result["ref_audio"], f"clone_voices/{clone_filename}")
+                self.assertEqual(result["ref_text"], "Friendship is magic.")
+                self.assertEqual(result["description"], "Warm voice")
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.CLONE_VOICES_MANIFEST = original_clone_manifest
+                app_module.DESIGNED_VOICES_MANIFEST = original_designed_manifest
+                app_module.project_manager = original_pm
+
+    def test_saved_voice_reuse_project_name_fallback_requires_exact_speaker_match(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            clone_dir = os.path.join(temp_root, "clone_voices")
+            designed_dir = os.path.join(temp_root, "designed_voices")
+            os.makedirs(clone_dir, exist_ok=True)
+            os.makedirs(designed_dir, exist_ok=True)
+
+            clone_filename = "demo_save_blake_hodges.wav"
+            with open(os.path.join(clone_dir, clone_filename), "wb") as f:
+                f.write(b"wav")
+
+            with open(os.path.join(clone_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {
+                            "id": "demo_save_blake_hodges",
+                            "name": "Blake Hodges",
+                            "speaker": "Blake Hodges",
+                            "script_title": "demo_save",
+                            "filename": clone_filename,
+                            "sample_text": "Hello there.",
+                        }
+                    ],
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            with open(os.path.join(designed_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump([], f)
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"loaded_project_name": "demo_save"}, f)
+
+            original_root = app_module.ROOT_DIR
+            original_clone_manifest = app_module.CLONE_VOICES_MANIFEST
+            original_designed_manifest = app_module.DESIGNED_VOICES_MANIFEST
+            original_pm = app_module.project_manager
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.CLONE_VOICES_MANIFEST = os.path.join(clone_dir, "manifest.json")
+                app_module.DESIGNED_VOICES_MANIFEST = os.path.join(designed_dir, "manifest.json")
+
+                class FakeProjectManager:
+                    def _normalize_speaker_name(self, value):
+                        return (value or "").strip().lower()
+
+                    def _current_script_title(self):
+                        return "Book One"
+
+                app_module.project_manager = FakeProjectManager()
+                self.assertIsNone(app_module._find_saved_voice_option_for_speaker("Blake"))
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.CLONE_VOICES_MANIFEST = original_clone_manifest
+                app_module.DESIGNED_VOICES_MANIFEST = original_designed_manifest
+                app_module.project_manager = original_pm
+
+    def test_saved_voice_reuse_matches_project_prefixed_name_with_exact_suffix(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            clone_dir = os.path.join(temp_root, "clone_voices")
+            designed_dir = os.path.join(temp_root, "designed_voices")
+            os.makedirs(clone_dir, exist_ok=True)
+            os.makedirs(designed_dir, exist_ok=True)
+
+            clone_filename = "forbidden-places.aerial.wav"
+            with open(os.path.join(clone_dir, clone_filename), "wb") as f:
+                f.write(b"wav")
+
+            with open(os.path.join(clone_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {
+                            "id": "forbidden_places_aerial",
+                            "name": "forbidden-places.Aerial",
+                            "script_title": "legacy-title",
+                            "filename": clone_filename,
+                            "sample_text": "Sky sample",
+                            "description": "Airy voice",
+                        }
+                    ],
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            with open(os.path.join(designed_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump([], f)
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"loaded_project_name": "forbidden-places"}, f)
+
+            original_root = app_module.ROOT_DIR
+            original_clone_manifest = app_module.CLONE_VOICES_MANIFEST
+            original_designed_manifest = app_module.DESIGNED_VOICES_MANIFEST
+            original_pm = app_module.project_manager
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.CLONE_VOICES_MANIFEST = os.path.join(clone_dir, "manifest.json")
+                app_module.DESIGNED_VOICES_MANIFEST = os.path.join(designed_dir, "manifest.json")
+
+                class FakeProjectManager:
+                    def _normalize_speaker_name(self, value):
+                        return (value or "").strip().lower()
+
+                    def _current_script_title(self):
+                        return "Book One"
+
+                app_module.project_manager = FakeProjectManager()
+                result = app_module._find_saved_voice_option_for_speaker("Aerial")
+                self.assertIsNotNone(result)
+                self.assertEqual(result["ref_audio"], f"clone_voices/{clone_filename}")
+                self.assertEqual(result["ref_text"], "Sky sample")
+                self.assertEqual(result["description"], "Airy voice")
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.CLONE_VOICES_MANIFEST = original_clone_manifest
+                app_module.DESIGNED_VOICES_MANIFEST = original_designed_manifest
+                app_module.project_manager = original_pm
+
+    def test_get_voices_populates_blank_row_from_project_prefixed_saved_voice(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            clone_dir = os.path.join(temp_root, "clone_voices")
+            designed_dir = os.path.join(temp_root, "designed_voices")
+            os.makedirs(clone_dir, exist_ok=True)
+            os.makedirs(designed_dir, exist_ok=True)
+
+            clone_filename = "forbidden-places_aerial.wav"
+            with open(os.path.join(clone_dir, clone_filename), "wb") as f:
+                f.write(b"wav")
+
+            with open(os.path.join(clone_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {
+                            "id": "forbidden_places_aerial",
+                            "name": "forbidden-places.Aerial",
+                            "speaker": "Aerial",
+                            "script_title": "forbidden-places",
+                            "filename": clone_filename,
+                            "sample_text": "The horizon brightened.",
+                            "description": "Airy young heroine voice",
+                        }
+                    ],
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            with open(os.path.join(designed_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump([], f)
+
+            script_path = os.path.join(temp_root, "annotated_script.json")
+            voice_config_path = os.path.join(temp_root, "voice_config.json")
+            voices_path = os.path.join(temp_root, "voices.json")
+            state_path = os.path.join(temp_root, "state.json")
+            with open(script_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"entries": [{"speaker": "Aerial", "text": "Hello."}], "dictionary": []},
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            with open(voice_config_path, "w", encoding="utf-8") as f:
+                json.dump({}, f, indent=2, ensure_ascii=False)
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump({"loaded_project_name": "forbidden-places"}, f, indent=2, ensure_ascii=False)
+
+            original_root = app_module.ROOT_DIR
+            original_script_path = app_module.SCRIPT_PATH
+            original_voice_config_path = app_module.VOICE_CONFIG_PATH
+            original_voices_path = app_module.VOICES_PATH
+            original_clone_manifest = app_module.CLONE_VOICES_MANIFEST
+            original_designed_manifest = app_module.DESIGNED_VOICES_MANIFEST
+            original_pm = app_module.project_manager
+            try:
+                app_module.ROOT_DIR = temp_root
+                app_module.SCRIPT_PATH = script_path
+                app_module.VOICE_CONFIG_PATH = voice_config_path
+                app_module.VOICES_PATH = voices_path
+                app_module.CLONE_VOICES_MANIFEST = os.path.join(clone_dir, "manifest.json")
+                app_module.DESIGNED_VOICES_MANIFEST = os.path.join(designed_dir, "manifest.json")
+
+                class FakeProjectManager:
+                    def _normalize_speaker_name(self, value):
+                        return (value or "").strip().lower()
+
+                    def get_narrator_threshold(self):
+                        return 10
+
+                    def load_chunks(self):
+                        return []
+
+                    def suggest_design_sample_text(self, speaker, chunks):
+                        return ""
+
+                app_module.project_manager = FakeProjectManager()
+
+                voices = asyncio.run(app_module.get_voices())
+                voices_by_name = {voice["name"]: voice for voice in voices}
+                self.assertEqual(voices_by_name["Aerial"]["config"].get("type"), "clone")
+                self.assertEqual(
+                    voices_by_name["Aerial"]["config"].get("ref_audio"),
+                    f"clone_voices/{clone_filename}",
+                )
+                self.assertEqual(
+                    voices_by_name["Aerial"]["config"].get("generated_ref_text"),
+                    "The horizon brightened.",
+                )
+                self.assertEqual(
+                    voices_by_name["Aerial"]["config"].get("description"),
+                    "Airy young heroine voice",
+                )
+            finally:
+                app_module.ROOT_DIR = original_root
+                app_module.SCRIPT_PATH = original_script_path
+                app_module.VOICE_CONFIG_PATH = original_voice_config_path
+                app_module.VOICES_PATH = original_voices_path
+                app_module.CLONE_VOICES_MANIFEST = original_clone_manifest
+                app_module.DESIGNED_VOICES_MANIFEST = original_designed_manifest
+                app_module.project_manager = original_pm
+
     def test_does_not_reuse_saved_voice_for_narrator(self):
         with tempfile.TemporaryDirectory() as temp_root:
             clone_dir = os.path.join(temp_root, "clone_voices")

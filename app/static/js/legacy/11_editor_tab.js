@@ -1641,6 +1641,40 @@
             }
         };
 
+        async function handleGenerationVoiceConfigError(error) {
+            const detail = error?.detail || {};
+            if (detail?.code !== 'voice_config_required') {
+                return false;
+            }
+
+            const voiceName = String(
+                detail.voice_speaker || detail.resolved_speaker || detail.speaker || ''
+            ).trim();
+            const message = String(detail.message || error.message || 'A voice must be configured before rendering.').trim();
+            showToast(message, 'warning', 8000);
+
+            if (!voiceName) {
+                return true;
+            }
+
+            try {
+                if (typeof window.focusVoiceCard === 'function') {
+                    const focused = await window.focusVoiceCard(voiceName);
+                    if (focused) {
+                        return true;
+                    }
+                }
+
+                const voicesLink = document.querySelector('.nav-link[data-tab="voices"]');
+                if (voicesLink && typeof voicesLink.click === 'function') {
+                    voicesLink.click();
+                }
+            } catch (focusError) {
+                console.warn('Failed to focus missing voice row', focusError);
+            }
+            return true;
+        }
+
         async function refreshAudioQueueUI() {
             const audioState = await API.get('/api/status/audio');
             latestAudioState = audioState;
@@ -2707,6 +2741,10 @@
                     pendingGraceMs: 5000,
                 });
             } catch (e) {
+                if (await handleGenerationVoiceConfigError(e)) {
+                    loadChunks(true);
+                    return;
+                }
                 showToast("Failed to start generation: " + e.message, 'error');
                 loadChunks(true); // Revert UI with full redraw
             }
@@ -2804,6 +2842,9 @@
                 if (window.releaseNavTaskSpinner) {
                     window.releaseNavTaskSpinner('editor');
                 }
+                if (await handleGenerationVoiceConfigError(e)) {
+                    return;
+                }
                 showToast("Error during batch rendering: " + e.message, 'error');
             }
         };
@@ -2855,6 +2896,9 @@
                 console.error("Batch Fast error:", e);
                 if (window.releaseNavTaskSpinner) {
                     window.releaseNavTaskSpinner('editor');
+                }
+                if (await handleGenerationVoiceConfigError(e)) {
+                    return;
                 }
                 showToast("Error during batch rendering: " + e.message, 'error');
             }

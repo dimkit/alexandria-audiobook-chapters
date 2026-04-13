@@ -1655,17 +1655,17 @@ class TTSEngine:
                         results["failed"].append((idx, "Batch returned None"))
                     continue
 
-                    sb_audio_duration = self._persist_batch_audio_outputs(
-                        wavs_list,
-                        sr,
-                        output_dir,
-                        sb_indices,
-                        results,
-                    )
+                sb_audio_duration = self._persist_batch_audio_outputs(
+                    wavs_list,
+                    sr,
+                    output_dir,
+                    sb_indices,
+                    results,
+                )
 
-                    total_audio_duration += sb_audio_duration
-                    sb_rtf = sb_audio_duration / gen_time if gen_time > 0 else 0
-                    print(f"  Sub-batch {sb_idx+1} done: {gen_time:.1f}s -> {sb_audio_duration:.1f}s audio ({sb_rtf:.2f}x RT)")
+                total_audio_duration += sb_audio_duration
+                sb_rtf = sb_audio_duration / gen_time if gen_time > 0 else 0
+                print(f"  Sub-batch {sb_idx+1} done: {gen_time:.1f}s -> {sb_audio_duration:.1f}s audio ({sb_rtf:.2f}x RT)")
 
             except Exception as e:
                 print(f"  Sub-batch {sb_idx+1} failed: {e}")

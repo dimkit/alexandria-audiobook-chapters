@@ -154,6 +154,8 @@ class ProjectChunkStoreMixin:
                 return self._copy_chunks_snapshot(chapter=chapter) or []
 
         def load_chunks_view(self, chapter=None):
+            if chapter:
+                self.ensure_chapter_narrator_voice_can_narrate(chapter)
             chunks = self.load_chunks_raw(chapter=chapter)
             runtime = self._copy_chunk_runtime(chunk.get("uid") for chunk in chunks)
             return [

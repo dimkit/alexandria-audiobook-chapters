@@ -21,7 +21,10 @@
                 if (res.ok) return;
                 try {
                     const body = await res.json();
-                    throw new Error(API._formatErrorDetail(body.detail, res.statusText));
+                    const err = new Error(API._formatErrorDetail(body.detail, res.statusText));
+                    err.detail = body.detail;
+                    err.status = res.status;
+                    throw err;
                 } catch (e) {
                     if (e.message) throw e;
                     throw new Error(res.statusText);

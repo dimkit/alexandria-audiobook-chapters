@@ -67,6 +67,12 @@ def _resolve_batch_target_rows(request: BatchGenerateRequest, *, pending_only: O
     )
 
 
+def _raise_if_generation_voice_issue(target_rows):
+    issue = project_manager.validate_generation_voice_targets(target_rows)
+    if issue:
+        raise HTTPException(status_code=400, detail=issue)
+
+
 def _audio_status_payload():
     with audio_queue_lock:
         _refresh_audio_process_state_locked()
@@ -489,6 +495,7 @@ async def generate_chunk_endpoint(index: str, background_tasks: BackgroundTasks)
         raise HTTPException(status_code=404, detail="Invalid chunk id")
     if not chunk.get("text", "").strip():
         raise HTTPException(status_code=400, detail="Cannot generate audio for an empty line")
+    _raise_if_generation_voice_issue([chunk])
     return _enqueue_audio_job(
         "parallel",
         [chunk.get("uid")],
@@ -505,6 +512,7 @@ async def regenerate_chunk_endpoint(index: str, background_tasks: BackgroundTask
     chunk = prepared["chunk"]
     if not chunk.get("text", "").strip():
         raise HTTPException(status_code=400, detail="Cannot generate audio for an empty line")
+    _raise_if_generation_voice_issue([chunk])
     return _enqueue_audio_job(
         "parallel",
         [chunk.get("uid")],
@@ -1140,6 +1148,7 @@ async def delete_m4b_cover():
 async def generate_batch_endpoint(request: BatchGenerateRequest, background_tasks: BackgroundTasks):
     """Generate multiple chunks in parallel using configured worker count."""
     target_rows = _resolve_batch_target_rows(request)
+    _raise_if_generation_voice_issue(target_rows)
     target_uids = [chunk.get("uid") for chunk in target_rows if chunk.get("uid")]
     if not target_uids:
         raise HTTPException(status_code=400, detail="No non-empty chunks matched the requested scope")
@@ -1164,6 +1173,7 @@ async def generate_batch_fast_endpoint(request: BatchGenerateRequest, background
     """Generate multiple chunks using batch TTS API with single seed. Faster but less flexible.
     Requires custom Qwen3-TTS with /generate_batch endpoint."""
     target_rows = _resolve_batch_target_rows(request)
+    _raise_if_generation_voice_issue(target_rows)
     target_uids = [chunk.get("uid") for chunk in target_rows if chunk.get("uid")]
     if not target_uids:
         raise HTTPException(status_code=400, detail="No non-empty chunks matched the requested scope")

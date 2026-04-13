@@ -382,6 +382,8 @@ class SQLiteScriptStore(ScriptStore):
             query += " AND chapter = ?"
             params.append(normalized_chapter)
         if pending_only:
+            # Treat errored rows as still outstanding work. A new render job should
+            # retry anything not yet completed instead of leaving persistent errors.
             query += " AND COALESCE(status, 'pending') != 'done'"
         query += " ORDER BY ordinal ASC"
         with self._connect() as conn:

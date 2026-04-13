@@ -177,5 +177,38 @@ class LocalBatchRegressionTests(unittest.TestCase):
             self.assertEqual(results["failed"], [("uid-2", "Batch returned 1/2 audio clips")])
             self.assertTrue(os.path.exists(os.path.join(output_dir, "temp_batch_uid-1.wav")))
 
+    def test_local_batch_custom_persists_outputs_for_successful_sub_batch(self):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
+        chunks = [{
+            "index": "uid-1",
+            "text": "A calm line with enough text.",
+            "instruct": "",
+            "speaker": "Aerial",
+        }]
+        voice_config = {
+            "Aerial": {
+                "type": "custom",
+                "voice": "Ryan",
+                "character_style": "",
+                "default_style": "",
+            }
+        }
+
+        fake_model = mock.Mock()
+        fake_model.generate_custom_voice.return_value = ([np.zeros(2400, dtype=np.float32)], 24000)
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            with mock.patch.object(engine, "_init_local_custom", return_value=fake_model), \
+                 mock.patch.object(engine, "_estimate_max_batch_size", return_value=8), \
+                 mock.patch.object(engine, "_build_sub_batches", return_value=[(0, 1)]), \
+                 mock.patch.object(engine, "_clear_gpu_cache"), \
+                 mock.patch.object(engine, "_warmup_model"):
+                engine._warmup_needed = False
+                results = engine._local_batch_custom(chunks, voice_config, output_dir)
+
+            self.assertEqual(results["completed"], ["uid-1"])
+            self.assertEqual(results["failed"], [])
+            self.assertTrue(os.path.exists(os.path.join(output_dir, "temp_batch_uid-1.wav")))
+
 if __name__ == "__main__":
     unittest.main()

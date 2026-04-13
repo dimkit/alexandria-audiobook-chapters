@@ -487,6 +487,65 @@ class EditorTabChunkPollTests(unittest.TestCase):
             """
         )
 
+    def test_render_all_surfaces_missing_voice_and_focuses_voice_row(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                const focusedVoices = [];
+                context.window.focusVoiceCard = async (voiceName) => {
+                    focusedVoices.push(voiceName);
+                    return true;
+                };
+                context.API.get = async (url) => {
+                    if (url === '/api/chunks/view') {
+                        return [{
+                            id: 0,
+                            uid: 'aerial-0',
+                            speaker: 'Aerial',
+                            text: 'Aerial line with enough words to render correctly.',
+                            status: 'pending',
+                            chapter: 'Chapter 1',
+                        }];
+                    }
+                    return [];
+                };
+                context.API.post = async (url) => {
+                    if (url === '/api/generate_batch') {
+                        const error = new Error('Cannot render because "Aerial" has no voice selected.');
+                        error.detail = {
+                            code: 'voice_config_required',
+                            message: 'Cannot render because "Aerial" has no voice selected.',
+                            speaker: 'Aerial',
+                            voice_speaker: 'Aerial',
+                        };
+                        throw error;
+                    }
+                    if (url === '/api/chunks/sync_from_script_if_stale') {
+                        return { synced: false };
+                    }
+                    return { status: 'ok' };
+                };
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                context.document.getElementById('editor-chapter-only').checked = false;
+                await context.window.renderAll(false);
+                await flushTicks();
+
+                assert.ok(
+                    context.__toasts.some((entry) => entry.message.includes('Aerial') && entry.level === 'warning'),
+                    'expected a warning toast for the missing voice'
+                );
+                assert.deepStrictEqual(focusedVoices, ['Aerial']);
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
     def test_generate_chunk_prefers_targeted_poll_results_over_stale_broad_state(self):
         self._run_node_test(
             """

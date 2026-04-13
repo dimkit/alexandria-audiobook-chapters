@@ -577,6 +577,38 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
 
         self.assertEqual(resolved, "Alice")
 
+    def test_validate_generation_voice_targets_reports_missing_voice_selection(self):
+        chunks = [
+            {
+                "id": 0,
+                "uid": "aerial-0",
+                "speaker": "Aerial",
+                "text": "Aerial line with enough words to render correctly.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+                "audio_path": None,
+                "audio_validation": None,
+            }
+        ]
+        self.manager.save_chunks(chunks)
+        self.manager._save_voice_config({
+            "Aerial": {
+                "type": "custom",
+                "voice": "",
+                "alias": "",
+            }
+        })
+
+        issue = self.manager.validate_generation_voice_targets(["aerial-0"])
+
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue["code"], "voice_config_required")
+        self.assertEqual(issue["speaker"], "Aerial")
+        self.assertEqual(issue["voice_speaker"], "Aerial")
+        self.assertEqual(issue["chunk_uid"], "aerial-0")
+        self.assertIn("no voice selected", issue["message"])
+
     def test_preview_voice_config_invalidation_resolves_once_per_generated_speaker(self):
         chunks = [
             {
@@ -726,6 +758,31 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
 
         self.assertTrue(success)
         self.assertEqual(fake_engine.speakers, ["Jordan"])
+
+    def test_load_chunks_view_repairs_selected_chapter_narrator_narrates_flag(self):
+        self.manager.save_chunks([
+            {
+                "id": 0,
+                "uid": "chapter-1-narrator",
+                "speaker": "NARRATOR",
+                "text": "Opening narration line.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+            }
+        ])
+        self.manager._save_voice_config({
+            "Alice": {"type": "builtin", "voice": "AliceVoice", "narrates": False},
+            "NARRATOR": {"type": "builtin", "voice": "NarratorVoice", "narrates": True},
+        })
+        self.manager.set_narrator_override("Chapter 1", "Alice")
+
+        rows = self.manager.load_chunks_view(chapter="Chapter 1")
+
+        self.assertEqual(len(rows), 1)
+        refreshed = self.manager._load_voice_config()
+        self.assertTrue(refreshed["Alice"]["narrates"])
+        self.assertEqual(self.manager.get_narrator_overrides().get("Chapter 1"), "Alice")
 
     def test_generate_chunks_batch_uses_stored_auto_narrator_aliases(self):
         self.manager.set_narrator_threshold(10)

@@ -24,12 +24,19 @@ async def list_saved_scripts():
         filepath = os.path.join(SAVED_PROJECTS_DIR, f)
         if not os.path.isfile(filepath):
             continue
+        manifest = _load_project_archive_manifest(filepath) or {}
+        metadata = manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {}
         projects[name] = {
             "name": name,
-            "created": os.path.getmtime(filepath),
-            "kind": "project",
-            "has_audio": True,
-            "has_voice_config": _project_archive_contains_entry(filepath, "voice_config.json"),
+            "created": float(manifest.get("created_at") or os.path.getmtime(filepath)),
+            "kind": str(metadata.get("kind") or "project"),
+            "has_audio": bool(metadata.get("has_audio", _project_archive_contains_entry(filepath, "voicelines/"))),
+            "has_voice_config": bool(
+                metadata.get("has_voice_config", _project_archive_contains_entry(filepath, "voice_config.json"))
+            ),
+            "chunk_count": int(metadata.get("chunk_count") or 0),
+            "chapter_count": int(metadata.get("chapter_count") or 0),
+            "last_chapter": metadata.get("last_chapter"),
         }
 
     for f in os.listdir(SCRIPTS_DIR):
@@ -54,6 +61,8 @@ async def list_saved_scripts():
 def _project_archive_contains_entry(zip_path: str, relative_path: str) -> bool:
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
+            if relative_path.endswith("/"):
+                return any(name.startswith(relative_path) for name in zf.namelist())
             return relative_path in zf.namelist()
     except (OSError, zipfile.BadZipFile):
         return False
@@ -98,7 +107,8 @@ async def load_project_archive(file: UploadFile = File(...)):
     try:
         with open(zip_path, "wb") as f:
             f.write(content)
-        _restore_project_archive_zip(zip_path)
+        inferred_name = _sanitize_name(os.path.splitext(filename)[0])
+        _restore_project_archive_zip(zip_path, loaded_project_name=inferred_name)
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -227,13 +237,14 @@ def _autosave_current_script_for_workflow(*, purge_existing: bool, trigger: str)
 
 
 def _save_current_project_archive_snapshot(name: str):
+    has_substantive_chunks = getattr(project_manager, "has_substantive_chunks", None)
+    if not os.path.exists(SCRIPT_PATH):
+        if not callable(has_substantive_chunks) or not bool(has_substantive_chunks()):
+            raise FileNotFoundError("No annotated script to save. Generate a script first.")
+
     safe_name = _sanitize_name(name)
     if not safe_name:
         raise ValueError("Invalid project name.")
-
-    state = _load_project_state_payload()
-    state["loaded_script_name"] = safe_name
-    _save_project_state_payload(state)
 
     archive_path = _saved_project_archive_path(safe_name)
     existed = os.path.exists(archive_path)
@@ -247,19 +258,14 @@ def _save_current_project_archive_snapshot(name: str):
 
 @router.post("/api/scripts/save")
 async def save_script(request: ScriptSaveRequest):
-    """Save the current project under a name, using a full archive once audio exists."""
+    """Save the current project under a name as a full-state archive."""
     running_task = _any_project_task_running()
     if running_task:
         raise HTTPException(status_code=409, detail=f"Cannot save a project while '{running_task}' is running.")
 
     try:
-        if _project_has_generated_audio():
-            result = _save_current_project_archive_snapshot(request.name)
-            kind = "project"
-        else:
-            result = _save_current_script_snapshot(request.name, purge_existing=False)
-            _delete_saved_project_archive(result["name"])
-            kind = "script"
+        result = _save_current_project_archive_snapshot(request.name)
+        kind = "project"
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -313,7 +319,7 @@ def _audio_generation_active_for_script_load() -> bool:
 
 @router.post("/api/scripts/load")
 async def load_script(request: ScriptLoadRequest):
-    """Load a saved project, preferring full archives over script snapshots."""
+    """Load a saved project, preferring full archives over legacy script snapshots."""
     if _audio_generation_active_for_script_load():
         raise HTTPException(status_code=409, detail="Cannot load a project while audio generation is running.")
 
@@ -323,7 +329,7 @@ async def load_script(request: ScriptLoadRequest):
 
     archive_path = _saved_project_archive_path(safe_name)
     if os.path.exists(archive_path):
-        _restore_project_archive_zip(archive_path)
+        _restore_project_archive_zip(archive_path, loaded_project_name=safe_name)
         logger.info("Project archive '%s' loaded", safe_name)
         return {"status": "loaded", "name": safe_name, "kind": "project"}
 
@@ -331,18 +337,19 @@ async def load_script(request: ScriptLoadRequest):
     if not os.path.exists(src):
         raise HTTPException(status_code=404, detail=f"Saved project '{safe_name}' not found.")
 
+    _clear_project_archive_targets()
     shutil.copy2(src, SCRIPT_PATH)
 
     companion = os.path.join(SCRIPTS_DIR, f"{safe_name}.voice_config.json")
+    has_voice_config = False
     if os.path.exists(companion):
         shutil.copy2(companion, VOICE_CONFIG_PATH)
+        has_voice_config = True
 
     paragraphs_path = os.path.join(ROOT_DIR, "paragraphs.json")
     paragraphs_companion = os.path.join(SCRIPTS_DIR, f"{safe_name}.paragraphs.json")
     if os.path.exists(paragraphs_companion):
         shutil.copy2(paragraphs_companion, paragraphs_path)
-    elif os.path.exists(paragraphs_path):
-        os.remove(paragraphs_path)
 
     source_companion = _find_saved_script_source_companion(safe_name)
     restored_input_path = None
@@ -353,16 +360,16 @@ async def load_script(request: ScriptLoadRequest):
         os.makedirs(UPLOADS_DIR, exist_ok=True)
         shutil.copy2(source_companion, restored_input_path)
 
-    # Delete chunks so they regenerate from the loaded script
-    if os.path.exists(CHUNKS_PATH):
-        os.remove(CHUNKS_PATH)
-
-    state = _load_project_state_payload()
+    state = {}
     state["render_prep_complete"] = False
     state["loaded_script_name"] = safe_name
+    state["loaded_project_name"] = safe_name
     if restored_input_path:
         state["input_file_path"] = restored_input_path
-    state[PROCESSING_STAGE_MARKERS_KEY] = {"script": {"completed_at": time.time()}}
+    processing_markers = {"script": {"completed_at": time.time()}}
+    if has_voice_config:
+        processing_markers["voices"] = {"completed_at": time.time()}
+    state[PROCESSING_STAGE_MARKERS_KEY] = processing_markers
     state[NEW_MODE_STAGE_MARKERS_KEY] = {
         "create_script": {"completed_at": time.time()},
     }
@@ -372,6 +379,7 @@ async def load_script(request: ScriptLoadRequest):
         project_manager.reload_script_store()
     if hasattr(project_manager, "import_voice_compat"):
         project_manager.import_voice_compat(VOICE_CONFIG_PATH, os.path.join(ROOT_DIR, "state.json"))
+    _reset_runtime_state_after_project_load()
 
     logger.info("Project script snapshot '%s' loaded", safe_name)
     return {"status": "loaded", "name": safe_name, "kind": "script"}

@@ -589,19 +589,30 @@
         }
 
         function getVoiceCardsForSave(options = {}) {
+            const allCards = Array.from(document.querySelectorAll('.voice-card'));
             if (options.includeAll) {
-                return Array.from(document.querySelectorAll('.voice-card'));
+                return allCards;
             }
-            const requested = new Set(
-                Array.from(options.speakerNames || [])
-                    .map(name => String(name || '').trim())
-                    .filter(Boolean)
-            );
-            const effectiveNames = requested.size > 0 ? requested : _dirtyVoiceNames;
+            if (allCards.length === 0) {
+                return [];
+            }
+            const dirtyNames = Array.from(_dirtyVoiceNames)
+                .map(name => String(name || '').trim())
+                .filter(Boolean);
+            if (dirtyNames.length === 0 && (!options.speakerNames || options.speakerNames.length === 0)) {
+                return allCards;
+            }
+            const effectiveNames = new Set(dirtyNames);
+            for (const name of (options.speakerNames || [])) {
+                const normalized = String(name || '').trim();
+                if (normalized) {
+                    effectiveNames.add(normalized);
+                }
+            }
             if (effectiveNames.size === 0) {
                 return Array.from(document.querySelectorAll('.voice-card'));
             }
-            return Array.from(document.querySelectorAll('.voice-card'))
+            return allCards
                 .filter(card => effectiveNames.has(getVoiceCardName(card)));
         }
 
@@ -1254,6 +1265,40 @@
             });
             _voicesListResizeBound = true;
         }
+
+        window.focusVoiceCard = async (voiceName) => {
+            const normalizedTarget = normalizeVoiceName(voiceName);
+            if (!normalizedTarget) return false;
+
+            const voicesTab = document.getElementById('voices-tab');
+            if (voicesTab && voicesTab.style.display === 'none') {
+                const voicesLink = document.querySelector('.nav-link[data-tab="voices"]');
+                if (voicesLink && typeof voicesLink.click === 'function') {
+                    voicesLink.click();
+                } else if (voicesTab) {
+                    document.querySelectorAll('.tab-content').forEach(tab => { tab.style.display = 'none'; });
+                    voicesTab.style.display = 'block';
+                }
+            }
+
+            await loadVoices();
+
+            const card = Array.from(document.querySelectorAll('.voice-card'))
+                .find((element) => normalizeVoiceName(element?.dataset?.voice) === normalizedTarget);
+            if (!card) return false;
+
+            card.classList.add('table-warning');
+            setTimeout(() => card.classList.remove('table-warning'), 2500);
+            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            const preferredControl = card.querySelector('.voice-alias-input')
+                || card.querySelector('.voice-select')
+                || card.querySelector('.designed-voice-select')
+                || card.querySelector('input, select, textarea');
+            if (preferredControl && typeof preferredControl.focus === 'function') {
+                preferredControl.focus();
+            }
+            return true;
+        };
 
         window.refreshAutomaticVoiceAliases = refreshAutomaticVoiceAliases;
         window.primeVoicesForScriptWorkflow = async () => {

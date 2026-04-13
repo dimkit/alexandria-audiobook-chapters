@@ -412,15 +412,12 @@ class ProjectVoiceMixin:
             destination = target_path or os.path.join(self.root_dir, "state.json")
             script_store = getattr(self, "script_store", None)
             if script_store is not None:
-                export_path = script_store.export_voice_state(destination)
-                payload = {}
-                if os.path.exists(export_path):
-                    try:
-                        with open(export_path, "r", encoding="utf-8") as f:
-                            payload = json.load(f)
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        payload = {}
                 state = self._load_state()
+                payload = {
+                    "narrator_threshold": self.get_narrator_threshold(),
+                    "narrator_overrides": self.get_narrator_overrides(),
+                    "auto_narrator_aliases": self.get_auto_narrator_aliases(),
+                }
                 state.update(payload)
                 self._save_state(state)
                 return destination
@@ -538,6 +535,49 @@ class ProjectVoiceMixin:
                 overrides.pop(chapter, None)
             state["narrator_overrides"] = overrides
             self._save_state(state)
+
+        def ensure_chapter_narrator_voice_can_narrate(self, chapter):
+            """Persist chapter narrator overrides back into voice state.
+
+            The selected narrator for a chapter is treated as the stronger source
+            of truth. If that speaker is no longer marked as `narrates`, repair
+            the persisted voice profile so editor loads cannot silently degrade a
+            valid chapter narrator override back toward the default narrator.
+            """
+            normalized_chapter = str(chapter or "").strip()
+            if not normalized_chapter:
+                return None
+
+            narrator_voice = str((self.get_narrator_overrides() or {}).get(normalized_chapter) or "").strip()
+            if not narrator_voice:
+                return None
+            if self._normalize_speaker_name(narrator_voice) == self._normalize_speaker_name("NARRATOR"):
+                return None
+
+            voice_config = self._load_voice_config()
+            canonical_voice = narrator_voice
+            for existing_name in voice_config.keys():
+                if self._normalize_speaker_name(existing_name) == self._normalize_speaker_name(narrator_voice):
+                    canonical_voice = existing_name
+                    break
+
+            current_profile = dict(voice_config.get(canonical_voice) or {})
+            if bool(current_profile.get("narrates")):
+                return canonical_voice
+
+            script_store = getattr(self, "script_store", None)
+            if script_store is not None:
+                script_store.patch_voice_profile(
+                    canonical_voice,
+                    fields={"narrates": True},
+                    reason="ensure_chapter_narrator_voice_can_narrate",
+                    wait=True,
+                )
+            else:
+                current_profile["narrates"] = True
+                voice_config[canonical_voice] = current_profile
+                self._save_voice_config(voice_config)
+            return canonical_voice
 
         def get_auto_narrator_aliases(self):
             script_store = getattr(self, "script_store", None)
@@ -757,6 +797,134 @@ class ProjectVoiceMixin:
         def _voice_ref_audio_from_config(voice_config, speaker):
             entry = ProjectVoiceMixin._voice_entry_from_config(voice_config, speaker)
             return str(entry.get("ref_audio") or "").strip()
+
+        @staticmethod
+        def _voice_generation_issue_from_config(speaker, voice_data):
+            profile = dict(voice_data or {})
+            if not profile:
+                return {
+                    "code": "voice_config_required",
+                    "message": f'"{speaker}" has no voice selected.',
+                }
+
+            voice_type = str(profile.get("type") or "").strip().lower() or "custom"
+            if voice_type == "clone":
+                ref_audio = str(profile.get("ref_audio") or "").strip()
+                ref_text = str(profile.get("generated_ref_text") or profile.get("ref_text") or "").strip()
+                if not ref_audio:
+                    return {
+                        "code": "voice_config_required",
+                        "message": f'"{speaker}" is missing a reusable voice sample.',
+                    }
+                if not ref_text:
+                    return {
+                        "code": "voice_config_required",
+                        "message": f'"{speaker}" is missing the saved transcript for its reusable voice sample.',
+                    }
+                return None
+
+            if voice_type in {"lora", "builtin_lora"}:
+                adapter_path = str(profile.get("adapter_path") or "").strip()
+                if not adapter_path:
+                    return {
+                        "code": "voice_config_required",
+                        "message": f'"{speaker}" has no LoRA voice selected.',
+                    }
+                return None
+
+            if voice_type == "design":
+                ref_audio = str(profile.get("ref_audio") or "").strip()
+                description = str(profile.get("description") or "").strip()
+                if not ref_audio and not description:
+                    return {
+                        "code": "voice_config_required",
+                        "message": f'"{speaker}" has no voice selected.',
+                    }
+                if not ref_audio:
+                    return {
+                        "code": "voice_config_required",
+                        "message": f'"{speaker}" has not finished creating its generated voice yet.',
+                    }
+                return None
+
+            voice_name = str(profile.get("voice") or "").strip()
+            if not voice_name:
+                return {
+                    "code": "voice_config_required",
+                    "message": f'"{speaker}" has no voice selected.',
+                }
+            return None
+
+        def validate_generation_voice_targets(self, chunk_refs):
+            refs = list(chunk_refs or [])
+            if not refs:
+                return None
+
+            chunk_rows = []
+            for chunk_ref in refs:
+                chunk = chunk_ref if isinstance(chunk_ref, dict) else self.get_chunk_raw(chunk_ref)
+                if chunk is None:
+                    continue
+                if not str((chunk or {}).get("text") or "").strip():
+                    continue
+                chunk_rows.append(chunk)
+            if not chunk_rows:
+                return None
+
+            voice_config = self._load_voice_config()
+            narrator_overrides = self.get_narrator_overrides()
+            narrator_name = self._resolve_narrator_name(voice_config, chunk_rows)
+            runtime_cache = {}
+            runtime_errors = {}
+
+            for chunk in chunk_rows:
+                source_speaker = str((chunk or {}).get("speaker") or "").strip()
+                resolved_speaker = self._resolve_generation_speaker(
+                    chunk,
+                    voice_config,
+                    narrator_overrides=narrator_overrides,
+                    narrator_name=narrator_name,
+                )
+                cache_key = self._normalize_speaker_name(resolved_speaker)
+                if cache_key not in runtime_cache and cache_key not in runtime_errors:
+                    try:
+                        prepared = self.prepare_runtime_voice_config(voice_config, [resolved_speaker])
+                        runtime_cache[cache_key] = dict(prepared.get(resolved_speaker) or {})
+                    except Exception as exc:
+                        runtime_errors[cache_key] = str(exc).strip() or f'Unable to prepare a voice for "{resolved_speaker}".'
+
+                if cache_key in runtime_errors:
+                    issue_message = runtime_errors[cache_key]
+                    issue_code = "voice_config_required"
+                else:
+                    issue = self._voice_generation_issue_from_config(
+                        resolved_speaker,
+                        runtime_cache.get(cache_key) or {},
+                    )
+                    if issue is None:
+                        continue
+                    issue_message = str(issue.get("message") or "").strip() or f'"{resolved_speaker}" has no voice selected.'
+                    issue_code = str(issue.get("code") or "voice_config_required").strip() or "voice_config_required"
+
+                if source_speaker and self._normalize_speaker_name(source_speaker) != self._normalize_speaker_name(resolved_speaker):
+                    message = (
+                        f'Cannot render because "{source_speaker}" resolves to "{resolved_speaker}", '
+                        f'and {issue_message}'
+                    )
+                else:
+                    message = f"Cannot render because {issue_message}"
+                return {
+                    "code": issue_code,
+                    "message": message,
+                    "speaker": source_speaker or resolved_speaker,
+                    "voice_speaker": resolved_speaker or source_speaker,
+                    "resolved_speaker": resolved_speaker,
+                    "chunk_uid": str((chunk or {}).get("uid") or "").strip(),
+                    "chunk_id": int((chunk or {}).get("id") or 0),
+                    "chapter": str((chunk or {}).get("chapter") or "").strip(),
+                }
+
+            return None
 
         def preview_voice_config_invalidation(self, old_config, new_config):
             """Preview how many generated clips must be invalidated for a voice-config change.
