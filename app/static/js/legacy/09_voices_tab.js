@@ -13,6 +13,8 @@
         let _voiceAliasesPrimedForScript = false;
         let _voiceSaveFlushPromise = null;
         let _voiceSavePending = false;
+        let _loadVoicesInFlight = null;
+        let _voicesRenderSignature = '';
         let _dirtyVoiceNames = new Set();
         let _voiceSavePendingOptions = {
             promptConfirmation: false,
@@ -73,6 +75,39 @@
             const narratesInput = narratorCard.querySelector('.voice-narrates');
             if (narratesInput && !narratesInput.checked) return '';
             return narratorCard.dataset.voice;
+        }
+
+        function captureVoicesListScrollState(container) {
+            return {
+                listScrollTop: container ? Number(container.scrollTop) || 0 : 0,
+                windowScrollY: typeof window !== 'undefined' ? (Number(window.scrollY) || 0) : 0,
+            };
+        }
+
+        function restoreVoicesListScrollState(container, scrollState) {
+            if (!container || !scrollState) return;
+            const restore = () => {
+                const maxScrollTop = Math.max(0, (Number(container.scrollHeight) || 0) - (Number(container.clientHeight) || 0));
+                container.scrollTop = Math.max(0, Math.min(Number(scrollState.listScrollTop) || 0, maxScrollTop));
+                if (typeof window !== 'undefined' && typeof window.scrollTo === 'function') {
+                    window.scrollTo(0, Number(scrollState.windowScrollY) || 0);
+                }
+            };
+            if (typeof requestAnimationFrame === 'function') {
+                requestAnimationFrame(restore);
+            } else {
+                setTimeout(restore, 0);
+            }
+        }
+
+        function buildVoicesRenderSignature(voices, extras = {}) {
+            return JSON.stringify({
+                narratorThreshold: Number(extras.narratorThreshold) || 0,
+                voices: Array.isArray(voices) ? voices : [],
+                designedVoices: Array.isArray(extras.designedVoices) ? extras.designedVoices : [],
+                cloneVoices: Array.isArray(extras.cloneVoices) ? extras.cloneVoices : [],
+                loraModels: Array.isArray(extras.loraModels) ? extras.loraModels : [],
+            });
         }
 
         function isNarratorVoiceCard(card) {
@@ -474,47 +509,85 @@
         };
 
         async function loadVoices() {
-            await loadVoiceSettings();
-            // Refresh voice caches so dropdowns are populated
-            try {
-                window._designedVoicesCache = await API.get('/api/voice_design/list');
-            } catch (e) { /* ignore if designer not available */ }
-            try {
-                window._cloneVoicesCache = await API.get('/api/clone_voices/list');
-            } catch (e) { /* ignore if no uploads */ }
-            try {
-                window._loraModelsCache = await API.get('/api/lora/models');
-            } catch (e) { /* ignore if no adapters */ }
-
-            const voices = await API.get('/api/voices');
-            window._narratingVoicesCache = voices
-                .filter(v => v.config?.narrates === true)
-                .map(v => v.name);
-            const container = document.getElementById('voices-list');
-            if (voices.length === 0) {
-                container.innerHTML = '<div class="alert alert-info">No voices found. Generate a script first.</div>';
-                layoutVoicesListContainer();
-                return;
+            if (_loadVoicesInFlight) {
+                return _loadVoicesInFlight;
             }
-            container.innerHTML = voices.map((v, i) => createVoiceCard(v, i)).join('');
-            _dirtyVoiceNames.clear();
-            updateVoiceAliasStates();
-            layoutVoicesListContainer();
 
-            let filledMissingDesignSample = false;
-            voices.forEach(voice => {
-                const config = voice.config || {};
-                const voiceType = config.type || 'design';
-                if (voiceType !== 'design') return;
-                if ((config.ref_text || '').trim()) return;
-                const card = Array.from(document.querySelectorAll('.voice-card')).find(el => el.dataset.voice === voice.name);
-                const sampleInput = card?.querySelector('.design-sample-text');
-                if (sampleInput && voice.suggested_sample_text) {
-                    sampleInput.value = voice.suggested_sample_text;
-                    filledMissingDesignSample = true;
+            const run = (async () => {
+                const container = document.getElementById('voices-list');
+                if (!container) return;
+                const scrollState = captureVoicesListScrollState(container);
+
+                await loadVoiceSettings();
+                // Refresh voice caches so dropdowns are populated
+                try {
+                    window._designedVoicesCache = await API.get('/api/voice_design/list');
+                } catch (e) { /* ignore if designer not available */ }
+                try {
+                    window._cloneVoicesCache = await API.get('/api/clone_voices/list');
+                } catch (e) { /* ignore if no uploads */ }
+                try {
+                    window._loraModelsCache = await API.get('/api/lora/models');
+                } catch (e) { /* ignore if no adapters */ }
+
+                const voices = await API.get('/api/voices');
+                window._narratingVoicesCache = voices
+                    .filter(v => v.config?.narrates === true)
+                    .map(v => v.name);
+
+                const renderSignature = buildVoicesRenderSignature(voices, {
+                    narratorThreshold: getNarratorThresholdValue(),
+                    designedVoices: window._designedVoicesCache,
+                    cloneVoices: window._cloneVoicesCache,
+                    loraModels: window._loraModelsCache,
+                });
+
+                if (voices.length === 0) {
+                    const emptyMarkup = '<div class="alert alert-info">No voices found. Generate a script first.</div>';
+                    if (container.innerHTML !== emptyMarkup) {
+                        container.innerHTML = emptyMarkup;
+                    }
+                    _voicesRenderSignature = renderSignature;
+                    layoutVoicesListContainer();
+                    restoreVoicesListScrollState(container, scrollState);
+                    return;
                 }
-            });
 
+                if (_voicesRenderSignature === renderSignature && container.innerHTML) {
+                    layoutVoicesListContainer();
+                    restoreVoicesListScrollState(container, scrollState);
+                    return;
+                }
+
+                container.innerHTML = voices.map((v, i) => createVoiceCard(v, i)).join('');
+                _voicesRenderSignature = renderSignature;
+                _dirtyVoiceNames.clear();
+                updateVoiceAliasStates();
+                layoutVoicesListContainer();
+
+                voices.forEach(voice => {
+                    const config = voice.config || {};
+                    const voiceType = config.type || 'design';
+                    if (voiceType !== 'design') return;
+                    if ((config.ref_text || '').trim()) return;
+                    const card = Array.from(document.querySelectorAll('.voice-card')).find(el => el.dataset.voice === voice.name);
+                    const sampleInput = card?.querySelector('.design-sample-text');
+                    if (sampleInput && voice.suggested_sample_text) {
+                        sampleInput.value = voice.suggested_sample_text;
+                    }
+                });
+
+                restoreVoicesListScrollState(container, scrollState);
+            })();
+
+            _loadVoicesInFlight = run;
+            try {
+                return await run;
+            } finally {
+                if (_loadVoicesInFlight === run) {
+                    _loadVoicesInFlight = null;
+                }
+            }
         }
 
         function collectVoiceConfig(cardsInput = null) {

@@ -20,7 +20,7 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
             const vm = require('vm');
 
             const source = fs.readFileSync({str(VOICES_TAB_JS)!r}, 'utf8')
-                + '\\nthis.__voicesTabTestHooks = {{ saveVoicesNow, suggestVoiceDescriptionsBulk, collectVoiceConfig, flushPendingVoiceSavesOnUnload, updateVoiceAliasStates }};';
+                + '\\nthis.__voicesTabTestHooks = {{ saveVoicesNow, suggestVoiceDescriptionsBulk, collectVoiceConfig, flushPendingVoiceSavesOnUnload, updateVoiceAliasStates, loadVoices }};';
 
             function createControl(initial = '', classNames = []) {{
                 return {{
@@ -250,6 +250,10 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
                     addEventListener(type, handler) {{
                         listeners[type] = handler;
                     }},
+                    innerHTML: '',
+                    scrollTop: 0,
+                    scrollHeight: 2000,
+                    clientHeight: 400,
                     style: {{}},
                     getBoundingClientRect() {{ return {{ top: 0 }}; }},
                 }};
@@ -269,6 +273,7 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
                     window: null,
                     document: {{
                         hidden: false,
+                        documentElement: {{ clientHeight: 900 }},
                         body: {{ appendChild() {{}}, removeChild() {{}} }},
                         querySelectorAll(selector) {{
                             if (selector === '.voice-card') return cards.map(item => item.card);
@@ -329,6 +334,10 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
                 }};
 
                 context.window = context;
+                context.window.scrollY = 0;
+                context.window.scrollTo = (_x, y) => {{
+                    context.window.scrollY = Number(y) || 0;
+                }};
                 context.window.addEventListener = () => {{}};
                 context.window.setNavTaskSpinner = (name) => spinnerCalls.push(['set', name]);
                 context.window.releaseNavTaskSpinner = (name) => spinnerCalls.push(['release', name]);
@@ -338,11 +347,18 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
                 context.__spinnerCalls = spinnerCalls;
                 context.__voicesListListeners = listeners;
                 context.__fetchCalls = fetchCalls;
+                context.__voicesList = voicesList;
                 return context;
             }}
 
             async function tick() {{
                 await new Promise((resolve) => setTimeout(resolve, 0));
+            }}
+
+            async function flushTicks(count = 6) {{
+                for (let index = 0; index < count; index += 1) {{
+                    await tick();
+                }}
             }}
 
             async function waitFor(predicate, attempts = 20) {{
@@ -885,6 +901,103 @@ class VoicesTabSaveQueueTests(unittest.TestCase):
                 const lastPayload = savePayloads[savePayloads.length - 1];
                 assert.strictEqual(lastPayload.config.Aerial.alias, 'Blake');
                 assert.strictEqual(lastPayload.config.Blake.narrates, true);
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_load_voices_skips_identical_rerender_and_preserves_scroll(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext([], async () => ({ status: 'ok' }));
+                let renderCalls = 0;
+                let voicesResponse = [
+                    { name: 'Aerial', config: { type: 'design', narrates: false }, line_count: 10, paragraph_count: 4, suggested_sample_text: 'sample' },
+                ];
+
+                context.API.get = async (url) => {
+                    if (url === '/api/voices/settings') return { narrator_threshold: 10 };
+                    if (url === '/api/voice_design/list') return [];
+                    if (url === '/api/clone_voices/list') return [];
+                    if (url === '/api/lora/models') return [];
+                    if (url === '/api/voices') return voicesResponse;
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+                context.createVoiceCard = (voice) => {
+                    renderCalls += 1;
+                    return `<div class="voice-card" data-voice="${voice.name}">${voice.name}</div>`;
+                };
+                context.updateVoiceAliasStates = () => {};
+
+                await context.__voicesTabTestHooks.loadVoices();
+                await flushTicks();
+
+                context.__voicesList.scrollTop = 321;
+                context.window.scrollY = 87;
+
+                await context.__voicesTabTestHooks.loadVoices();
+                await flushTicks();
+
+                assert.strictEqual(renderCalls, 1, 'identical voice payload should not rebuild the list a second time');
+                assert.strictEqual(context.__voicesList.scrollTop, 321);
+                assert.strictEqual(context.window.scrollY, 87);
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_load_voices_restores_scroll_after_rerender_when_data_changes(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext([], async () => ({ status: 'ok' }));
+                let renderCalls = 0;
+                let voicesResponse = [
+                    { name: 'Aerial', config: { type: 'design', narrates: false }, line_count: 10, paragraph_count: 4, suggested_sample_text: 'sample' },
+                ];
+
+                context.API.get = async (url) => {
+                    if (url === '/api/voices/settings') return { narrator_threshold: 10 };
+                    if (url === '/api/voice_design/list') return [];
+                    if (url === '/api/clone_voices/list') return [];
+                    if (url === '/api/lora/models') return [];
+                    if (url === '/api/voices') return voicesResponse;
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+                context.createVoiceCard = (voice) => {
+                    renderCalls += 1;
+                    return `<div class="voice-card" data-voice="${voice.name}">${voice.name}</div>`;
+                };
+                context.updateVoiceAliasStates = () => {};
+
+                await context.__voicesTabTestHooks.loadVoices();
+                await flushTicks();
+
+                context.__voicesList.scrollTop = 444;
+                context.window.scrollY = 123;
+                voicesResponse = [
+                    { name: 'Aerial', config: { type: 'design', narrates: false }, line_count: 10, paragraph_count: 4, suggested_sample_text: 'sample' },
+                    { name: 'Blake', config: { type: 'design', narrates: false }, line_count: 8, paragraph_count: 3, suggested_sample_text: 'sample 2' },
+                ];
+
+                await context.__voicesTabTestHooks.loadVoices();
+                await flushTicks();
+
+                assert.strictEqual(renderCalls, 3, 'changed voice payload should rebuild the list');
+                assert.strictEqual(context.__voicesList.scrollTop, 444);
+                assert.strictEqual(context.window.scrollY, 123);
+                assert.ok(context.__voicesList.innerHTML.includes('Blake'));
             })().catch((error) => {
                 console.error(error);
                 process.exit(1);
