@@ -455,7 +455,7 @@ def build_attribution_classifier(
     model_name,
     system_prompt,
     user_prompt_template,
-    max_tokens=256,
+    max_tokens=None,
     completion_service=None,
     structured_service=None,
     runtime=None,

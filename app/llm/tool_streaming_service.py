@@ -18,7 +18,7 @@ class ToolStreamingService:
         model_name: str,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
-        max_tokens: int,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.1,
         tool_choice: Any = "required",
         parallel_tool_calls: bool = False,
@@ -29,15 +29,20 @@ class ToolStreamingService:
         text_content = ""
 
         try:
+            payload: Dict[str, Any] = {
+                "model": model_name,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "parallel_tool_calls": parallel_tool_calls,
+                "temperature": temperature,
+                "stream": True,
+            }
+            if max_tokens is not None:
+                payload["max_tokens"] = int(max_tokens)
+
             stream = client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                parallel_tool_calls=parallel_tool_calls,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
+                **payload,
             )
         except Exception as exc:
             raise LLMTransportError(f"Failed to start streamed LLM request: {exc}") from exc

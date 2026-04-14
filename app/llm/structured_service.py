@@ -153,7 +153,7 @@ class StructuredLLMService:
                     tool_choice="required",
                     parallel_tool_calls=False,
                     temperature=0.1 if temperature is None else float(temperature),
-                    max_tokens=int(max_tokens or 512),
+                    max_tokens=int(max_tokens) if max_tokens is not None else None,
                     reasoning_parameter_name=reasoning_parameter_name,
                 )
             except Exception:
@@ -311,15 +311,23 @@ class StructuredLLMService:
         if message is None:
             return None
         tool_calls = getattr(message, "tool_calls", None) or []
-        if not tool_calls:
-            return None
-        function = getattr(tool_calls[0], "function", None)
-        if function is None:
-            return None
-        arguments = getattr(function, "arguments", None)
+        if tool_calls:
+            function = getattr(tool_calls[0], "function", None)
+            if function is not None:
+                arguments = getattr(function, "arguments", None)
+                parsed = StructuredLLMService._parse_tool_arguments_payload(arguments)
+                if parsed is not None:
+                    return parsed
+
+        # LM Studio can emit tool invocations in reasoning_content tags without
+        # populating message.tool_calls for some models/prompts.
+        reasoning_payload = getattr(message, "reasoning_content", None)
+        return StructuredLLMService._extract_reasoning_tool_arguments(reasoning_payload)
+
+    @staticmethod
+    def _parse_tool_arguments_payload(arguments: Any) -> Optional[Dict[str, Any]]:
         if not arguments:
             return None
-
         if isinstance(arguments, dict):
             return arguments
         if not isinstance(arguments, str):
@@ -329,6 +337,33 @@ class StructuredLLMService:
         except json.JSONDecodeError:
             return None
         return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _extract_reasoning_tool_arguments(reasoning_payload: Any) -> Optional[Dict[str, Any]]:
+        content = str(reasoning_payload or "").strip()
+        if not content:
+            return None
+
+        matches = re.findall(
+            r"<parameter=([A-Za-z0-9_:-]+)>([\s\S]*?)</parameter>",
+            content,
+            flags=re.IGNORECASE,
+        )
+        if not matches:
+            return None
+
+        parsed: Dict[str, Any] = {}
+        for name, raw_value in matches:
+            key = str(name or "").strip()
+            if not key:
+                continue
+            text = str(raw_value or "").strip()
+            if not text:
+                parsed[key] = ""
+                continue
+            loaded = StructuredLLMService._try_json_load(text)
+            parsed[key] = loaded if loaded is not None else text
+        return parsed or None
 
     @staticmethod
     def _payload_to_text(payload: Any) -> str:

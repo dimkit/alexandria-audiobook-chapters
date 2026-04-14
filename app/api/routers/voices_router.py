@@ -461,6 +461,14 @@ def _llm_worker_count(config: Dict[str, dict] | None = None) -> int:
         return 1
 
 
+def _generation_max_tokens(config: Dict[str, dict] | None = None) -> int:
+    generation_config = (config or {}).get("generation", {})
+    try:
+        return max(1, int(generation_config.get("max_tokens", 4096) or 4096))
+    except (TypeError, ValueError):
+        return 4096
+
+
 def suggest_voice_description_sync(speaker: str):
     speaker = (speaker or "").strip()
     if not speaker:
@@ -486,6 +494,7 @@ def suggest_voice_description_sync(speaker: str):
         runtime=runtime,
         messages=[{"role": "user", "content": prompt_payload["prompt"]}],
         contract=VOICE_DESCRIPTION_CONTRACT,
+        max_tokens=_generation_max_tokens(config),
     )
     payload = result.parsed if isinstance(result.parsed, dict) else None
     voice = str((payload or {}).get("voice") or "").strip()

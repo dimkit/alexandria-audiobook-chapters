@@ -4663,6 +4663,7 @@ def run_script_sanity_task(run_id: str, stop_check=None):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 config = json.load(f)
         chunk_size = int(config.get("generation", {}).get("chunk_size", 3000))
+        generation_max_tokens = int(config.get("generation", {}).get("max_tokens", 4096) or 4096)
         llm_config = config.get("llm", {})
         prompts_config = config.get("prompts", {})
         if not prompts_config.get("attribution_system_prompt") or not prompts_config.get("attribution_user_prompt"):
@@ -4701,6 +4702,7 @@ def run_script_sanity_task(run_id: str, stop_check=None):
                 llm_runtime.model_name,
                 attribution_system_prompt,
                 attribution_user_prompt,
+                max_tokens=generation_max_tokens,
                 runtime=llm_runtime,
             )
 

@@ -18,12 +18,15 @@ from typing import Callable
 import pytest
 import requests
 
+from llm import LMStudioModelLoadService
 from runtime_layout import RuntimeLayout
 
 
 LMSTUDIO_BASE_URL = "http://127.0.0.1:1234"
+LMSTUDIO_API_KEY = "local"
 TOOL_MODEL_NAME = "qwen/qwen3.5-9b"
-NON_TOOL_MODEL_NAME = "bartowski/google_gemma-3-4b-it-GGUF"
+NON_TOOL_MODEL_NAME = "google_gemma-3-4b-it"
+NON_TOOL_MODEL_FALLBACKS = ("bartowski/google_gemma-3-4b-it-GGUF",)
 TOOL_MODEL_CONTEXT_LENGTH = 16384
 NON_TOOL_MODEL_CONTEXT_LENGTH = 16384
 MAX_RETRIES_PER_SCENARIO = 1
@@ -34,6 +37,7 @@ LIVE_TEST_LOCK_PATH = os.path.join(tempfile.gettempdir(), "threadspeak_lmstudio_
 SOURCE_LAYOUT = RuntimeLayout.from_app_dir(os.path.dirname(os.path.abspath(__file__)))
 SOURCE_REPO_DIR = SOURCE_LAYOUT.repo_root
 SOURCE_APP_DIR = SOURCE_LAYOUT.app_dir
+LMSTUDIO_CONTROL_SERVICE = LMStudioModelLoadService(timeout_seconds=240)
 
 MODE_PATTERN = re.compile(r"llm_mode=([^\s]+)\s+tool_call_observed=(True|False)")
 
@@ -153,31 +157,57 @@ def _wait_for_lmstudio_model_loaded(model_name: str):
     )
 
 
-def _load_lmstudio_model_once(model_name: str, context_length: int):
-    response = requests.post(
-        f"{LMSTUDIO_BASE_URL}/api/v1/models/load",
-        json={
-            "model": model_name,
-            "context_length": int(context_length),
-            "echo_load_config": True,
-        },
-        timeout=240,
+def _load_lmstudio_model_once(model_name: str, context_length: int, fallback_model_names=()):
+    candidates = []
+    for candidate in (model_name, *(fallback_model_names or ())):
+        normalized = str(candidate or "").strip()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    errors = []
+    for candidate in candidates:
+        try:
+            payload = LMSTUDIO_CONTROL_SERVICE.load_model(
+                base_url=LMSTUDIO_BASE_URL,
+                api_key=LMSTUDIO_API_KEY,
+                model_name=candidate,
+                context_length=int(context_length),
+                echo_load_config=True,
+            )
+            if str(payload.get("status") or "") != "loaded":
+                raise AssertionError(
+                    f"LM Studio model load returned unexpected status for '{candidate}': {payload}"
+                )
+            if str(payload.get("type") or "") != "llm":
+                raise AssertionError(
+                    f"LM Studio model load returned unexpected type for '{candidate}': {payload}"
+                )
+            _wait_for_lmstudio_model_loaded(candidate)
+            return candidate
+        except requests.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            errors.append(f"{candidate}: HTTP {status_code} ({exc})")
+            if status_code == 404:
+                continue
+            raise
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+            raise
+
+    raise AssertionError(
+        f"Unable to load any LM Studio model candidate from {candidates}. "
+        f"Errors: {errors}"
     )
-    if response.status_code != 200:
-        raise AssertionError(
-            f"LM Studio model load failed for '{model_name}' with "
-            f"HTTP {response.status_code}: {response.text[:1000]}"
-        )
-    payload = response.json()
-    if str(payload.get("status") or "") != "loaded":
-        raise AssertionError(
-            f"LM Studio model load returned unexpected status for '{model_name}': {payload}"
-        )
-    if str(payload.get("type") or "") != "llm":
-        raise AssertionError(
-            f"LM Studio model load returned unexpected type for '{model_name}': {payload}"
-        )
-    _wait_for_lmstudio_model_loaded(model_name)
+
+
+def _unload_all_lmstudio_models_once():
+    payload = LMSTUDIO_CONTROL_SERVICE.unload_all_models(
+        base_url=LMSTUDIO_BASE_URL,
+        api_key=LMSTUDIO_API_KEY,
+    )
+    if str(payload.get("status") or "") != "ok":
+        raise AssertionError(f"LM Studio unload-all returned unexpected status: {payload}")
 
 
 def _find_free_port() -> int:
@@ -562,15 +592,26 @@ def _execute_scenario_with_retry(
     raise AssertionError(f"Scenario {scenario.name} failed: {last_error}")
 
 
-def _run_phase(model_name: str, expected_mode: str, expected_tool: bool, context_length: int):
-    _load_lmstudio_model_once(model_name, context_length)
+def _run_phase(
+    model_name: str,
+    expected_mode: str,
+    expected_tool: bool,
+    context_length: int,
+    fallback_model_names=(),
+):
+    _unload_all_lmstudio_models_once()
+    loaded_model_name = _load_lmstudio_model_once(
+        model_name,
+        context_length,
+        fallback_model_names=fallback_model_names,
+    )
     failures = []
     with ThreadPoolExecutor(max_workers=len(SCENARIOS)) as executor:
         futures = {
             executor.submit(
                 _execute_scenario_with_retry,
                 scenario,
-                model_name,
+                loaded_model_name,
                 expected_mode,
                 expected_tool,
             ): scenario.name
@@ -599,9 +640,10 @@ def test_live_lmstudio_llm_endpoints_tool_and_json_fallback():
             expected_tool=True,
             context_length=TOOL_MODEL_CONTEXT_LENGTH,
         )
-        _run_phase(
-            model_name=NON_TOOL_MODEL_NAME,
-            expected_mode="json",
-            expected_tool=False,
-            context_length=NON_TOOL_MODEL_CONTEXT_LENGTH,
-        )
+    _run_phase(
+        model_name=NON_TOOL_MODEL_NAME,
+        expected_mode="json",
+        expected_tool=False,
+        context_length=NON_TOOL_MODEL_CONTEXT_LENGTH,
+        fallback_model_names=NON_TOOL_MODEL_FALLBACKS,
+    )

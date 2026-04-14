@@ -163,6 +163,68 @@ class ToolCapabilityVerificationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("Model name is required", str(ctx.exception.detail))
 
+    def test_lm_studio_unload_all_models_unloads_loaded_instances(self):
+        with (
+            mock.patch.object(
+                config_router,
+                "_lmstudio_request_json",
+                return_value={
+                    "models": [
+                        {
+                            "key": "qwen",
+                            "loaded_instances": [{"id": "qwen/instance"}],
+                        },
+                        {
+                            "key": "gemma",
+                            "loaded_instances": [{"id": "gemma/instance"}],
+                        },
+                    ]
+                },
+            ),
+            mock.patch.object(config_router, "_post_json", return_value={"instance_id": "ok"}) as post_mock,
+        ):
+            result = config_router.unload_all_lmstudio_models(
+                base_url="http://127.0.0.1:1234/v1",
+                api_key="local",
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["total_loaded_instances"], 2)
+        self.assertEqual(post_mock.call_count, 2)
+        posted_payloads = [call[0][1] for call in post_mock.call_args_list]
+        self.assertEqual(
+            sorted(payload["instance_id"] for payload in posted_payloads),
+            ["gemma/instance", "qwen/instance"],
+        )
+
+    def test_lm_studio_unload_all_models_endpoint_uses_saved_defaults(self):
+        with (
+            mock.patch.object(
+                config_router,
+                "_read_saved_llm_config",
+                return_value={
+                    "base_url": "http://127.0.0.1:1234/v1",
+                    "api_key": "local",
+                },
+            ),
+            mock.patch.object(
+                config_router,
+                "unload_all_lmstudio_models",
+                return_value={"status": "ok", "total_loaded_instances": 0, "unloaded_instance_ids": []},
+            ) as unload_mock,
+        ):
+            result = asyncio.run(
+                config_router.unload_all_lmstudio_models_endpoint(
+                    config_router.LMStudioUnloadAllModelsRequest()
+                )
+            )
+
+        self.assertEqual(result["status"], "ok")
+        unload_mock.assert_called_once()
+        kwargs = unload_mock.call_args.kwargs
+        self.assertEqual(kwargs["base_url"], "http://127.0.0.1:1234/v1")
+        self.assertEqual(kwargs["api_key"], "local")
+
 
 if __name__ == "__main__":
     unittest.main()

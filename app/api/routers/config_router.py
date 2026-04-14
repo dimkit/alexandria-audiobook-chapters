@@ -39,8 +39,18 @@ class LMStudioModelLoadRequest(BaseModel):
     echo_load_config: bool = False
 
 
+class LMStudioUnloadAllModelsRequest(BaseModel):
+    base_url: str = ""
+    api_key: str | None = None
+
+
 def _request_json(url: str, api_key: str):
     service = ToolCapabilityService(timeout_seconds=_TOOL_CAPABILITY_TIMEOUT_SECONDS)
+    return service._request_json(url, api_key)
+
+
+def _lmstudio_request_json(url: str, api_key: str):
+    service = LMStudioModelLoadService(timeout_seconds=_LMSTUDIO_MODEL_LOAD_TIMEOUT_SECONDS)
     return service._request_json(url, api_key)
 
 
@@ -71,6 +81,7 @@ def _tool_capability_service() -> ToolCapabilityService:
 def _lmstudio_model_load_service() -> LMStudioModelLoadService:
     return LMStudioModelLoadService(
         timeout_seconds=_LMSTUDIO_MODEL_LOAD_TIMEOUT_SECONDS,
+        request_json_fn=_lmstudio_request_json,
         post_json_fn=_post_json,
     )
 
@@ -121,6 +132,17 @@ def load_lmstudio_model(
         num_experts=num_experts,
         offload_kv_cache_to_gpu=offload_kv_cache_to_gpu,
         echo_load_config=echo_load_config,
+    )
+
+
+def unload_all_lmstudio_models(
+    *,
+    base_url: str,
+    api_key: str,
+):
+    return _lmstudio_model_load_service().unload_all_models(
+        base_url=base_url,
+        api_key=api_key,
     )
 
 
@@ -674,6 +696,27 @@ async def load_lmstudio_model_endpoint(request: LMStudioModelLoadRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to load LM Studio model: {exc}") from exc
+
+
+@router.post("/api/config/lmstudio/unload_all_models")
+async def unload_all_lmstudio_models_endpoint(request: LMStudioUnloadAllModelsRequest):
+    saved = _read_saved_llm_config()
+    base_url = (request.base_url or "").strip() or str(saved.get("base_url") or "").strip()
+    api_key = request.api_key if request.api_key is not None else str(saved.get("api_key") or "")
+
+    if not base_url:
+        raise HTTPException(status_code=400, detail="LLM base URL is required.")
+
+    try:
+        return await asyncio.to_thread(
+            unload_all_lmstudio_models,
+            base_url=base_url,
+            api_key=api_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to unload LM Studio models: {exc}") from exc
 
 
 @router.post("/api/generation_mode_lock")
