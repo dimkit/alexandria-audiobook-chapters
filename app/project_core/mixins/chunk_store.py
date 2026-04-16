@@ -151,10 +151,16 @@ class ProjectChunkStoreMixin:
             return chunks
 
         def load_chunks_raw(self, chapter=None):
+            normalized_chapter = str(chapter or "").strip()
             with self._chunks_lock:
+                if normalized_chapter:
+                    # Chapter-scoped reads should hit SQLite directly to avoid loading
+                    # the full project snapshot when callers only need one chapter.
+                    return self.script_store.load_chunks(chapter=normalized_chapter)
+
                 full_snapshot = self._load_chunks_from_disk_locked()
                 self._set_chunks_snapshot(full_snapshot)
-                return self._copy_chunks_snapshot(chapter=chapter) or []
+                return self._copy_chunks_snapshot() or []
 
         def load_chunks_view(self, chapter=None):
             if chapter:
@@ -174,6 +180,24 @@ class ProjectChunkStoreMixin:
 
         def load_chunks(self, chapter=None):
             return self.load_chunks_raw(chapter=chapter)
+
+        def load_proofread_view(self, chapter=None, page=1, page_size=500, include_chapters=False):
+            payload = self.script_store.load_proofread_view(
+                chapter=chapter,
+                page=page,
+                page_size=page_size,
+                include_chapters=include_chapters,
+            )
+            chunks = list(payload.get("chunks") or [])
+            runtime = self._copy_chunk_runtime(chunk.get("uid") for chunk in chunks)
+            payload["chunks"] = [
+                self._merge_runtime_chunk(chunk, runtime.get(chunk.get("uid")))
+                for chunk in chunks
+            ]
+            return payload
+
+        def get_next_proofread_failure(self, after_uid=None):
+            return self.script_store.get_next_proofread_failure(after_uid=after_uid)
 
         def get_chunk_raw(self, chunk_ref):
             return self.script_store.get_chunk(chunk_ref)

@@ -3,12 +3,15 @@
         let isPlayingSequence = false;
         let cachedChunks = []; // Cache to track changes
         let cachedVisibleChunkIds = [];
-        let cachedProofreadVisibleChunkIds = [];
         let selectedEditorChapter = WHOLE_PROJECT_CHAPTER_ID;
         let editorChapterAutoSelected = false;
         let editorChapterSummaries = [];
         let selectedProofreadChapter = WHOLE_PROJECT_CHAPTER_ID;
         let proofreadChapterAutoSelected = false;
+        let cachedProofreadChunks = [];
+        let proofreadChapterSummaries = [];
+        let latestProofreadViewStats = { chapter: null, project: null };
+        let latestProofreadPagination = { page: 1, page_size: 2000, total: 0, has_next: false };
         let audioQueuePollTimer = null;
         let audioQueuePollInFlight = null;
         let editorEventSource = null;
@@ -117,12 +120,13 @@
                 return rawPath;
             }
             const normalizedPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
-            const token = cacheToken || Date.now().toString();
-            return `${normalizedPath}?t=${encodeURIComponent(String(token))}`;
+            const token = String(cacheToken || '').trim();
+            if (!token) return normalizedPath;
+            return `${normalizedPath}?t=${encodeURIComponent(token)}`;
         }
 
         function buildChunkAudioSrc(chunk, fallbackToken = '') {
-            const fingerprint = getChunkAudioFingerprint(chunk) || fallbackToken || Date.now().toString();
+            const fingerprint = getChunkAudioFingerprint(chunk) || fallbackToken || String(chunk?.audio_path || '').trim();
             return buildAudioSrcFromPath(chunk?.audio_path || '', fingerprint);
         }
 
@@ -806,7 +810,7 @@
             ];
         }
 
-        function syncProofreadChapterState(chunks = cachedChunks, chapterSummaries = editorChapterSummaries) {
+        function syncProofreadChapterState(chunks = cachedProofreadChunks, chapterSummaries = proofreadChapterSummaries) {
             const select = document.getElementById('proofread-chapter-select');
             const summary = document.getElementById('proofread-chapter-summary');
             if (!select || !summary) return;
@@ -1093,7 +1097,7 @@
                         chunkRef,
                         audioPath: chunk.audio_path,
                         fingerprint: getChunkAudioFingerprint(chunk),
-                        src: buildChunkAudioSrc(chunk, Date.now().toString()),
+                        src: buildChunkAudioSrc(chunk),
                         width: 210,
                     })
                     : '<span class="text-muted small">No audio</span>';
@@ -1136,7 +1140,6 @@
                 });
             }
 
-            cachedProofreadVisibleChunkIds = visibleChunks.map(chunk => getChunkRef(chunk));
         }
 
         function getProofreadDerivedStats(chunks, threshold = getProofreadThreshold(), chapterId = selectedProofreadChapter) {
@@ -1185,8 +1188,9 @@
             status = latestProofreadStatus;
             const progress = status?.progress || {};
             const running = !!status?.running;
-            const derived = getProofreadDerivedStats(cachedChunks);
-            const projectDerived = getProofreadDerivedStats(cachedChunks, getProofreadThreshold(), WHOLE_PROJECT_CHAPTER_ID);
+            const derived = getProofreadDerivedStats(cachedProofreadChunks);
+            const chapterStats = latestProofreadViewStats?.chapter || derived;
+            const projectDerived = latestProofreadViewStats?.project || chapterStats;
             const progressCompleted = Number.isFinite(Number(progress.processed))
                 ? Number(progress.processed)
                 : (Number.isFinite(Number(progress.transcribed)) ? Number(progress.transcribed) : 0);
@@ -1198,13 +1202,13 @@
             document.getElementById('proofread-phase').textContent = progress.phase || (status?.running ? 'proofreading' : 'Idle');
             document.getElementById('proofread-progress').textContent = running
                 ? `${formatNumber(progressCompleted)} / ${formatNumber(progressTotal)}`
-                : `${formatNumber(derived.passed + derived.failed)} / ${formatNumber(Math.max(derived.total - derived.skipped, 0))}`;
+                : `${formatNumber(chapterStats.passed + chapterStats.failed)} / ${formatNumber(Math.max(chapterStats.total - chapterStats.skipped, 0))}`;
             document.getElementById('proofread-eta').textContent = formatDuration(progress.eta_seconds);
             document.getElementById('proofread-elapsed').textContent = formatDuration(progress.elapsed_seconds || 0);
-            document.getElementById('proofread-passed').textContent = formatNumber(running ? (progress.passed || 0) : derived.passed);
+            document.getElementById('proofread-passed').textContent = formatNumber(running ? (progress.passed || 0) : chapterStats.passed);
             document.getElementById('proofread-failed').textContent = formatNumber(running ? (progress.failed || 0) : projectDerived.failed);
-            document.getElementById('proofread-auto-failed').textContent = formatNumber(running ? (progress.auto_failed || 0) : derived.auto_failed);
-            document.getElementById('proofread-skipped').textContent = formatNumber(running ? (progress.skipped || 0) : derived.skipped);
+            document.getElementById('proofread-auto-failed').textContent = formatNumber(running ? (progress.auto_failed || 0) : chapterStats.auto_failed);
+            document.getElementById('proofread-skipped').textContent = formatNumber(running ? (progress.skipped || 0) : chapterStats.skipped);
 
             const summary = document.getElementById('proofread-run-summary');
             const chapterLabel = selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID ? 'the whole project' : selectedProofreadChapter;
@@ -1222,96 +1226,76 @@
             document.getElementById('btn-proofread-regrade-book').disabled = running;
         }
 
+        async function loadProofreadData(options = {}) {
+            const chapterId = options.chapterId != null ? String(options.chapterId || '') : selectedProofreadChapter;
+            const normalizedChapter = chapterId && chapterId !== WHOLE_PROJECT_CHAPTER_ID
+                ? chapterId
+                : WHOLE_PROJECT_CHAPTER_ID;
+            const page = Number.isFinite(Number(options.page)) ? Math.max(1, Number(options.page)) : 1;
+            const pageSize = Number.isFinite(Number(options.pageSize)) ? Math.max(1, Number(options.pageSize)) : 2000;
+            const includeChapters = options.includeChapters !== false;
+
+            const params = new URLSearchParams();
+            if (normalizedChapter !== WHOLE_PROJECT_CHAPTER_ID) {
+                params.set('chapter', normalizedChapter);
+            }
+            params.set('page', String(page));
+            params.set('page_size', String(pageSize));
+            params.set('include_chapters', includeChapters ? '1' : '0');
+
+            const payload = await API.get(`/api/proofread/view?${params.toString()}`);
+            cachedProofreadChunks = Array.isArray(payload?.chunks) ? payload.chunks : [];
+            if (Array.isArray(payload?.chapters)) {
+                proofreadChapterSummaries = payload.chapters;
+            }
+            latestProofreadViewStats = {
+                chapter: payload?.stats?.chapter || null,
+                project: payload?.stats?.project || null,
+            };
+            latestProofreadPagination = payload?.pagination || latestProofreadPagination;
+            selectedProofreadChapter = normalizedChapter;
+
+            syncProofreadChapterState(cachedProofreadChunks, proofreadChapterSummaries);
+            renderProofreadTable(cachedProofreadChunks);
+            renderProofreadTaskStatus(await API.get('/api/status/proofread'));
+            return payload;
+        }
+        window.loadProofreadData = loadProofreadData;
+
         window.changeProofreadChapter = async (chapterId) => {
             selectedProofreadChapter = chapterId || WHOLE_PROJECT_CHAPTER_ID;
-            if (!Array.isArray(cachedChunks) || cachedChunks.length === 0) {
-                await loadChunks(true);
-                return;
-            }
-            renderProofreadTable(cachedChunks);
-            syncProofreadChapterState(cachedChunks);
-            renderProofreadTaskStatus(await API.get('/api/status/proofread'));
+            await loadProofreadData({ chapterId: selectedProofreadChapter, page: 1, includeChapters: true });
         };
 
         async function jumpToNextProofreadFailure(afterChunkRef) {
-            let chunks = Array.isArray(cachedChunks) ? cachedChunks : [];
-            if (!chunks.length) {
-                chunks = await API.get('/api/chunks/view');
-                cachedChunks = chunks;
-                syncEditorChapterState(chunks);
-                syncProofreadChapterState(chunks);
+            const query = new URLSearchParams();
+            if (afterChunkRef != null && String(afterChunkRef).trim()) {
+                query.set('after_uid', String(afterChunkRef).trim());
             }
+            const payload = await API.get(`/api/proofread/next_failure?${query.toString()}`);
+            if (!payload?.found) return false;
 
-            const isFailure = chunk => {
-                const p = chunk?.proofread || {};
-                return Boolean(p.checked) && !Boolean(p.passed) && !Boolean(p.manual_validated) && !Boolean(p.manual_failed);
-            };
-
-            const currentIndex = afterChunkRef != null
-                ? chunks.findIndex(c => getChunkRef(c) === String(afterChunkRef))
-                : -1;
-
-            // Search from the chunk after the current one, then wrap around
-            const candidates = currentIndex >= 0
-                ? [...chunks.slice(currentIndex + 1), ...chunks.slice(0, currentIndex + 1)]
-                : chunks;
-
-            const nextFailure = candidates.find(isFailure);
-            if (!nextFailure) return; // no failures left, stay put
-
-            const chapterId = getChunkChapterName(nextFailure) || WHOLE_PROJECT_CHAPTER_ID;
+            const chapterId = String(payload.chapter || '').trim() || WHOLE_PROJECT_CHAPTER_ID;
             selectedProofreadChapter = chapterId;
-            renderProofreadTable(cachedChunks);
-            syncProofreadChapterState(chunks);
+            await loadProofreadData({ chapterId, page: 1, includeChapters: true });
 
             await new Promise(resolve => requestAnimationFrame(() => resolve()));
-
-            const chunkRef = getChunkRef(nextFailure);
+            const chunkRef = String(payload.uid || '').trim();
             const row = document.querySelector(`#proofread-table-body tr[data-proofread-id="${CSS.escape(chunkRef)}"]`);
-            if (!row) return;
+            if (!row) return false;
 
             document.querySelectorAll('#proofread-table-body tr.table-primary').forEach(tr => tr.classList.remove('table-primary'));
             row.classList.add('table-primary');
             row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return true;
         }
 
         window.jumpToFirstProofreadFailure = async () => {
             try {
-                let chunks = Array.isArray(cachedChunks) ? cachedChunks : [];
-                if (!chunks.length) {
-                    chunks = await API.get('/api/chunks/view');
-                    cachedChunks = chunks;
-                    syncEditorChapterState(chunks);
-                    syncProofreadChapterState(chunks);
-                }
-
-                const firstFailure = chunks.find(chunk => {
-                    const proofread = chunk?.proofread || {};
-                    return Boolean(proofread.checked) && !Boolean(proofread.passed) && !Boolean(proofread.manual_validated) && !Boolean(proofread.manual_failed);
-                });
-                if (!firstFailure) {
+                const moved = await jumpToNextProofreadFailure(null);
+                if (!moved) {
                     showToast('No proofread failures were found.', 'info', 2500);
-                    return;
                 }
-
-                const chapterId = getChunkChapterName(firstFailure) || WHOLE_PROJECT_CHAPTER_ID;
-                selectedProofreadChapter = chapterId;
-                renderProofreadTable(cachedChunks);
-                syncProofreadChapterState(chunks);
-                renderProofreadTaskStatus(await API.get('/api/status/proofread'));
-
-                await new Promise(resolve => requestAnimationFrame(() => resolve()));
-
-                const chunkRef = getChunkRef(firstFailure);
-                const row = document.querySelector(`#proofread-table-body tr[data-proofread-id="${CSS.escape(chunkRef)}"]`);
-                if (!row) {
-                    showToast('Found a proofread failure, but could not scroll to it.', 'warning', 3000);
-                    return;
-                }
-
-                document.querySelectorAll('#proofread-table-body tr.table-primary').forEach(tr => tr.classList.remove('table-primary'));
-                row.classList.add('table-primary');
-                row.scrollIntoView({ behavior: 'smooth', block: 'center' });
             } catch (e) {
                 showToast('Failed to jump to the first proofread failure: ' + e.message, 'error');
             }
@@ -1325,7 +1309,7 @@
                 const config = await API.get('/api/config');
                 config.proofread = { ...(config.proofread || {}), certainty_threshold: threshold };
                 await API.post('/api/config', config);
-                renderProofreadTable(cachedChunks);
+                renderProofreadTable(cachedProofreadChunks);
                 renderProofreadTaskStatus(latestProofreadStatus || { running: false, progress: {}, logs: [] });
             } catch (e) {
                 showToast('Failed to save proofread certainty: ' + e.message, 'error');
@@ -1334,7 +1318,7 @@
 
         window.previewProofreadThreshold = () => {
             getProofreadThreshold();
-            renderProofreadTable(cachedChunks);
+            renderProofreadTable(cachedProofreadChunks);
             renderProofreadTaskStatus(latestProofreadStatus || { running: false, progress: {}, logs: [] });
         };
 
@@ -1346,7 +1330,7 @@
             };
             await API.post('/api/proofread', payload);
             await pollLogs('proofread', 'proofread-logs');
-            await loadChunks(false);
+            await loadProofreadData({ chapterId: selectedProofreadChapter, includeChapters: true });
         }
 
         window.startProofreadSequence = async () => {
@@ -1384,7 +1368,7 @@
                 const result = await API.post('/api/proofread/discard_selection', {
                     chapter: selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID ? null : selectedProofreadChapter,
                 });
-                await loadChunks(false);
+                await loadProofreadData({ chapterId: selectedProofreadChapter, includeChapters: true });
                 showToast(
                     `Discarded ${result.discarded || 0} proofread result(s). Preserved ${result.preserved_transcripts || 0} transcript cache(s).`,
                     'success',
@@ -1410,13 +1394,12 @@
         };
 
         function applyProofreadChunkUpdate(updatedChunk) {
-            // Patch cachedChunks in-place so jumpToNextProofreadFailure and
-            // renderProofreadTable see the correct state even when loadChunks(false)
-            // used chapter scope and didn't fetch this chunk's chapter.
             if (!updatedChunk) return;
             const ref = getChunkRef(updatedChunk);
-            const idx = cachedChunks.findIndex(c => getChunkRef(c) === ref);
-            if (idx >= 0) cachedChunks[idx] = updatedChunk;
+            const proofreadIdx = cachedProofreadChunks.findIndex(c => getChunkRef(c) === ref);
+            if (proofreadIdx >= 0) cachedProofreadChunks[proofreadIdx] = updatedChunk;
+            const editorIdx = cachedChunks.findIndex(c => getChunkRef(c) === ref);
+            if (editorIdx >= 0) cachedChunks[editorIdx] = updatedChunk;
             updateProofreadRow(updatedChunk);
         }
 
@@ -1427,7 +1410,6 @@
                 });
                 applyProofreadChunkUpdate(result.chunk);
                 showToast('Clip validated.', 'success', 2000);
-                await loadChunks(false);
                 await jumpToNextProofreadFailure(chunkRef);
             } catch (e) {
                 showToast('Failed to validate clip: ' + e.message, 'error');
@@ -1441,7 +1423,6 @@
                 });
                 applyProofreadChunkUpdate(result.chunk);
                 showToast('Clip rejected.', 'warning', 2000);
-                await loadChunks(false);
                 await jumpToNextProofreadFailure(chunkRef);
             } catch (e) {
                 showToast('Failed to reject clip: ' + e.message, 'error');
@@ -1454,7 +1435,7 @@
                     threshold: getProofreadThreshold(),
                 });
                 showToast('Clip compared successfully.', 'success', 3000);
-                await loadChunks(false);
+                await loadProofreadData({ chapterId: selectedProofreadChapter, includeChapters: false });
             } catch (e) {
                 showToast('Failed to compare clip: ' + e.message, 'error');
             }
@@ -1462,8 +1443,8 @@
 
         window.editProofreadChunk = async (chunkRef) => {
             try {
-                const chunk = (cachedChunks || []).find(candidate => getChunkRef(candidate) === String(chunkRef))
-                    || (await API.get('/api/chunks/view')).find(candidate => getChunkRef(candidate) === String(chunkRef));
+                const chunk = (cachedProofreadChunks || []).find(candidate => getChunkRef(candidate) === String(chunkRef))
+                    || (await API.get(`/api/chunks/${encodeURIComponent(chunkRef)}`));
                 if (!chunk) {
                     showToast('Could not find that clip in the editor.', 'warning');
                     return;
@@ -1503,7 +1484,7 @@
             if (result.ungraded_with_audio > 0) {
                 showToast('Only graded audio will be deleted. Grade your complete book for a more exhaustive result.', 'warning', 7000);
             }
-            await loadChunks(false);
+            await loadProofreadData({ chapterId: selectedProofreadChapter, includeChapters: false });
             if (result.cleared > 0) {
                 showToast(`Cleared ${result.cleared} failed clip${result.cleared === 1 ? '' : 's'}.`, 'success', 4000);
             } else {
@@ -2017,8 +1998,9 @@
                 try {
                     const payload = JSON.parse(event.data || '{}');
                     editorChapterSummaries = Array.isArray(payload?.chapters) ? payload.chapters : [];
+                    proofreadChapterSummaries = editorChapterSummaries;
                     syncEditorChapterState(cachedChunks);
-                    syncProofreadChapterState(cachedChunks, editorChapterSummaries);
+                    syncProofreadChapterState(cachedProofreadChunks, proofreadChapterSummaries);
                 } catch (e) {
                     console.warn('Failed to update chapter list from SSE', e);
                 }
@@ -2143,44 +2125,15 @@
                         tbody.innerHTML = '<tr><td colspan="5" class="text-center">No chunks found. Please generate script first.</td></tr>';
                         cachedChunks = [];
                         cachedVisibleChunkIds = [];
-                        cachedProofreadVisibleChunkIds = [];
                         syncEditorChapterState([]);
-                        syncProofreadChapterState([]);
-                        renderProofreadTable([]);
                         refreshDictionaryCounts([]);
                         return;
                     }
 
                     syncEditorChapterState(mergedChunks);
                     if (forceFullRedraw || cachedChunks.length === 0) {
-                        syncProofreadChapterState(mergedChunks);
                         refreshDictionaryCounts(mergedChunks);
                     }
-
-                    const proofreadVisibleChunks = getProofreadVisibleChunks(mergedChunks);
-                    const proofreadRowIds = Array.from(
-                        document.querySelectorAll('#proofread-table-body tr[data-proofread-id]')
-                    ).map(row => row.dataset.proofreadId || '');
-                    const canIncrementProofread = !forceFullRedraw &&
-                        proofreadRowIds.length === proofreadVisibleChunks.length &&
-                        proofreadRowIds.every((id, index) => id === getChunkRef(proofreadVisibleChunks[index]));
-
-                    if (canIncrementProofread) {
-                        const threshold = getProofreadThreshold();
-                        proofreadVisibleChunks.forEach(chunk => {
-                            const chunkRef = getChunkRef(chunk);
-                            const row = document.querySelector(`tr[data-proofread-id="${chunkRef}"]`);
-                            const nextFingerprint = getProofreadFingerprint(chunk, threshold);
-                            const currentFingerprint = row?.dataset?.proofreadFingerprint || '';
-                            if (!row || currentFingerprint !== nextFingerprint) {
-                                updateProofreadRow(chunk, threshold);
-                            }
-                        });
-                        cachedProofreadVisibleChunkIds = proofreadVisibleChunks.map(chunk => getChunkRef(chunk));
-                    } else {
-                        renderProofreadTable(mergedChunks);
-                    }
-                    renderProofreadTaskStatus(latestProofreadStatus || { running: false, progress: {}, logs: [] });
                     const visibleChunks = getVisibleChunks(mergedChunks);
                     const tableRowIds = Array.from(tbody.querySelectorAll('tr[data-id]')).map(row => row.dataset.id || '');
 
@@ -2617,7 +2570,7 @@
             if (proofreadRow) proofreadRow.remove();
             cachedChunks = cachedChunks.filter(c => getChunkRef(c) !== deletedRef);
             cachedVisibleChunkIds = cachedVisibleChunkIds.filter(ref => ref !== deletedRef);
-            cachedProofreadVisibleChunkIds = cachedProofreadVisibleChunkIds.filter(ref => ref !== deletedRef);
+            cachedProofreadChunks = cachedProofreadChunks.filter(c => getChunkRef(c) !== deletedRef);
 
             try {
                 const res = await fetch(`/api/chunks/${id}`, { method: 'DELETE' });
@@ -2725,9 +2678,7 @@
             // Filter from caches
             cachedChunks = cachedChunks.filter(c => getChunkChapterName(c) !== chapter);
             cachedVisibleChunkIds = cachedVisibleChunkIds.filter(ref => !chapterChunkRefs.includes(ref));
-            if (typeof cachedProofreadVisibleChunkIds !== 'undefined') {
-                cachedProofreadVisibleChunkIds = cachedProofreadVisibleChunkIds.filter(ref => !chapterChunkRefs.includes(ref));
-            }
+            cachedProofreadChunks = cachedProofreadChunks.filter(c => !chapterChunkRefs.includes(getChunkRef(c)));
 
             try {
                 const res = await fetch(`/api/chapters/${encodeURIComponent(chapter)}`, { method: 'DELETE' });

@@ -113,6 +113,32 @@ async def get_chunks_view(chapter: Optional[str] = None):
     return project_manager.load_chunks_view(chapter=(chapter or "").strip() or None)
 
 
+@router.get("/api/proofread/view")
+async def get_proofread_view(
+    chapter: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 500,
+    include_chapters: bool = True,
+):
+    normalized_page = max(1, int(page or 1))
+    normalized_page_size = max(1, min(2000, int(page_size or 500)))
+    normalized_chapter = (chapter or "").strip() or None
+    return project_manager.load_proofread_view(
+        chapter=normalized_chapter,
+        page=normalized_page,
+        page_size=normalized_page_size,
+        include_chapters=bool(include_chapters),
+    )
+
+
+@router.get("/api/proofread/next_failure")
+async def get_next_proofread_failure(after_uid: Optional[str] = None):
+    next_failure = project_manager.get_next_proofread_failure(after_uid=(after_uid or "").strip() or None)
+    if next_failure is None:
+        return {"found": False}
+    return {"found": True, **next_failure}
+
+
 @router.get("/api/chunks/chapters")
 async def get_chunk_chapters():
     return {"chapters": project_manager.get_chapter_list()}

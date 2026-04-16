@@ -113,8 +113,11 @@
                 renderAudioMergeProgress(status);
             } else if (taskName === 'proofread') {
                 renderProofreadTaskStatus(status);
-                if (status.running) {
-                    loadChunks(false).catch(err => console.error('Failed to refresh proofread rows', err));
+                const proofreadTabVisible = document.getElementById('proofread-tab')?.style.display !== 'none';
+                if (status.running && proofreadTabVisible) {
+                    if (window.loadProofreadData) {
+                        window.loadProofreadData({ includeChapters: false }).catch(err => console.error('Failed to refresh proofread rows', err));
+                    }
                 }
             } else if (taskName === 'repair') {
                 if (status.running) {
@@ -136,7 +139,8 @@
             el.scrollTop = el.scrollHeight;
         }
 
-        function finalizeTaskStatus(taskName, status) {
+        function finalizeTaskStatus(taskName, status, options = {}) {
+            const activeRunTransition = Boolean(options.activeRunTransition);
             if (taskName === 'audio' && status.logs.some(l => l.includes("Optimized export complete"))) {
                 const marker = `optimized:${status.merge_progress?.updated_at || status.logs[status.logs.length - 1] || ''}`;
                 if (wasTaskActionRequested(taskName, 'optimized') && shouldHandleTaskCompletion(taskName, marker)) {
@@ -165,7 +169,9 @@
                     loadChunks();
                 }
             } else if (taskName === 'proofread') {
-                loadChunks(false).catch(err => console.error('Failed to refresh chunks after proofreading', err));
+                if (activeRunTransition && window.loadProofreadData) {
+                    window.loadProofreadData({ includeChapters: false }).catch(err => console.error('Failed to refresh proofread after completion', err));
+                }
             } else if (taskName === 'repair') {
                 loadChunks(false).catch(err => console.error('Failed to refresh chunks after repair', err));
             } else if (taskName === 'create_script') {
@@ -204,7 +210,7 @@
                         if (!status.running) {
                             if (interval) clearInterval(interval);
                             activeTaskPolls.delete(taskName);
-                            finalizeTaskStatus(taskName, status);
+                            finalizeTaskStatus(taskName, status, { activeRunTransition: true });
                             if (resolvedNavTab && window.releaseNavTaskSpinner) {
                                 window.releaseNavTaskSpinner(resolvedNavTab);
                             }
@@ -278,7 +284,7 @@
                             console.error(`Polling failed for ${taskName}`, err);
                         });
                     } else {
-                        finalizeTaskStatus(taskName, status);
+                        finalizeTaskStatus(taskName, status, { activeRunTransition: false });
                     }
                 } catch (e) {
                     console.error(`Reconnect failed for ${taskName}`, e);

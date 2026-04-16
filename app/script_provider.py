@@ -605,6 +605,261 @@ class SQLiteScriptStore(ScriptStore):
             for row in rows
         ]
 
+    def _proofread_scope_where(self, chapter=None):
+        clause = "WHERE COALESCE(chunk_type, '') != 'silence'"
+        params = []
+        normalized_chapter = str(chapter or "").strip()
+        if normalized_chapter:
+            clause += " AND chapter = ?"
+            params.append(normalized_chapter)
+        return clause, params
+
+    @staticmethod
+    def _row_to_proofread_chunk(row):
+        chunk = {
+            "id": int(row["ordinal"]),
+            "uid": row["uid"],
+            "speaker": row["speaker"],
+            "text": row["text"],
+            "status": row["status"],
+            "audio_path": row["audio_path"],
+        }
+        if row["chapter"]:
+            chunk["chapter"] = row["chapter"]
+        if row["audio_validation_json"]:
+            chunk["audio_validation"] = json.loads(row["audio_validation_json"])
+        else:
+            chunk["audio_validation"] = None
+        if row["proofread_json"]:
+            chunk["proofread"] = json.loads(row["proofread_json"])
+        return chunk
+
+    def _proofread_stats(self, chapter=None):
+        self._bootstrap_if_needed()
+        where_clause, where_params = self._proofread_scope_where(chapter=chapter)
+
+        with self._connect() as conn:
+            try:
+                row = conn.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(
+                            CASE
+                                WHEN TRIM(COALESCE(audio_path, '')) = '' THEN 1
+                                ELSE 0
+                            END
+                        ) AS skipped,
+                        SUM(
+                            CASE
+                                WHEN COALESCE(json_extract(proofread_json, '$.checked'), 0) = 1
+                                     AND COALESCE(json_extract(proofread_json, '$.passed'), 0) = 1
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS passed,
+                        SUM(
+                            CASE
+                                WHEN COALESCE(json_extract(proofread_json, '$.checked'), 0) = 1
+                                     AND COALESCE(json_extract(proofread_json, '$.passed'), 0) != 1
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS failed,
+                        SUM(
+                            CASE
+                                WHEN COALESCE(json_extract(proofread_json, '$.checked'), 0) = 1
+                                     AND COALESCE(json_extract(proofread_json, '$.passed'), 0) != 1
+                                     AND TRIM(COALESCE(json_extract(proofread_json, '$.auto_failed_reason'), '')) != ''
+                                THEN 1
+                                ELSE 0
+                            END
+                        ) AS auto_failed
+                    FROM chunks
+                    {where_clause}
+                    """,
+                    where_params,
+                ).fetchone()
+                return {
+                    "total": int(row["total"] or 0),
+                    "passed": int(row["passed"] or 0),
+                    "failed": int(row["failed"] or 0),
+                    "auto_failed": int(row["auto_failed"] or 0),
+                    "skipped": int(row["skipped"] or 0),
+                }
+            except sqlite3.OperationalError:
+                rows = conn.execute(
+                    f"""
+                    SELECT audio_path, proofread_json
+                    FROM chunks
+                    {where_clause}
+                    """,
+                    where_params,
+                ).fetchall()
+
+        total = 0
+        passed = 0
+        failed = 0
+        auto_failed = 0
+        skipped = 0
+        for row in rows:
+            total += 1
+            audio_path = str(row["audio_path"] or "").strip()
+            if not audio_path:
+                skipped += 1
+                continue
+
+            payload = None
+            raw = row["proofread_json"]
+            if raw:
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    payload = None
+            if not isinstance(payload, dict) or not payload.get("checked"):
+                continue
+            if payload.get("passed"):
+                passed += 1
+            else:
+                failed += 1
+                if str(payload.get("auto_failed_reason") or "").strip():
+                    auto_failed += 1
+
+        return {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "auto_failed": auto_failed,
+            "skipped": skipped,
+        }
+
+    def load_proofread_view(self, chapter=None, page=1, page_size=500, include_chapters=False):
+        self._bootstrap_if_needed()
+
+        normalized_page = int(page or 1)
+        if normalized_page < 1:
+            normalized_page = 1
+        normalized_page_size = int(page_size or 500)
+        if normalized_page_size < 1:
+            normalized_page_size = 1
+        if normalized_page_size > 2000:
+            normalized_page_size = 2000
+
+        where_clause, where_params = self._proofread_scope_where(chapter=chapter)
+        offset = (normalized_page - 1) * normalized_page_size
+
+        with self._connect() as conn:
+            total = int(conn.execute(
+                f"SELECT COUNT(*) FROM chunks {where_clause}",
+                where_params,
+            ).fetchone()[0] or 0)
+
+            rows = conn.execute(
+                f"""
+                SELECT uid, ordinal, speaker, text, chapter, status, audio_path,
+                       audio_validation_json, proofread_json
+                FROM chunks
+                {where_clause}
+                ORDER BY ordinal ASC
+                LIMIT ? OFFSET ?
+                """,
+                [*where_params, normalized_page_size, offset],
+            ).fetchall()
+
+        chunks = [self._row_to_proofread_chunk(row) for row in rows]
+        has_next = (offset + len(chunks)) < total
+        response = {
+            "chapter": str(chapter or "").strip() or None,
+            "chunks": chunks,
+            "pagination": {
+                "page": normalized_page,
+                "page_size": normalized_page_size,
+                "total": total,
+                "has_next": has_next,
+            },
+            "stats": {
+                "chapter": self._proofread_stats(chapter=chapter),
+                "project": self._proofread_stats(chapter=None),
+            },
+        }
+        if include_chapters:
+            response["chapters"] = self.get_chapter_list()
+        return response
+
+    def get_next_proofread_failure(self, after_uid=None):
+        self._bootstrap_if_needed()
+
+        try:
+            after = self._resolve_chunk_ref(after_uid) if str(after_uid or "").strip() else None
+        except Exception:
+            after = None
+        after_ordinal = int(after["ordinal"]) if after is not None else -1
+
+        with self._connect() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT uid, ordinal, chapter
+                    FROM chunks
+                    WHERE COALESCE(chunk_type, '') != 'silence'
+                      AND TRIM(COALESCE(audio_path, '')) != ''
+                      AND COALESCE(json_extract(proofread_json, '$.checked'), 0) = 1
+                      AND COALESCE(json_extract(proofread_json, '$.passed'), 0) != 1
+                      AND COALESCE(json_extract(proofread_json, '$.manual_validated'), 0) = 0
+                      AND COALESCE(json_extract(proofread_json, '$.manual_failed'), 0) = 0
+                    ORDER BY ordinal ASC
+                    """
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = conn.execute(
+                    """
+                    SELECT uid, ordinal, chapter, audio_path, proofread_json, chunk_type
+                    FROM chunks
+                    ORDER BY ordinal ASC
+                    """
+                ).fetchall()
+                filtered = []
+                for row in rows:
+                    if str(row["chunk_type"] or "").strip() == "silence":
+                        continue
+                    if not str(row["audio_path"] or "").strip():
+                        continue
+                    try:
+                        proofread = json.loads(row["proofread_json"] or "null")
+                    except Exception:
+                        proofread = None
+                    if not isinstance(proofread, dict):
+                        continue
+                    if not proofread.get("checked"):
+                        continue
+                    if proofread.get("passed"):
+                        continue
+                    if proofread.get("manual_validated") or proofread.get("manual_failed"):
+                        continue
+                    filtered.append({
+                        "uid": row["uid"],
+                        "ordinal": row["ordinal"],
+                        "chapter": row["chapter"],
+                    })
+                rows = filtered
+
+        if not rows:
+            return None
+
+        candidate = None
+        for row in rows:
+            if int(row["ordinal"]) > after_ordinal:
+                candidate = row
+                break
+        if candidate is None:
+            candidate = rows[0]
+
+        return {
+            "uid": str(candidate["uid"]),
+            "chapter": str(candidate.get("chapter") or "").strip() or None,
+            "ordinal": int(candidate["ordinal"]),
+        }
+
     def resolve_generation_targets(self, scope_mode="project", chapter=None, pending_only=True):
         self._bootstrap_if_needed()
         query = (
