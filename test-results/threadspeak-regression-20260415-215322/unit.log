@@ -1,0 +1,67 @@
+..........s.s.ss..s....s.ss.s.s.s....ss............s...........sssssss.s [ 17%]
+sss..............................................s...................... [ 35%]
+...MP3 export produced invalid file (0 bytes) — ffmpeg likely lacks MP3 encoder (libmp3lame). Falling back to WAV.
+MP3 conversion failed (ffmpeg missing?): [Errno 2] No such file or directory: '/var/folders/76/jl7s7xyn0gj53cmfgr0s85r80000gn/T/tmpqawcryp1/voicelines/voiceline_jordan-11_jordan.mp3'
+...................................................ss................ [ 53%]
+.................................................F...................... [ 71%]
+........................................................................ [ 89%]
+..........................................                               [100%]
+=================================== FAILURES ===================================
+_ ProjectArchiveHelpersTests.test_run_generate_script_task_clears_downstream_markers_and_marks_script_complete _
+
+self = <test_project_archive.ProjectArchiveHelpersTests testMethod=test_run_generate_script_task_clears_downstream_markers_and_marks_script_complete>
+
+    def test_run_generate_script_task_clears_downstream_markers_and_marks_script_complete(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            input_path = os.path.join(temp_root, "uploads", "story.epub")
+            os.makedirs(os.path.dirname(input_path), exist_ok=True)
+            with open(input_path, "w", encoding="utf-8") as f:
+                f.write("story")
+            with open(os.path.join(temp_root, "state.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "input_file_path": input_path,
+                        "processing_stage_markers": {
+                            "script": {"completed_at": 1},
+                            "review": {"completed_at": 2},
+                            "sanity": {"completed_at": 3},
+                        },
+                    },
+                    f,
+                )
+    
+            original_root = app_module.ROOT_DIR
+            original_run_process = app_module.run_process
+            try:
+                app_module.ROOT_DIR = temp_root
+    
+                def fake_run_process(command, task_name, run_id):
+                    self.assertEqual(task_name, "script")
+                    self.assertEqual(command[-1], input_path)
+                    return True
+    
+                app_module.run_process = fake_run_process
+>               self.assertTrue(app_module._run_generate_script_task("run-1"))
+
+app/test_project_archive.py:485: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+app/app.py:54: in _compat_wrapper
+    result = getattr(owner_module, name)(*args, **kwargs)
+app/api/shared.py:5045: in _run_generate_script_task
+    success = run_process(
+app/test_project_archive.py:481: in fake_run_process
+    self.assertEqual(command[-1], input_path)
+E   AssertionError: '/var[13 chars]l7s7xyn0gj53cmfgr0s85r80000gn/T/tmp36hv_fiw' != '/var[13 chars]l7s7xyn0gj53cmfgr0s85r80000gn/T/tmp36hv_fiw/uploads/story.epub'
+E   - /var/folders/76/jl7s7xyn0gj53cmfgr0s85r80000gn/T/tmp36hv_fiw
+E   + /var/folders/76/jl7s7xyn0gj53cmfgr0s85r80000gn/T/tmp36hv_fiw/uploads/story.epub
+E   ?                                                             +++++++++++++++++++
+=============================== warnings summary ===============================
+app/test_api.py:212
+  /Users/kris/pinokio/api/alexandria-audiobook.git/app/test_api.py:212: PytestCollectionWarning: cannot collect test class 'TestFailure' because it has a __init__ constructor (from: app/test_api.py)
+    class TestFailure(Exception):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+- generated xml file: /Users/kris/pinokio/api/alexandria-audiobook.git/test-results/threadspeak-regression-20260415-215322/unit-junit.xml -
+=========================== short test summary info ============================
+FAILED app/test_project_archive.py::ProjectArchiveHelpersTests::test_run_generate_script_task_clears_downstream_markers_and_marks_script_complete
+1 failed, 373 passed, 28 skipped, 12 deselected, 1 warning in 19.81s

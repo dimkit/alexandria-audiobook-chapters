@@ -1,0 +1,14 @@
+..........s.s.ss..s....s.ss.s.s.s....ss............s...........sssssss.s [ 17%]
+sss..............................................s...................... [ 35%]
+......................................................ss................ [ 53%]
+........................................................................ [ 71%]
+........................................................................ [ 89%]
+..........................................                               [100%]
+=============================== warnings summary ===============================
+app/test_api.py:212
+  /Users/kris/pinokio/api/alexandria-audiobook.git/app/test_api.py:212: PytestCollectionWarning: cannot collect test class 'TestFailure' because it has a __init__ constructor (from: app/test_api.py)
+    class TestFailure(Exception):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+- generated xml file: /Users/kris/pinokio/api/alexandria-audiobook.git/test-results/threadspeak-regression-20260415-213643/unit-junit.xml -
+374 passed, 28 skipped, 12 deselected, 1 warning in 22.71s

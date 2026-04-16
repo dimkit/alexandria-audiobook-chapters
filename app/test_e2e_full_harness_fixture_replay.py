@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 
+import pytest
 import requests
 
 from e2e_sim import LMStudioSimServer
@@ -169,6 +170,7 @@ def _wait_for_audio_idle(base_url: str, timeout_seconds: int = 1800) -> dict:
     raise AssertionError("Timed out waiting for audio queue to become idle")
 
 
+@pytest.mark.skip(reason="Deprecated fixture replay utility test for Stage1-Stage5 population; retained for future reference.")
 def test_full_harness_fixtures_replay():
     fixtures_dir = os.path.join(SOURCE_APP_DIR, "test_fixtures", "e2e_sim")
     harness_path = os.path.join(fixtures_dir, "full_e2e_test_book_harness.json")

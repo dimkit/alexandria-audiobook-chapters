@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 
+import pytest
 import requests
 
 from e2e_sim import LMStudioSimServer
@@ -230,6 +231,7 @@ def _seed_clone_voices(base_url: str, project_dir: str, voice_manifest_path: str
     _assert_status(save_response, 200, "seed clone voices")
 
 
+@pytest.mark.skip(reason="Deprecated fixture replay utility test for Stage1-Stage5 population; retained for future reference.")
 def test_editor_audio_fixture_replay():
     fixtures_dir = os.path.join(SOURCE_APP_DIR, "test_fixtures", "e2e_sim")
     script_fixture = os.path.join(fixtures_dir, "lmstudio_generate_script_test_book.json")

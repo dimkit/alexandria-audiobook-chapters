@@ -49,24 +49,24 @@ class ToolStreamingService:
 
         try:
             for chunk in stream:
-                choices = getattr(chunk, "choices", None) or []
+                choices = self._field(chunk, "choices") or []
                 if not choices:
                     continue
-                delta = getattr(choices[0], "delta", None)
+                delta = self._field(choices[0], "delta")
                 if delta is None:
                     continue
 
-                rc = getattr(delta, "reasoning_content", None)
+                rc = self._field(delta, "reasoning_content")
                 if rc:
                     reasoning_content += rc
-                content = getattr(delta, "content", None)
+                content = self._field(delta, "content")
                 if content:
                     text_content += content
 
-                delta_tool_calls = getattr(delta, "tool_calls", None) or []
+                delta_tool_calls = self._field(delta, "tool_calls") or []
                 if delta_tool_calls:
-                    function = getattr(delta_tool_calls[0], "function", None)
-                    frag = getattr(function, "arguments", None) if function is not None else None
+                    function = self._field(delta_tool_calls[0], "function")
+                    frag = self._field(function, "arguments") if function is not None else None
                     if frag:
                         tool_call_args += frag
 
@@ -82,6 +82,24 @@ class ToolStreamingService:
                         text_content=text_content,
                         reasoning_content=reasoning_content,
                     )
+
+            parsed = self._try_parse_json(tool_call_args)
+            if parsed is not None:
+                return ToolStreamResult(
+                    parsed_arguments=parsed,
+                    raw_payload=tool_call_args or text_content,
+                    text_content=text_content,
+                    reasoning_content=reasoning_content,
+                )
+
+            parsed = self._try_parse_json(text_content.strip())
+            if parsed is not None:
+                return ToolStreamResult(
+                    parsed_arguments=parsed,
+                    raw_payload=text_content,
+                    text_content=text_content,
+                    reasoning_content=reasoning_content,
+                )
         except Exception as exc:
             raise LLMTransportError(f"Streamed LLM request failed: {exc}") from exc
 
@@ -110,6 +128,12 @@ class ToolStreamingService:
             text_content=text_content,
             reasoning_content=reasoning_content,
         )
+
+    @staticmethod
+    def _field(value: Any, name: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
 
     @staticmethod
     def _try_parse_json(payload: str) -> Optional[Dict[str, Any]]:

@@ -541,7 +541,10 @@
 
         function buildEditorChapterOptions(chapters) {
             const summaries = Array.isArray(chapters) ? chapters : [];
-            const total = summaries.reduce((sum, chapter) => sum + (Number(chapter?.chunk_count) || 0), 0);
+            const total = summaries.reduce(
+                (sum, chapter) => sum + (Number(chapter?.chunk_count) || Number(chapter?.count) || 0),
+                0
+            );
             return [{
                 id: WHOLE_PROJECT_CHAPTER_ID,
                 label: 'Whole Project',
@@ -549,7 +552,7 @@
             }, ...summaries.map(chapter => ({
                 id: String(chapter?.chapter || ''),
                 label: `${String(chapter?.chapter || '')}${String(chapter?.narrator_label || '').trim() ? ` N: ${String(chapter?.narrator_label || '').trim()}` : ''}`,
-                count: Number(chapter?.chunk_count) || 0
+                count: Number(chapter?.chunk_count) || Number(chapter?.count) || 0
             }))];
         }
 
@@ -803,12 +806,12 @@
             ];
         }
 
-        function syncProofreadChapterState(chunks) {
+        function syncProofreadChapterState(chunks = cachedChunks, chapterSummaries = editorChapterSummaries) {
             const select = document.getElementById('proofread-chapter-select');
             const summary = document.getElementById('proofread-chapter-summary');
             if (!select || !summary) return;
 
-            const options = buildEditorChapterOptions(chunks);
+            const options = buildEditorChapterOptions(Array.isArray(chapterSummaries) ? chapterSummaries : []);
             const firstRealChapter = options.find(option => option.id !== WHOLE_PROJECT_CHAPTER_ID);
             if (!proofreadChapterAutoSelected && selectedProofreadChapter === WHOLE_PROJECT_CHAPTER_ID && firstRealChapter) {
                 selectedProofreadChapter = firstRealChapter.id;
@@ -2015,6 +2018,7 @@
                     const payload = JSON.parse(event.data || '{}');
                     editorChapterSummaries = Array.isArray(payload?.chapters) ? payload.chapters : [];
                     syncEditorChapterState(cachedChunks);
+                    syncProofreadChapterState(cachedChunks, editorChapterSummaries);
                 } catch (e) {
                     console.warn('Failed to update chapter list from SSE', e);
                 }
@@ -2119,16 +2123,22 @@
                 try {
                     const chapterPayload = await API.get('/api/chunks/chapters');
                     editorChapterSummaries = Array.isArray(chapterPayload?.chapters) ? chapterPayload.chapters : [];
-                    syncEditorChapterState(cachedChunks);
 
-                    const chunks = await API.get(
+                    const fetchedChunks = await API.get(
                         selectedEditorChapter !== WHOLE_PROJECT_CHAPTER_ID
                             ? `/api/chunks/view?chapter=${encodeURIComponent(selectedEditorChapter)}`
                             : '/api/chunks/view'
                     );
+                    const nextProjectChunks = (
+                        selectedEditorChapter !== WHOLE_PROJECT_CHAPTER_ID
+                        && Array.isArray(cachedChunks)
+                        && cachedChunks.length > 0
+                    )
+                        ? mergeChapterScopedSnapshots(cachedChunks, fetchedChunks, selectedEditorChapter)
+                        : (fetchedChunks || []);
                     const mergedChunks = pendingDeleteRefs.size > 0
-                        ? (chunks || []).filter(c => !pendingDeleteRefs.has(getChunkRef(c)))
-                        : (chunks || []);
+                        ? nextProjectChunks.filter(c => !pendingDeleteRefs.has(getChunkRef(c)))
+                        : nextProjectChunks;
                     if (mergedChunks.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="5" class="text-center">No chunks found. Please generate script first.</td></tr>';
                         cachedChunks = [];

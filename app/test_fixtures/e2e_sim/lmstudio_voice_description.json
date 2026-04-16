@@ -1,0 +1,72 @@
+{
+  "strict": true,
+  "metadata": {
+    "purpose": "LM Studio fixture for single voice description suggestion in E2E tests",
+    "captured_at": "2026-04-15T07:19:17.000000+00:00",
+    "source_file": "app/test_fixtures/files/test_book.epub",
+    "model_name": "sim-tool-model"
+  },
+  "routes": {
+    "GET /api/v1/models": [
+      {
+        "response": {
+          "models": [
+            {
+              "type": "llm",
+              "publisher": "qwen",
+              "key": "sim-tool-model",
+              "display_name": "sim-tool-model",
+              "loaded_instances": [
+                {
+                  "id": "sim-tool-model"
+                }
+              ],
+              "capabilities": {
+                "trained_for_tool_use": true
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "POST /v1/chat/completions": [
+      {
+        "expect": {
+          "model": "sim-tool-model",
+          "tool_choice": "required"
+        },
+        "response": {
+          "id": "chatcmpl-voice-description-1",
+          "object": "chat.completion",
+          "created": 1776237558,
+          "model": "sim-tool-model",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                  {
+                    "id": "call-voice-description-1",
+                    "type": "function",
+                    "function": {
+                      "name": "submit_voice_description",
+                      "arguments": "{\"voice\": \"Calm, measured narrator with warm tone\"}"
+                    }
+                  }
+                ]
+              },
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 80,
+            "completion_tokens": 16,
+            "total_tokens": 96
+          }
+        }
+      }
+    ]
+  }
+}

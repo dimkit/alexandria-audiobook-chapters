@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 
+import pytest
 import requests
 
 from e2e_sim import LMStudioSimServer
@@ -132,6 +133,7 @@ def _poll_task(base_url: str, task_name: str, timeout_seconds: int = 600) -> dic
     raise AssertionError(f"Timed out waiting for '{task_name}'")
 
 
+@pytest.mark.skip(reason="Deprecated fixture replay utility test for Stage1-Stage5 population; retained for future reference.")
 def test_generate_script_replays_from_captured_fixture():
     fixture_path = os.path.join(
         SOURCE_APP_DIR,

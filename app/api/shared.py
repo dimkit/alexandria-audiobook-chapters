@@ -5025,7 +5025,68 @@ def _run_generate_script_task(run_id: str):
     if not input_file:
         raise FileNotFoundError("No input file found in state")
     _clear_processing_stage_and_downstream("script")
-    success = run_process([sys.executable, "-u", "-m", "scripts.generate_script", input_file], "script", run_id)
+    config_path = os.path.join(ROOT_DIR, "scripts", "config.json")
+
+    legacy_mode = False
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        generation_cfg = cfg.get("generation", {}) if isinstance(cfg, dict) else {}
+        legacy_mode = bool((generation_cfg or {}).get("legacy_mode", False))
+    except Exception:
+        # Preserve legacy behavior when config is unavailable.
+        legacy_mode = True
+
+    if legacy_mode:
+        success = run_process(
+            [sys.executable, "-u", "-m", "scripts.generate_script", input_file],
+            "script",
+            run_id,
+        )
+    else:
+        success = run_process(
+            [sys.executable, "-u", "-m", "scripts.process_paragraphs", input_file, "--project-root", ROOT_DIR],
+            "script",
+            run_id,
+        )
+        if success:
+            success = run_process(
+                [sys.executable, "-u", "-m", "scripts.assign_dialogue", "--project-root", ROOT_DIR, config_path],
+                "script",
+                run_id,
+            )
+        if success:
+            success = run_process(
+                [sys.executable, "-u", "-m", "scripts.extract_temperament", "--project-root", ROOT_DIR, config_path],
+                "script",
+                run_id,
+            )
+        if success:
+            script_max_length = _load_script_max_length()
+            success = run_process(
+                [
+                    sys.executable,
+                    "-u",
+                    "-m",
+                    "scripts.create_script",
+                    "--project-root",
+                    ROOT_DIR,
+                    "--max-length",
+                    str(script_max_length),
+                ],
+                "script",
+                run_id,
+            )
+            if success and hasattr(project_manager, "sync_missing_voice_profiles_from_chunks"):
+                project_manager.sync_missing_voice_profiles_from_chunks(
+                    reason="create_script_seed_voice_profiles",
+                )
+            if success and hasattr(project_manager, "log_voice_audit_event"):
+                project_manager.log_voice_audit_event(
+                    "create_script_voice_seed_complete",
+                    reason="create_script_seed_voice_profiles",
+                )
+
     if success:
         project_manager.reload_script_store()
         _mark_processing_stage_completed_marker("script")

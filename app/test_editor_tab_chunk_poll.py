@@ -1433,6 +1433,115 @@ class EditorTabChunkPollTests(unittest.TestCase):
             """
         )
 
+    def test_proofread_chapter_options_use_summaries_not_chunk_rows(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                context.__editorTabTestHooks.setSelectedEditorChapter('Chapter 1');
+                context.API.get = async (url) => {
+                    if (url === '/api/chunks/chapters') {
+                        return {
+                            chapters: [
+                                { chapter: 'Chapter 1', chunk_count: 2 },
+                                { chapter: 'Chapter 2', chunk_count: 1 },
+                                { chapter: 'Chapter 3', chunk_count: 3 },
+                            ],
+                        };
+                    }
+                    if (url === '/api/chunks/view?chapter=Chapter%201') {
+                        return [
+                            { id: 1, uid: 'chunk-1', speaker: 'Narrator', chapter: 'Chapter 1', text: 'one', instruct: '', status: 'done', audio_path: null, audio_validation: null },
+                            { id: 2, uid: 'chunk-2', speaker: 'Narrator', chapter: 'Chapter 1', text: 'two', instruct: '', status: 'done', audio_path: null, audio_validation: null },
+                        ];
+                    }
+                    if (url === '/api/voices') {
+                        return [];
+                    }
+                    if (url === '/api/narrator_candidates?chapter=Chapter%201') {
+                        return { chapter: 'Chapter 1', voices: ['NARRATOR'] };
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                await context.loadChunks(true);
+                await flushTicks();
+
+                const select = context.document.getElementById('proofread-chapter-select');
+                const values = Array.from(select.innerHTML.matchAll(/value=\"([^\"]+)\"/g), match => match[1]);
+                const uniqueValues = [...new Set(values)];
+                assert.ok(values.includes('__whole_project__'), 'proofread chapter selector should include whole project option');
+                assert.ok(uniqueValues.includes('Chapter 1'), 'Chapter 1 should be listed from summaries');
+                assert.ok(uniqueValues.includes('Chapter 2'), 'Chapter 2 should be listed from summaries');
+                assert.ok(uniqueValues.includes('Chapter 3'), 'Chapter 3 should be listed from summaries');
+                assert.strictEqual(values.length, uniqueValues.length, 'proofread options should not duplicate chapter entries');
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_proofread_chapter_switch_uses_full_project_cache_after_chapter_scoped_editor_reload(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                context.__editorTabTestHooks.setSelectedEditorChapter('Chapter 1');
+                context.__editorTabTestHooks.setCachedChunks([
+                    { id: 1, uid: 'chunk-1', speaker: 'Narrator', chapter: 'Chapter 1', text: 'one', instruct: '', status: 'done', audio_path: null, audio_validation: null },
+                    { id: 2, uid: 'chunk-2', speaker: 'Narrator', chapter: 'Chapter 2', text: 'two', instruct: '', status: 'done', audio_path: null, audio_validation: null },
+                ]);
+
+                context.API.get = async (url) => {
+                    if (url === '/api/chunks/chapters') {
+                        return {
+                            chapters: [
+                                { chapter: 'Chapter 1', chunk_count: 1 },
+                                { chapter: 'Chapter 2', chunk_count: 1 },
+                            ],
+                        };
+                    }
+                    if (url === '/api/chunks/view?chapter=Chapter%201') {
+                        return [
+                            { id: 1, uid: 'chunk-1', speaker: 'Narrator', chapter: 'Chapter 1', text: 'one (updated)', instruct: '', status: 'done', audio_path: null, audio_validation: null },
+                        ];
+                    }
+                    if (url === '/api/status/proofread') {
+                        return { running: false, progress: {}, logs: [] };
+                    }
+                    if (url === '/api/voices') {
+                        return [];
+                    }
+                    if (url === '/api/narrator_candidates?chapter=Chapter%201') {
+                        return { chapter: 'Chapter 1', voices: ['NARRATOR'] };
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                await context.loadChunks(true);
+                await flushTicks();
+                await context.window.changeProofreadChapter('Chapter 2');
+                await flushTicks();
+
+                const cached = context.__editorTabTestHooks.getCachedChunks();
+                assert.ok(cached.some(chunk => String(chunk.chapter) === 'Chapter 2'), 'expected full-project cache to retain other chapters');
+
+                const proofreadBody = context.document.getElementById('proofread-table-body');
+                assert.ok(String(proofreadBody.innerHTML || '').includes('two'), 'proofread table should render Chapter 2 rows');
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
     def test_sync_narrator_selections_from_backend_replaces_stale_local_entries(self):
         self._run_node_test(
             """

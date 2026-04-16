@@ -1,0 +1,34 @@
+..........s.s.ss..s....s.ss.s.s.s....ss............s...........sssssss.s [ 17%]
+sss..............................................s...................... [ 35%]
+......................................................ss................ [ 53%]
+............................................................F........... [ 71%]
+........................................................................ [ 89%]
+..........................................                               [100%]
+=================================== FAILURES ===================================
+_______ ProjectManagerContractTests.test_project_manager_method_surface ________
+
+self = <test_project_contract.ProjectManagerContractTests testMethod=test_project_manager_method_surface>
+
+    def test_project_manager_method_surface(self):
+        actual = set()
+        for name in dir(ProjectManager):
+            if name.startswith("__") and name != "__init__":
+                continue
+            member = getattr(ProjectManager, name, None)
+            if inspect.isroutine(member):
+                actual.add(name)
+>       self.assertEqual(actual, EXPECTED_PROJECT_MANAGER_METHODS)
+E       AssertionError: Items in the first set but not the second:
+E       '_maybe_init_e2e_proofread_text_sim_provider'
+E       '_resolve_e2e_proofread_fallback_text'
+
+app/test_project_contract.py:347: AssertionError
+=============================== warnings summary ===============================
+app/test_api.py:212
+  /Users/kris/pinokio/api/alexandria-audiobook.git/app/test_api.py:212: PytestCollectionWarning: cannot collect test class 'TestFailure' because it has a __init__ constructor (from: app/test_api.py)
+    class TestFailure(Exception):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED app/test_project_contract.py::ProjectManagerContractTests::test_project_manager_method_surface
+1 failed, 373 passed, 28 skipped, 12 deselected, 1 warning in 37.09s

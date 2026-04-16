@@ -1,0 +1,25 @@
+{
+  "strict": true,
+  "metadata": {
+    "purpose": "Qwen local fixture for voice design preview generation",
+    "captured_at": "2026-04-15T07:19:17.000000+00:00",
+    "source_file": "app/test_fixtures/files/test_book.epub",
+    "tts_local_backend": "qwen",
+    "sample_rate": 24000
+  },
+  "methods": {
+    "generate_voice_design": [
+      {
+        "expect": {
+          "text": "The gate opened slowly as dawn broke."
+        },
+        "audio_wav_path": "audio/voice_profiles_test_book/06_NARRATOR.wav",
+        "sample_rate": 24000,
+        "metadata": {
+          "speaker": "NARRATOR",
+          "ref_audio": "clone_voices/test_book_narrator.wav"
+        }
+      }
+    ]
+  }
+}

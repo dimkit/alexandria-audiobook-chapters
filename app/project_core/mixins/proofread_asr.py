@@ -7,7 +7,6 @@ This mixin provides:
 """
 
 import os
-import json
 import atexit
 import shutil
 import subprocess
@@ -295,44 +294,63 @@ class ProjectProofreadASRMixin:
             }
 
         def _commit_proofread_result_locked(self, chunks, index, proofread_result):
-            # Proofread can run in a separate process; never write an old snapshot
-            # back wholesale, or we can clobber in-flight generation_token/status.
-            latest = chunks
-            try:
-                latest_loaded = self.load_chunks_raw()
-                if isinstance(latest_loaded, list):
-                    latest = latest_loaded
-            except Exception:
-                latest = chunks
+            # Proofread can run in a separate process; avoid clobbering live state
+            # by updating only the proofread payload for the single target uid.
+            uid = ""
+            if 0 <= index < len(chunks):
+                uid = str((chunks[index].get("uid") or "")).strip()
 
-            if 0 <= index < len(latest):
-                latest[index]["proofread"] = proofread_result
+            if not uid:
+                try:
+                    latest = self.load_chunks_raw()
+                    if 0 <= index < len(latest):
+                        uid = str((latest[index].get("uid") or "")).strip()
+                except Exception:
+                    uid = ""
+
+            if uid and hasattr(self, "patch_chunk_if"):
+                updated = self.patch_chunk_if(uid, fields={"proofread": proofread_result}, reason="proofread_single")
+                if updated is not None:
+                    if 0 <= index < len(chunks):
+                        chunks[index]["proofread"] = proofread_result
+                    return proofread_result
+
             if 0 <= index < len(chunks):
                 chunks[index]["proofread"] = proofread_result
-
-            self._atomic_json_write(latest, self.chunks_path)
             return proofread_result
 
         def _commit_proofread_results_batch_locked(self, chunks, pending_results):
             if not pending_results:
                 return 0
-            # Proofread can run in a separate process; merge into freshest chunks
-            # to avoid dropping live generation state written by the audio worker.
             latest = chunks
             try:
-                latest_loaded = self.load_chunks_raw()
-                if isinstance(latest_loaded, list):
-                    latest = latest_loaded
+                latest = self.load_chunks_raw()
             except Exception:
                 latest = chunks
 
+            patch_updates = []
             for index, proofread_result in pending_results.items():
-                if 0 <= index < len(latest):
-                    latest[index]["proofread"] = proofread_result
                 if 0 <= index < len(chunks):
                     chunks[index]["proofread"] = proofread_result
 
-            self._atomic_json_write(latest, self.chunks_path)
+                uid = str((chunks[index].get("uid") or "")).strip() if 0 <= index < len(chunks) else ""
+                if not uid and 0 <= index < len(latest):
+                    uid = str((latest[index].get("uid") or "")).strip()
+
+                if not uid:
+                    continue
+
+                patch_updates.append({
+                    "uid": uid,
+                    "fields": {"proofread": proofread_result},
+                })
+
+            if patch_updates:
+                self.patch_chunks_if(
+                    patch_updates,
+                    reason="proofread_batch",
+                )
+
             return len(pending_results)
 
         @staticmethod
@@ -456,8 +474,17 @@ class ProjectProofreadASRMixin:
                     })
                     proofread_state.pop("validated_at", None)
 
+                uid = str((chunk.get("uid") or "")).strip()
+                if uid:
+                    updated = self.patch_chunk_if(
+                        uid,
+                        fields={"proofread": proofread_state},
+                        reason="proofread_manual_validation",
+                    )
+                    if updated is not None:
+                        return updated
+
                 chunk["proofread"] = proofread_state
-                self._atomic_json_write(chunks, self.chunks_path)
                 return chunk
 
         def manually_validate_proofread_clip(self, chunk_ref, threshold=1.0):
@@ -501,11 +528,12 @@ class ProjectProofreadASRMixin:
                 force_compare=True,
             )
 
-            self._commit_chunk_updates([{
-                "uid": uid,
-                "expected": {"audio_path": audio_path},
-                "fields": {"proofread": proofread_result},
-            }])
+            self.patch_chunk_if(
+                uid,
+                expected={"audio_path": audio_path},
+                fields={"proofread": proofread_result},
+                reason="proofread_compare",
+            )
             return self.get_chunk_view(uid)
 
         def discard_proofread_selection(self, chapter=None):
@@ -522,6 +550,7 @@ class ProjectProofreadASRMixin:
                 discarded = 0
                 preserved_transcripts = 0
                 cleared_transcripts = 0
+                patch_updates = []
 
                 for chunk in chunks:
                     if not self._chunk_in_scope(chunk, chapter):
@@ -531,17 +560,23 @@ class ProjectProofreadASRMixin:
                     if not existing_proofread:
                         continue
 
+                    uid = str((chunk.get("uid") or "")).strip()
+                    if not uid:
+                        continue
+
                     replacement = self._discarded_proofread_state(existing_proofread, chunk.get("audio_path"))
                     if replacement:
                         chunk["proofread"] = replacement
                         preserved_transcripts += 1
+                        patch_updates.append({"uid": uid, "fields": {"proofread": replacement}})
                     else:
                         chunk.pop("proofread", None)
                         cleared_transcripts += 1
+                        patch_updates.append({"uid": uid, "clear_fields": ["proofread"]})
                     discarded += 1
 
                 if discarded:
-                    self._atomic_json_write(chunks, self.chunks_path)
+                    self.patch_chunks_if(patch_updates, reason="discard_proofread_selection")
 
                 return {
                     "discarded": discarded,
@@ -554,6 +589,7 @@ class ProjectProofreadASRMixin:
             discarded = 0
             preserved_transcripts = 0
             cleared_transcripts = 0
+            patch_updates = []
 
             for index in scoped_indices:
                 chunk = chunks[index]
@@ -566,16 +602,22 @@ class ProjectProofreadASRMixin:
                     continue
 
                 replacement = self._discarded_proofread_state(existing_proofread, chunk.get("audio_path"))
+                uid = str((chunk.get("uid") or "")).strip()
+                if not uid:
+                    continue
+
                 if replacement:
                     chunk["proofread"] = replacement
                     preserved_transcripts += 1
+                    patch_updates.append({"uid": uid, "fields": {"proofread": replacement}})
                 else:
                     chunk.pop("proofread", None)
                     cleared_transcripts += 1
+                    patch_updates.append({"uid": uid, "clear_fields": ["proofread"]})
                 discarded += 1
 
-            if discarded:
-                self._atomic_json_write(chunks, self.chunks_path)
+            if patch_updates:
+                self.patch_chunks_if(patch_updates, reason="proofread_scope_reset")
 
             return {
                 "discarded": discarded,
@@ -987,6 +1029,7 @@ class ProjectProofreadASRMixin:
                 cleared = 0
                 failed_candidates = 0
                 ungraded_with_audio = 0
+                update_batch = []
 
                 for chunk in chunks:
                     if not self._chunk_in_scope(chunk, chapter):
@@ -1019,9 +1062,24 @@ class ProjectProofreadASRMixin:
                     chunk.pop("generation_token", None)
                     self._clear_proofread_state(chunk)
                     cleared += 1
+                    uid = str((chunk.get("uid") or "")).strip()
+                    if uid:
+                        update_batch.append({
+                            "uid": uid,
+                            "fields": {
+                                "audio_path": None,
+                                "audio_validation": None,
+                                "status": "pending",
+                                "auto_regen_count": 0,
+                            },
+                            "clear_fields": ["proofread", "generation_token"],
+                        })
 
                 if cleared:
-                    self._atomic_json_write(chunks, self.chunks_path)
+                    self.patch_chunks_if(
+                        update_batch,
+                        reason="clear_proofread_failures",
+                    )
 
                 return {
                     "cleared": cleared,

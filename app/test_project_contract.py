@@ -291,6 +291,8 @@ EXPECTED_PROJECT_MANAGER_METHODS = {
     "_group_indices_by_voice_type",
     "group_indices_by_resolved_speaker",
     "generate_chunks_batch",
+    "_resolve_e2e_proofread_fallback_text",
+    "_maybe_init_e2e_proofread_text_sim_provider",
 }
 
 EXPECTED_PROJECT_EXPORTS = {

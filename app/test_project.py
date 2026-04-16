@@ -4095,8 +4095,8 @@ class RepairLostAudioLinksTests(unittest.TestCase):
         ])
 
         original_transcribe_bulk = self.manager.transcribe_audio_paths_bulk
-        original_atomic_write = self.manager._atomic_json_write
-        write_calls = []
+        original_patch_chunks_if = self.manager.patch_chunks_if
+        patch_calls = []
         try:
             self.manager.transcribe_audio_paths_bulk = lambda paths, progress_callback=None: {
                 path: {
@@ -4106,22 +4106,23 @@ class RepairLostAudioLinksTests(unittest.TestCase):
                 for index, path in enumerate(paths)
             }
 
-            def tracked_atomic_write(payload, destination_path):
-                if destination_path == self.manager.chunks_path:
-                    write_calls.append(destination_path)
-                return original_atomic_write(payload, destination_path)
+            def tracked_patch_chunks_if(updates, reason="patch_chunks_if"):
+                patch_calls.append((reason, len(updates or [])))
+                return original_patch_chunks_if(updates, reason=reason)
 
-            self.manager._atomic_json_write = tracked_atomic_write
+            self.manager.patch_chunks_if = tracked_patch_chunks_if
 
             result = self.manager.proofread_chunks(chapter="Prologue", threshold=0.9)
             reloaded = self.manager.load_chunks()
 
             self.assertEqual(result["processed"], 3)
-            self.assertEqual(len(write_calls), 1)
+            self.assertEqual(len(patch_calls), 1)
+            self.assertEqual(patch_calls[0][0], "proofread_batch")
+            self.assertEqual(patch_calls[0][1], 3)
             self.assertTrue(all(chunk.get("proofread", {}).get("checked") for chunk in reloaded))
         finally:
             self.manager.transcribe_audio_paths_bulk = original_transcribe_bulk
-            self.manager._atomic_json_write = original_atomic_write
+            self.manager.patch_chunks_if = original_patch_chunks_if
 
     def test_proofread_auto_fails_large_duration_mismatch_without_asr(self):
         uid = "fedcba9876543210fedcba9876543210"

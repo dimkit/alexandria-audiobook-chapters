@@ -1,0 +1,54 @@
+{
+  "strict": true,
+  "routes": {
+    "POST /v1/chat/completions": [
+      {
+        "expect": {
+          "model": "sim-tool-model",
+          "stream": true
+        },
+        "stream_events": [
+          {
+            "object": "chat.completion.chunk",
+            "id": "chatcmpl-stream-tool-1",
+            "created": 1776237560,
+            "model": "sim-tool-model",
+            "choices": [
+              {
+                "index": 0,
+                "delta": {
+                  "role": "assistant",
+                  "tool_calls": [
+                    {
+                      "index": 0,
+                      "id": "call-stream-tool-1",
+                      "type": "function",
+                      "function": {
+                        "name": "submit_voice_description",
+                        "arguments": "{\"voice\": \"Calm, measured narrator with warm tone\"}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": null
+              }
+            ]
+          },
+          {
+            "object": "chat.completion.chunk",
+            "id": "chatcmpl-stream-tool-1",
+            "created": 1776237561,
+            "model": "sim-tool-model",
+            "choices": [
+              {
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

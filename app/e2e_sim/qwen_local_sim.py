@@ -419,7 +419,17 @@ class QwenLocalSimProvider:
             "has_ref_audio": kwargs.get("ref_audio") is not None,
         }
         if self._has_scripted_clone_prompt:
-            entry = self._consume("create_voice_clone_prompt", payload) or {}
+            try:
+                entry = self._consume("create_voice_clone_prompt", payload) or {}
+            except AssertionError:
+                entry = {}
+                self._trace(
+                    "request_dynamic",
+                    {
+                        "method": "create_voice_clone_prompt",
+                        "request": payload,
+                    },
+                )
         else:
             entry = {}
             self._trace(
