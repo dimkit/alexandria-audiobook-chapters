@@ -8,6 +8,7 @@ import time
 logger = logging.getLogger("ThreadspeakUI")
 
 BUILTIN_LORA_HF_REPO = "Finrandojin/Alexandria"
+TRUE_VALUES = {"1", "true", "yes", "on"}
 
 REQUIRED_ADAPTER_FILES = [
     "adapter_config.json",
@@ -21,6 +22,10 @@ OPTIONAL_ADAPTER_FILES = ["preview_sample.wav"]
 _manifest_cache = None
 _manifest_cache_time = 0
 _MANIFEST_TTL = 3600  # 1 hour
+
+
+def _downloads_disabled():
+    return str(os.getenv("THREADSPEAK_DISABLE_MODEL_DOWNLOADS", "")).strip().lower() in TRUE_VALUES
 
 
 def fetch_builtin_manifest(builtin_dir, hf_repo=BUILTIN_LORA_HF_REPO):
@@ -37,6 +42,9 @@ def fetch_builtin_manifest(builtin_dir, hf_repo=BUILTIN_LORA_HF_REPO):
     if os.path.exists(local_path):
         with open(local_path, "r", encoding="utf-8") as f:
             entries = json.load(f)
+    elif _downloads_disabled():
+        logger.info("Skipping built-in LoRA manifest download because THREADSPEAK_DISABLE_MODEL_DOWNLOADS is enabled.")
+        entries = []
     else:
         try:
             from huggingface_hub import hf_hub_download
@@ -70,6 +78,11 @@ def download_builtin_adapter(adapter_id, builtin_dir, hf_repo=BUILTIN_LORA_HF_RE
     Raises:
         RuntimeError: If a required file fails to download.
     """
+    if _downloads_disabled():
+        raise RuntimeError(
+            "Model downloads are disabled by THREADSPEAK_DISABLE_MODEL_DOWNLOADS."
+        )
+
     from huggingface_hub import hf_hub_download
 
     # Strip builtin_ prefix to get HF subfolder name

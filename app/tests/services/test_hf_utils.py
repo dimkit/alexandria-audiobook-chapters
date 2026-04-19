@@ -57,6 +57,27 @@ class FetchBuiltinManifestTests(unittest.TestCase):
             if os.path.exists(remote_manifest_path):
                 os.unlink(remote_manifest_path)
 
+    def test_skips_manifest_download_when_runtime_downloads_are_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_hf = types.SimpleNamespace(hf_hub_download=mock.Mock())
+            with mock.patch.dict("os.environ", {"THREADSPEAK_DISABLE_MODEL_DOWNLOADS": "1"}, clear=False):
+                with mock.patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+                    result = hf_utils.fetch_builtin_manifest(tmpdir)
+
+        self.assertEqual(result, [])
+        fake_hf.hf_hub_download.assert_not_called()
+
+    def test_download_builtin_adapter_rejects_when_runtime_downloads_are_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_hf = types.SimpleNamespace(hf_hub_download=mock.Mock())
+            with mock.patch.dict("os.environ", {"THREADSPEAK_DISABLE_MODEL_DOWNLOADS": "1"}, clear=False):
+                with mock.patch.dict("sys.modules", {"huggingface_hub": fake_hf}):
+                    with self.assertRaises(RuntimeError) as raised:
+                        hf_utils.download_builtin_adapter("builtin_watson", tmpdir)
+
+        self.assertIn("THREADSPEAK_DISABLE_MODEL_DOWNLOADS", str(raised.exception))
+        fake_hf.hf_hub_download.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

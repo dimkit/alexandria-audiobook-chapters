@@ -174,6 +174,18 @@ Run the stage-1 UI E2E test (non-legacy Process Script flow):
 rtk app/env/bin/python -m pytest -q app/test_e2e_stage1_script_ui.py
 ```
 
+Run the opt-in fresh-clone full UX E2E test:
+
+```bash
+rtk app/env/bin/python -m pytest -q app/tests/e2e --run-fresh-clone-e2e -k fresh_clone
+```
+
+Or through the regression runner:
+
+```bash
+rtk scripts/run-tests-regression.sh --e2e-only --fresh-clone-e2e
+```
+
 One-time browser setup (required on new environments):
 
 ```bash
@@ -190,6 +202,11 @@ Top-level E2E continuity rule:
 - Phase 2 must start from Phase 1's real UI run output; Phase 3 must start from Phase 2's real UI run output.
 - No direct task/data seeding between phases once the browser flow begins.
 - Any attempted shortcut (manual API trigger, injected phase data, pre-seeded phase state) is invalid and must be reported immediately.
+
+Fresh-clone lane:
+- `test_fresh_clone_full_ui_e2e.py` clones the local git repo at `origin/main`, creates a fresh `app/env`, and boots that clone instead of copying the current working tree.
+- The lane sets `THREADSPEAK_DISABLE_MODEL_DOWNLOADS=1` during app launch so simulator-backed runs hard-fail instead of downloading TTS or built-in adapter models.
+- LLM base URL and model name must be entered through the real Setup tab before script processing; the test does not pre-seed project/script/voice state into the backend.
 
 Regenerate the Generate Script fixture from live LM Studio responses:
 

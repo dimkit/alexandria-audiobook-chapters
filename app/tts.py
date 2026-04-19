@@ -575,6 +575,11 @@ class TTSEngine:
             print(f"  Loading from local cache: {local_path}")
             return model_cls.from_pretrained(local_path, **load_kwargs)
         else:
+            if TTSEngine._env_flag("THREADSPEAK_DISABLE_MODEL_DOWNLOADS", default=False):
+                raise RuntimeError(
+                    "Model downloads are disabled by THREADSPEAK_DISABLE_MODEL_DOWNLOADS "
+                    f"and no local cache exists for {model_id}."
+                )
             print(f"  Model not cached locally, downloading {model_id}...")
             return model_cls.from_pretrained(model_id, **load_kwargs)
 

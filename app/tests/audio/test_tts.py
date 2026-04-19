@@ -74,6 +74,17 @@ class NormalizeExternalUrlTests(unittest.TestCase):
         })
         self.assertEqual(engine._detect_external_http_api(), "http://localhost:42003")
 
+    def test_load_model_rejects_remote_download_when_runtime_downloads_are_disabled(self):
+        fake_model_cls = mock.Mock()
+
+        with mock.patch.object(TTSEngine, "_resolve_local_model_path", return_value=None):
+            with mock.patch.dict(os.environ, {"THREADSPEAK_DISABLE_MODEL_DOWNLOADS": "1"}, clear=False):
+                with self.assertRaises(RuntimeError) as raised:
+                    TTSEngine._load_model(fake_model_cls, "Qwen/example", {})
+
+        self.assertIn("THREADSPEAK_DISABLE_MODEL_DOWNLOADS", str(raised.exception))
+        fake_model_cls.from_pretrained.assert_not_called()
+
     def test_write_base64_audio(self):
         payload = base64.b64encode(b"RIFFfakewav").decode("ascii")
         fd, path = tempfile.mkstemp(suffix=".wav")

@@ -2,6 +2,7 @@
 
 import json
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -32,6 +33,16 @@ WATCHDOG_IDLE_SECONDS = 10.0
 SCRIPT_LEAK_CHECK_SECONDS = 5.0
 WATCHDOG_POLL_SECONDS = 0.35
 WATCHDOG_MAX_SECONDS = 120.0
+FRESH_CLONE_BOOTSTRAP_TIMEOUT_SECONDS = 1800.0
+MODEL_DOWNLOAD_DISABLE_ENV = "THREADSPEAK_DISABLE_MODEL_DOWNLOADS"
+MODEL_DOWNLOAD_FORBIDDEN_PATTERNS = (
+    "model not cached locally, downloading",
+    "attempting auto-download",
+    "built-in adapter downloaded:",
+    "downloaded builtin_",
+    "downloaded qwen/",
+    "downloaded qwen3",
+)
 
 
 def _env_true(name: str) -> bool:
@@ -55,6 +66,161 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _run_command(command: list[str], *, cwd: str, env: dict | None = None, timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
+    if completed.returncode != 0:
+        rendered = " ".join(command)
+        raise AssertionError(
+            f"Command failed with exit code {completed.returncode}: {rendered}\n"
+            f"{(completed.stdout or '')[-4000:]}"
+        )
+    return completed
+
+
+def _assert_no_model_download_attempts(text: str, *, context: str) -> None:
+    lowered = str(text or "").lower()
+    matched = [pattern for pattern in MODEL_DOWNLOAD_FORBIDDEN_PATTERNS if pattern in lowered]
+    if matched:
+        raise AssertionError(
+            f"Detected forbidden model download attempt during {context}.\n"
+            f"Matched patterns: {matched}\n"
+            f"Recent output:\n{str(text or '')[-4000:]}"
+        )
+
+
+def _resolve_clone_source_commit(source_repo_dir: str, source_ref: str = "HEAD") -> str:
+    completed = _run_command(
+        ["git", "-C", source_repo_dir, "rev-parse", source_ref],
+        cwd=source_repo_dir,
+    )
+    return str(completed.stdout or "").strip()
+
+
+def _clone_repo_git_ref(source_repo_dir: str, clone_root: str, *, source_ref: str = "HEAD") -> str:
+    source_repo_dir = os.path.abspath(source_repo_dir)
+    clone_root = os.path.abspath(clone_root)
+    os.makedirs(clone_root, exist_ok=True)
+    expected_commit = _resolve_clone_source_commit(source_repo_dir, source_ref)
+    _run_command(
+        ["git", "clone", "--local", "--shared", "--no-checkout", source_repo_dir, clone_root],
+        cwd=os.path.dirname(clone_root),
+    )
+    _run_command(
+        ["git", "-C", clone_root, "checkout", "--detach", expected_commit],
+        cwd=clone_root,
+    )
+    actual_commit = str(
+        _run_command(["git", "-C", clone_root, "rev-parse", "HEAD"], cwd=clone_root).stdout or ""
+    ).strip()
+    if actual_commit != expected_commit:
+        raise AssertionError(
+            f"Fresh clone did not resolve to git ref {source_ref}.\n"
+            f"Expected: {expected_commit}\n"
+            f"Actual:   {actual_commit}"
+        )
+    return actual_commit
+
+
+def _apply_source_worktree_patch(source_repo_dir: str, clone_root: str) -> None:
+    diff = _run_command(
+        ["git", "-C", source_repo_dir, "diff", "--binary", "HEAD", "--", "."],
+        cwd=source_repo_dir,
+    ).stdout or ""
+    if not diff.strip():
+        return
+    completed = subprocess.run(
+        ["git", "-C", clone_root, "apply", "--binary", "--whitespace=nowarn", "-"],
+        cwd=clone_root,
+        input=diff,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            "Failed to apply current source worktree patch to fresh clone.\n"
+            f"{(completed.stdout or '')[-4000:]}"
+        )
+
+
+def _fresh_clone_install_commands(python_executable: str, *, host_platform: str | None = None, host_arch: str | None = None) -> list[list[str]]:
+    current_platform = str(host_platform or sys.platform).lower()
+    current_arch = str(host_arch or platform.machine()).lower()
+    commands: list[list[str]] = [
+        [python_executable, "-m", "pip", "uninstall", "-y", "google-genai"],
+        [python_executable, "-m", "pip", "install", "--upgrade", "pip"],
+        [python_executable, "-m", "pip", "install", "-r", "requirements.txt"],
+        [
+            python_executable,
+            "-m",
+            "pip",
+            "install",
+            "fastapi",
+            "uvicorn",
+            "pydantic",
+            "openai",
+            "python-docx",
+            "pytest",
+            "numpy",
+            "pydub",
+            "soundfile",
+            "librosa",
+            "requests",
+            "aiofiles",
+            "python-multipart",
+        ],
+    ]
+    if current_platform == "darwin" and current_arch == "arm64":
+        commands.extend([
+            [python_executable, "-m", "pip", "uninstall", "-y", "qwen-tts"],
+            [python_executable, "-m", "pip", "install", "mlx-audio==0.4.2", "sentencepiece", "tiktoken"],
+        ])
+    else:
+        commands.append([python_executable, "-m", "pip", "install", "qwen-tts==0.1.1"])
+    commands.append([
+        python_executable,
+        "-c",
+        "import fastapi, openai, pytest, uvicorn, pydantic, docx, numpy, pydub, soundfile, librosa; print('Dependency check OK')",
+    ])
+    return commands
+
+
+def _bootstrap_clone_app_env(
+    clone_root: str,
+    *,
+    timeout_seconds: float = FRESH_CLONE_BOOTSTRAP_TIMEOUT_SECONDS,
+) -> str:
+    app_dir = os.path.join(clone_root, "app")
+    python_bin = os.path.join(app_dir, "env", "bin", "python")
+    if os.path.isdir(os.path.join(app_dir, "env")):
+        shutil.rmtree(os.path.join(app_dir, "env"), ignore_errors=True)
+
+    source_env_python = os.path.join(SOURCE_APP_DIR, "env", "bin", "python")
+    if os.path.exists(source_env_python):
+        base_python = str(Path(source_env_python).resolve())
+    else:
+        base_python = shutil.which("python3") or sys.executable
+    _run_command([base_python, "-m", "venv", "env"], cwd=app_dir, timeout=300.0)
+    for command in _fresh_clone_install_commands(python_bin):
+        completed = _run_command(command, cwd=app_dir, timeout=timeout_seconds)
+        _assert_no_model_download_attempts(completed.stdout or "", context="fresh clone bootstrap")
+    return python_bin
+
+
 def _deep_update(base: dict, patch: dict) -> dict:
     for key, value in (patch or {}).items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
@@ -76,6 +242,29 @@ def _write_json(path: str, payload: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def _seed_clone_config_values(app_dir: str, values_patch: dict | None) -> None:
+    if not values_patch:
+        return
+
+    config_path = os.path.join(app_dir, "config.json")
+    config_payload = _read_json(config_path) if os.path.exists(config_path) else {}
+    _deep_update(config_payload, values_patch)
+    _write_json(config_path, config_payload)
+
+    scripts_config_path = os.path.join(app_dir, "scripts", "config.json")
+    scripts_payload = _read_json(scripts_config_path) if os.path.exists(scripts_config_path) else {}
+    for section, value in (values_patch or {}).items():
+        if isinstance(value, dict):
+            target = scripts_payload.get(section)
+            if not isinstance(target, dict):
+                target = {}
+                scripts_payload[section] = target
+            _deep_update(target, value)
+        else:
+            scripts_payload[section] = value
+    _write_json(scripts_config_path, scripts_payload)
 
 
 class _IsolatedServer:
@@ -192,6 +381,108 @@ class _IsolatedServer:
                     self._proc.kill()
                 except Exception:
                     pass
+        if self._temp_root and os.path.isdir(self._temp_root) and not _env_true("THREADSPEAK_E2E_KEEP_ISOLATED_ROOT"):
+            shutil.rmtree(self._temp_root, ignore_errors=True)
+
+
+class _FreshCloneServer:
+    def __init__(
+        self,
+        *,
+        env_overrides: dict | None = None,
+        bootstrap_config_values: dict | None = None,
+        bootstrap_timeout_seconds: float = FRESH_CLONE_BOOTSTRAP_TIMEOUT_SECONDS,
+        source_ref: str = "HEAD",
+    ):
+        self._temp_root = ""
+        self._proc: subprocess.Popen[str] | None = None
+        self.base_url = ""
+        self.repo_root = ""
+        self.app_dir = ""
+        self.layout: RuntimeLayout | None = None
+        self.python_path = ""
+        self.checked_out_commit = ""
+        self.log_path = ""
+        self._env_overrides = dict(env_overrides or {})
+        self._bootstrap_config_values = dict(bootstrap_config_values or {})
+        self._bootstrap_timeout_seconds = float(bootstrap_timeout_seconds)
+        self._source_ref = str(source_ref or "HEAD")
+
+    def __enter__(self):
+        self._temp_root = tempfile.mkdtemp(prefix="threadspeak_e2e_fresh_clone_")
+        self.repo_root = os.path.join(self._temp_root, "repo")
+        self.checked_out_commit = _clone_repo_git_ref(
+            SOURCE_REPO_DIR,
+            self.repo_root,
+            source_ref=self._source_ref,
+        )
+        _apply_source_worktree_patch(SOURCE_REPO_DIR, self.repo_root)
+        self.app_dir = os.path.join(self.repo_root, "app")
+        _seed_clone_config_values(self.app_dir, self._bootstrap_config_values)
+        self.python_path = _bootstrap_clone_app_env(
+            self.repo_root,
+            timeout_seconds=self._bootstrap_timeout_seconds,
+        )
+        self.log_path = os.path.join(self.repo_root, "fresh-clone-server.log")
+
+        port = _find_free_port()
+        self.base_url = f"http://127.0.0.1:{port}"
+
+        env = os.environ.copy()
+        env["PINOKIO_SHARE_LOCAL"] = "false"
+        env["PINOKIO_SHARE_LOCAL_PORT"] = str(port)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
+        env.setdefault(MODEL_DOWNLOAD_DISABLE_ENV, "1")
+        env.update(self._env_overrides)
+
+        log_handle = open(self.log_path, "w", encoding="utf-8")
+        try:
+            self._proc = subprocess.Popen(
+                [self.python_path, "app.py"],
+                cwd=self.app_dir,
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        finally:
+            log_handle.close()
+
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if self._proc.poll() is not None:
+                output = _tail_file(self.log_path)
+                _assert_no_model_download_attempts(output, context="fresh clone server startup")
+                raise AssertionError(
+                    f"Fresh clone server exited early with code {self._proc.returncode}.\n{output[-4000:]}"
+                )
+            try:
+                response = requests.get(f"{self.base_url}/", timeout=1.5)
+                if response.status_code < 500:
+                    self.layout = RuntimeLayout.from_app_dir(self.app_dir)
+                    return self
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+        raise AssertionError(f"Timed out waiting for fresh clone server at {self.base_url}")
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=10)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+        if self.log_path and os.path.exists(self.log_path):
+            _assert_no_model_download_attempts(_tail_file(self.log_path, max_chars=12000), context="fresh clone server runtime")
         if self._temp_root and os.path.isdir(self._temp_root) and not _env_true("THREADSPEAK_E2E_KEEP_ISOLATED_ROOT"):
             shutil.rmtree(self._temp_root, ignore_errors=True)
 
@@ -511,7 +802,14 @@ def _wait_for_nav_unlocked(page, nav_selector: str, label: str) -> None:
     _wait_for_activity(f"Waiting for {label} navigation unlock", probe, done)
 
 
-def _switch_llm_via_setup_ui(page, *, llm_base_url: str, llm_model_name: str) -> None:
+def _switch_llm_via_setup_ui(
+    page,
+    *,
+    llm_base_url: str,
+    llm_model_name: str,
+    tts_mode: str | None = None,
+    tts_parallel_workers: int | None = None,
+) -> None:
     page.locator('.nav-link[data-tab="setup"]').click()
 
     def probe_setup():
@@ -521,18 +819,28 @@ def _switch_llm_via_setup_ui(page, *, llm_base_url: str, llm_model_name: str) ->
                 const llmUrl = document.querySelector('#llm-url');
                 const llmModel = document.querySelector('#llm-model');
                 const llmWorkers = document.querySelector('#llm-workers');
+                const ttsMode = document.querySelector('#tts-mode');
+                const parallelWorkers = document.querySelector('#parallel-workers');
                 return {
                     has_toggle: !!toggle,
                     legacy_checked: !!toggle && !!toggle.checked,
                     has_llm_url: !!llmUrl,
                     has_llm_model: !!llmModel,
                     has_llm_workers: !!llmWorkers,
+                    has_tts_mode: !!ttsMode,
+                    has_parallel_workers: !!parallelWorkers,
                 };
             }"""
         )
 
     def setup_ready(snapshot):
-        return bool(snapshot.get("has_toggle") and snapshot.get("has_llm_url") and snapshot.get("has_llm_model"))
+        return bool(
+            snapshot.get("has_toggle")
+            and snapshot.get("has_llm_url")
+            and snapshot.get("has_llm_model")
+            and snapshot.get("has_tts_mode")
+            and snapshot.get("has_parallel_workers")
+        )
 
     setup_snapshot = _wait_for_activity("Waiting for Setup tab UI", probe_setup, setup_ready)
     assert not setup_snapshot.get("legacy_checked"), "Expected non-legacy mode to be enabled."
@@ -540,6 +848,8 @@ def _switch_llm_via_setup_ui(page, *, llm_base_url: str, llm_model_name: str) ->
     llm_url = page.locator("#llm-url")
     llm_model = page.locator("#llm-model")
     llm_workers = page.locator("#llm-workers")
+    tts_mode_locator = page.locator("#tts-mode")
+    parallel_workers_locator = page.locator("#parallel-workers")
 
     with page.expect_response(
         lambda response: (
@@ -555,6 +865,11 @@ def _switch_llm_via_setup_ui(page, *, llm_base_url: str, llm_model_name: str) ->
         llm_model.blur()
         llm_workers.fill("1")
         llm_workers.blur()
+        if tts_mode is not None:
+            tts_mode_locator.select_option(tts_mode)
+        if tts_parallel_workers is not None:
+            parallel_workers_locator.fill(str(int(tts_parallel_workers)))
+            parallel_workers_locator.blur()
 
 
 def _wait_for_voice_generation_completion(page, expected_speakers: set[str]) -> dict:
@@ -949,11 +1264,32 @@ def _exclusive_run_lock(lock_name: str):
             pass
 
 
-def _run_stage1_to_voices_tab(*, page, app_base_url: str, book_path: str) -> None:
+def _run_stage1_to_voices_tab(
+    *,
+    page,
+    app_base_url: str,
+    book_path: str,
+    script_llm_base_url: str | None = None,
+    script_llm_model_name: str | None = None,
+    tts_mode: str | None = None,
+    tts_parallel_workers: int | None = None,
+) -> None:
     page.goto(app_base_url, wait_until="domcontentloaded", timeout=10000)
     _wait_for_bootstrap_ready(page)
     _wait_for_script_tab_ready(page)
     _maybe_reset_project_from_script_tab(page)
+
+    if script_llm_base_url or script_llm_model_name:
+        assert script_llm_base_url, "script_llm_base_url is required when overriding the script-stage LLM."
+        assert script_llm_model_name, "script_llm_model_name is required when overriding the script-stage LLM."
+        _switch_llm_via_setup_ui(
+            page,
+            llm_base_url=script_llm_base_url,
+            llm_model_name=script_llm_model_name,
+            tts_mode=tts_mode,
+            tts_parallel_workers=tts_parallel_workers,
+        )
+        _wait_for_script_tab_ready(page)
 
     with page.expect_response(
         lambda response: (

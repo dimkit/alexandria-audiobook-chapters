@@ -298,6 +298,76 @@ def test_get_config_persists_missing_temperament_words_default():
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(original_raw)
 
+def test_get_config_persists_missing_llm_and_tts_defaults():
+    config_path = os.path.join(common.ACTIVE_APP_DIR, "config.json")
+    with open(config_path, "r", encoding="utf-8") as f:
+        original_raw = f.read()
+
+    modified = json.loads(original_raw)
+    modified.pop("llm", None)
+    tts = modified.setdefault("tts", {})
+    tts.pop("language", None)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(modified, f, indent=2, ensure_ascii=False)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        data = r.json()
+        if data.get("llm", {}).get("base_url") != "":
+            raise TestFailure("GET /api/config did not backfill llm.base_url")
+        if data.get("llm", {}).get("model_name") != "":
+            raise TestFailure("GET /api/config did not backfill llm.model_name")
+        if data.get("tts", {}).get("language") != "English":
+            raise TestFailure("GET /api/config did not backfill tts.language")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            persisted = json.load(f)
+        if persisted.get("llm", {}).get("base_url") != "":
+            raise TestFailure("GET /api/config did not persist llm defaults")
+        if persisted.get("tts", {}).get("language") != "English":
+            raise TestFailure("GET /api/config did not persist tts.language default")
+    finally:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(original_raw)
+
+def test_save_setup_config_preserves_hidden_local_backend():
+    r = get("/api/config")
+    assert_status(r, 200)
+    original = r.json()
+
+    seeded = {
+        "llm": original["llm"],
+        "tts": {**(original.get("tts") or {}), "mode": "local", "local_backend": "qwen"},
+        "prompts": original.get("prompts"),
+        "generation": original.get("generation"),
+        "proofread": original.get("proofread"),
+        "export": original.get("export"),
+        "ui": original.get("ui"),
+    }
+    r = post("/api/config", json=seeded)
+    assert_status(r, 200)
+
+    payload = {
+        "tts": {
+            "mode": "local",
+            "url": seeded["tts"].get("url", "http://127.0.0.1:7860"),
+            "language": seeded["tts"].get("language", "English"),
+            "parallel_workers": 1,
+        }
+    }
+    r = post("/api/config/setup", json=payload)
+    assert_status(r, 200)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        readback = r.json()
+        if readback.get("tts", {}).get("local_backend") != "qwen":
+            raise TestFailure("POST /api/config/setup overwrote hidden tts.local_backend")
+    finally:
+        post("/api/config", json=original)
+
 def test_save_setup_config_roundtrip_temperament_words():
     r = get("/api/config")
     assert_status(r, 200)

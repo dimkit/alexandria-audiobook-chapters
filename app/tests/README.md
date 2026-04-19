@@ -17,8 +17,11 @@ Use `test_<domain>_<behavior>.py` for new files and keep each file focused on on
 - Project domain: `rtk app/env/bin/python -m pytest -q app/tests/project`
 - Editor UI domain: `rtk app/env/bin/python -m pytest -q app/tests/editor_ui`
 - E2E domain: `rtk app/env/bin/python -m pytest -q app/tests/e2e`
+- Fresh-clone E2E lane: `rtk app/env/bin/python -m pytest -q app/tests/e2e --run-fresh-clone-e2e -k fresh_clone`
 
 ## Guidance
 
 - Prefer extracting shared harness/setup into `_helpers.py` modules.
 - Keep files scoped; avoid re-growing monoliths.
+- The fresh-clone E2E lane is intentionally off by default because it clones `origin/main`
+  and bootstraps a fresh `app/env` before driving the real UI.

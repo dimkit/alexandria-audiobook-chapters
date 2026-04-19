@@ -279,6 +279,17 @@ async def get_config():
             "local_backend": "auto",
             "url": "http://127.0.0.1:7860",
             "device": "auto",
+            "language": "English",
+            "parallel_workers": 2,
+            "batch_seed": None,
+            "compile_codec": False,
+            "batch_group_by_type": False,
+            "sub_batch_enabled": True,
+            "sub_batch_min_size": 4,
+            "sub_batch_ratio": 5.0,
+            "sub_batch_max_chars": 3000,
+            "sub_batch_max_items": 0,
+            "script_max_length": 100,
             "auto_regenerate_bad_clips": False,
             "auto_regenerate_bad_clip_attempts": 3
         },
@@ -338,6 +349,10 @@ async def get_config():
     else:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             config = json.load(f)
+
+    if not isinstance(config, dict):
+        config = {}
+        config_changed = True
 
     # Ensure prompts section exists with defaults from file
     if "prompts" not in config:
@@ -430,9 +445,23 @@ async def get_config():
     if "tts" not in config or not isinstance(config.get("tts"), dict):
         config["tts"] = dict(default_config["tts"])
         config_changed = True
-    elif not config["tts"].get("local_backend"):
-        config["tts"]["local_backend"] = "auto"
+    else:
+        for key, value in default_config["tts"].items():
+            if config["tts"].get(key) is None:
+                config["tts"][key] = value
+                config_changed = True
+        if not config["tts"].get("local_backend"):
+            config["tts"]["local_backend"] = "auto"
+            config_changed = True
+
+    if "llm" not in config or not isinstance(config.get("llm"), dict):
+        config["llm"] = dict(default_config["llm"])
         config_changed = True
+    else:
+        for key, value in default_config["llm"].items():
+            if config["llm"].get(key) is None:
+                config["llm"][key] = value
+                config_changed = True
 
     export_defaults = default_config["export"]
     if "export" not in config or not isinstance(config.get("export"), dict):
@@ -572,6 +601,11 @@ async def save_setup_config(update: SetupConfigUpdate):
     if update.tts is not None:
         new_tts = update.tts.model_dump()
         old_tts = existing_config.get("tts") or {}
+        hidden_local_backend = str(old_tts.get("local_backend") or "").strip()
+        # The Setup tab does not expose local_backend yet, so keep the stored value
+        # when autosave posts the UI default back.
+        if hidden_local_backend and str(new_tts.get("local_backend") or "").strip() == "auto":
+            new_tts["local_backend"] = hidden_local_backend
         tts_changed = any(new_tts.get(k) != old_tts.get(k) for k in new_tts)
         existing_config["tts"] = {**old_tts, **new_tts}
         if tts_changed:
