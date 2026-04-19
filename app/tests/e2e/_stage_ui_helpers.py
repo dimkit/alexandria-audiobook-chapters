@@ -7,8 +7,8 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
-import uuid
 from contextlib import contextmanager
 from typing import Any, Dict
 
@@ -50,40 +50,15 @@ def _env_true(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _e2e_temp_root() -> str:
-    override = str(os.environ.get("THREADSPEAK_TEST_TMPDIR", "")).strip()
-    if override:
-        root = override
-    else:
-        root = os.path.join(SOURCE_REPO_DIR, "cache", "t")
-    os.makedirs(root, exist_ok=True)
-    return root
-
-
-def _make_runtime_dir(prefix: str) -> str:
-    root = _e2e_temp_root()
-    for _ in range(100):
-        candidate = os.path.join(root, f"{prefix}{uuid.uuid4().hex}")
-        try:
-            os.makedirs(candidate, exist_ok=False)
-            return candidate
-        except FileExistsError:
-            continue
-    raise AssertionError(f"Could not allocate runtime directory under {root}")
-
-
 @contextmanager
 def _report_directory(prefix: str):
     if _env_true("THREADSPEAK_E2E_KEEP_REPORTS"):
-        report_root = _make_runtime_dir(prefix)
+        report_root = tempfile.mkdtemp(prefix=prefix)
         print(f"[e2e-debug] keeping report directory: {report_root}", flush=True)
         yield report_root
         return
-    report_root = _make_runtime_dir(prefix)
-    try:
+    with tempfile.TemporaryDirectory(prefix=prefix) as report_root:
         yield report_root
-    finally:
-        shutil.rmtree(report_root, ignore_errors=True)
 
 
 def _find_free_port() -> int:
@@ -361,7 +336,7 @@ class _IsolatedServer:
         self._env_overrides = dict(env_overrides or {})
 
     def __enter__(self):
-        self._temp_root = _make_runtime_dir("s1_")
+        self._temp_root = tempfile.mkdtemp(prefix="threadspeak_e2e_stage1_ui_")
         self.app_dir = os.path.join(self._temp_root, "app")
         shutil.copytree(
             SOURCE_APP_DIR,
@@ -505,7 +480,7 @@ class _FreshCloneServer:
         self._reuse_source_env = bool(reuse_source_env)
 
     def __enter__(self):
-        self._temp_root = _make_runtime_dir("fc_")
+        self._temp_root = tempfile.mkdtemp(prefix="threadspeak_e2e_fresh_clone_")
         self.repo_root = self._temp_root
         _copy_repo_git_metadata_and_tracked_files(SOURCE_REPO_DIR, self.repo_root)
         self.checked_out_commit = _reset_repo_copy_to_ref(
@@ -2268,7 +2243,7 @@ def _read_lock_owner_pid(lock_path: str) -> int | None:
 
 @contextmanager
 def _exclusive_run_lock(lock_name: str):
-    lock_dir = os.path.join(_e2e_temp_root(), "threadspeak-e2e-locks")
+    lock_dir = os.path.join(tempfile.gettempdir(), "threadspeak-e2e-locks")
     os.makedirs(lock_dir, exist_ok=True)
     lock_path = os.path.join(lock_dir, f"{lock_name}.lock")
     pid = os.getpid()
