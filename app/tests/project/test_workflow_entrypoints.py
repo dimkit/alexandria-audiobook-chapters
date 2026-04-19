@@ -340,10 +340,13 @@ class WorkflowEntrypointAccessibilityTests(unittest.TestCase):
                 f.write("archive")
             with open(queue_log_path, "w", encoding="utf-8") as f:
                 f.write("queued")
-            with sqlite3.connect(chunks_db_path) as conn:
+            conn = sqlite3.connect(chunks_db_path)
+            try:
                 conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
                 conn.execute("INSERT INTO t(value) VALUES ('ok')")
                 conn.commit()
+            finally:
+                conn.close()
             with open(f"{chunks_db_path}-wal", "w", encoding="utf-8") as f:
                 f.write("wal")
             with open(f"{chunks_db_path}-shm", "w", encoding="utf-8") as f:

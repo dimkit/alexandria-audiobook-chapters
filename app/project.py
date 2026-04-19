@@ -140,30 +140,62 @@ class ProjectManager(
         self._audio_finalize_queue = queue.Queue()
         self._audio_finalize_tasks_lock = threading.Lock()
         self._audio_finalize_tasks = {}
+        self._runtime_workers_stop = threading.Event()
         self._audio_finalize_persist_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix=f"audio-finalize-ledger-{os.path.basename(self.root_dir)}",
         )
         self._audio_finalize_threads = []
+        self._chunks_flush_thread = None
         self.script_store = None
         self._init_script_store()
         self._restore_audio_finalize_tasks_from_store()
-        self._chunks_flush_thread = threading.Thread(
-            target=self._chunks_flush_loop,
-            daemon=True,
-            name=f"chunk-flush-{os.path.basename(self.root_dir)}",
-        )
-        self._chunks_flush_thread.start()
-        for worker_index in range(self._finalizer_workers):
+        self._ensure_runtime_workers_started()
+        atexit.register(self.flush_dirty_chunks, True)
+        atexit.register(self.shutdown_script_store)
+
+    def _ensure_runtime_workers_started(self):
+        if getattr(self, "_runtime_workers_stop", None) is None or self._runtime_workers_stop.is_set():
+            self._runtime_workers_stop = threading.Event()
+
+        if self._chunks_flush_thread is None or not self._chunks_flush_thread.is_alive():
+            self._chunks_flush_thread = threading.Thread(
+                target=self._chunks_flush_loop,
+                daemon=True,
+                name=f"chunk-flush-{os.path.basename(self.root_dir)}",
+            )
+            self._chunks_flush_thread.start()
+
+        alive_workers = [thread for thread in self._audio_finalize_threads if thread.is_alive()]
+        self._audio_finalize_threads = alive_workers
+        while len(self._audio_finalize_threads) < self._finalizer_workers:
+            worker_index = len(self._audio_finalize_threads) + 1
             thread = threading.Thread(
                 target=self._audio_finalize_worker_loop,
                 daemon=True,
-                name=f"audio-finalizer-{os.path.basename(self.root_dir)}-{worker_index + 1}",
+                name=f"audio-finalizer-{os.path.basename(self.root_dir)}-{worker_index}",
             )
             thread.start()
             self._audio_finalize_threads.append(thread)
-        atexit.register(self.flush_dirty_chunks, True)
-        atexit.register(self.shutdown_script_store)
+
+    def _stop_runtime_workers(self, *, timeout=10.0):
+        stop_event = getattr(self, "_runtime_workers_stop", None)
+        if stop_event is None:
+            return
+        stop_event.set()
+        with self._chunks_flush_condition:
+            self._chunks_flush_condition.notify_all()
+
+        for _ in list(self._audio_finalize_threads):
+            self._audio_finalize_queue.put(None)
+
+        if self._chunks_flush_thread is not None:
+            self._chunks_flush_thread.join(timeout=timeout)
+        self._chunks_flush_thread = None
+
+        for thread in list(self._audio_finalize_threads):
+            thread.join(timeout=timeout)
+        self._audio_finalize_threads = []
 
     def _init_script_store(self):
         self.script_store = create_script_store(
@@ -177,6 +209,7 @@ class ProjectManager(
         self.script_store.start()
 
     def shutdown_script_store(self, flush=True):
+        self._stop_runtime_workers(timeout=10.0)
         executor = getattr(self, "_audio_finalize_persist_executor", None)
         if executor is not None:
             executor.shutdown(wait=flush, cancel_futures=False)
@@ -198,4 +231,5 @@ class ProjectManager(
             max_workers=1,
             thread_name_prefix=f"audio-finalize-ledger-{os.path.basename(self.root_dir)}",
         )
+        self._ensure_runtime_workers_started()
         self._restore_audio_finalize_tasks_from_store()

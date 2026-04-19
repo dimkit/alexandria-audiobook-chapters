@@ -111,6 +111,7 @@ class MediaStaticProxyTests(unittest.TestCase):
                 self.assertEqual(response.read(), b"0123456789")
                 self.assertEqual(response.headers.get("Content-Range"), "bytes 0-9/1000")
         finally:
+            shared._shutdown_media_static_server()
             if os.path.exists(clip_path):
                 os.remove(clip_path)
 

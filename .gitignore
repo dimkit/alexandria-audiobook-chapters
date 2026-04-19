@@ -93,3 +93,8 @@ data/state_store.db/mem%3Aindex%3Abm25.bin
 package-lock.json
 package.json
 voice_state.audit.jsonl
+
+# Test runner artifacts (keep fixture inputs under app/test_fixtures tracked)
+/test-results/
+.pytest_cache/
+playwright-report/

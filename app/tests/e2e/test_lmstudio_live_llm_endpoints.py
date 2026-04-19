@@ -1,5 +1,4 @@
 import errno
-import fcntl
 import io
 import json
 import os
@@ -21,6 +20,11 @@ import requests
 
 from llm import LMStudioModelLoadService
 from runtime_layout import RuntimeLayout
+
+try:
+    import fcntl
+except ModuleNotFoundError:
+    fcntl = None
 
 
 LMSTUDIO_BASE_URL = "http://127.0.0.1:1234"
@@ -71,6 +75,8 @@ def _normalize_http_url(raw_url: str) -> str:
 
 @contextmanager
 def _global_live_test_run_guard():
+    if fcntl is None:
+        pytest.skip("Live LM Studio endpoint locking uses fcntl, which is unavailable on this platform.")
     handle = open(LIVE_TEST_LOCK_PATH, "a+", encoding="utf-8")
     try:
         try:

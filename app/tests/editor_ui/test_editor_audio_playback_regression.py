@@ -26,8 +26,10 @@ def _find_free_port():
 class EditorAudioPlaybackRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if shutil.which("node") is None:
-            raise unittest.SkipTest("node is required for editor playback regression tests")
+        raise unittest.SkipTest(
+            "Deprecated: this test depended on mutable live runtime state. "
+            "Coverage moved to deterministic isolated E2E Stage 3 playback assertions."
+        )
 
         cls.port = _find_free_port()
         cls.base_url = f"http://127.0.0.1:{cls.port}"

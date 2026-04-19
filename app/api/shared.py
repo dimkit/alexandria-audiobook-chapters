@@ -1,6 +1,7 @@
 import os
 import sys
 import gc
+import errno
 import copy
 import json
 import shutil
@@ -2331,7 +2332,57 @@ def _clear_directory_contents(directory):
         if os.path.isdir(entry_path):
             shutil.rmtree(entry_path)
         else:
-            os.remove(entry_path)
+            _remove_file_with_retries(entry_path)
+
+
+def _remove_file_with_retries(path, *, retries=100, delay_seconds=0.1):
+    """
+    Remove a file with bounded retries for transient lock contention.
+
+    Windows can briefly hold SQLite/media file handles after worker teardown.
+    Retries are effectively no-op on normal paths and keep Linux/macOS behavior unchanged.
+    """
+    normalized = os.path.abspath(str(path or ""))
+    last_error = None
+    for attempt in range(max(1, int(retries))):
+        try:
+            os.remove(normalized)
+            return True
+        except FileNotFoundError:
+            return False
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            # Retry only common access/busy-denied cases; re-raise everything else.
+            if exc.errno not in (errno.EACCES, errno.EBUSY, errno.EPERM):
+                raise
+            last_error = exc
+        if attempt >= retries - 1:
+            break
+        gc.collect()
+        time.sleep(delay_seconds)
+    if last_error is not None:
+        raise last_error
+    return False
+
+
+def _shutdown_live_project_managers_for_db_path(db_path):
+    target_db = os.path.abspath(str(db_path or ""))
+    if not target_db:
+        return
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, ProjectManager):
+                continue
+            candidate = os.path.abspath(str(getattr(obj, "chunks_db_path", "") or ""))
+            if candidate != target_db:
+                continue
+            try:
+                obj.shutdown_script_store(flush=True)
+            except Exception:
+                pass
+        except Exception:
+            continue
 
 
 def _clear_project_derived_state(preserve_input_file=True, preserve_reusable_voices=True):
@@ -2345,6 +2396,13 @@ def _clear_project_derived_state(preserve_input_file=True, preserve_reusable_voi
     )
     state = _load_project_state_payload()
     input_file_path = (state.get("input_file_path") or "").strip()
+    _shutdown_media_static_server()
+    manager_supports_shutdown = hasattr(project_manager, "shutdown_script_store")
+    if manager_supports_shutdown:
+        try:
+            project_manager.shutdown_script_store(flush=True)
+        except Exception:
+            pass
     manager_root = os.path.abspath(getattr(project_manager, "root_dir", ROOT_DIR))
     current_root = os.path.abspath(ROOT_DIR)
     if manager_root == current_root:
@@ -2353,9 +2411,9 @@ def _clear_project_derived_state(preserve_input_file=True, preserve_reusable_voi
     else:
         chunks_db_path = getattr(project_manager, "chunks_db_path", os.path.join(ROOT_DIR, "chunks.sqlite3"))
         chunks_queue_log_path = getattr(project_manager, "chunks_queue_log_path", os.path.join(ROOT_DIR, "chunks.queue.log"))
+    _shutdown_live_project_managers_for_db_path(chunks_db_path)
 
     files_to_remove = [
-        chunks_db_path,
         f"{chunks_db_path}-wal",
         f"{chunks_db_path}-shm",
         chunks_queue_log_path,
@@ -2373,9 +2431,11 @@ def _clear_project_derived_state(preserve_input_file=True, preserve_reusable_voi
         os.path.join(ROOT_DIR, "logs", "llm_responses.log"),
         os.path.join(ROOT_DIR, "logs", "review_responses.log"),
     ]
+    if manager_supports_shutdown:
+        files_to_remove.insert(0, chunks_db_path)
     for path in files_to_remove:
         if os.path.exists(path):
-            os.remove(path)
+            _remove_file_with_retries(path)
 
     _clear_directory_contents(VOICELINES_DIR)
     _clear_directory_contents(os.path.join(LAYOUT.exports_dir, "_wip"))
@@ -2891,6 +2951,7 @@ def _clear_project_archive_targets():
         CLONE_VOICES_DIR=CLONE_VOICES_DIR,
         DESIGNED_VOICES_DIR=DESIGNED_VOICES_DIR,
     )
+    _shutdown_media_static_server()
     if hasattr(project_manager, "shutdown_script_store"):
         try:
             project_manager.shutdown_script_store(flush=True)
@@ -2920,10 +2981,12 @@ def _clear_project_archive_targets():
         os.path.join(logs_dir, "review_responses.log"),
     ]
     removable_dirs = [UPLOADS_DIR, VOICELINES_DIR]
+    primary_db_path = getattr(project_manager, "chunks_db_path", os.path.join(ROOT_DIR, "chunks.sqlite3"))
+    _shutdown_live_project_managers_for_db_path(primary_db_path)
 
     for absolute_path in removable_files:
         if os.path.exists(absolute_path):
-            os.remove(absolute_path)
+            _remove_file_with_retries(absolute_path)
 
     for absolute_dir in removable_dirs:
         if os.path.isdir(absolute_dir):
@@ -3007,6 +3070,8 @@ def _normalize_restored_project_state(restored_state=None, *, loaded_project_nam
     input_file_path = str(payload.get("input_file_path") or "").strip()
     if input_file_path and not os.path.exists(input_file_path):
         input_file_path = ""
+    if input_file_path:
+        input_file_path = os.path.normpath(input_file_path)
 
     normalized_project_name = str(loaded_project_name or payload.get("loaded_project_name") or "").strip()
     normalized_script_name = str(payload.get("loaded_script_name") or "").strip()
@@ -3124,7 +3189,9 @@ def _restore_project_archive(extracted_dir: str, *, loaded_project_name: str = "
                 restored_state = json.load(f)
             input_file_path = (restored_state.get("input_file_path") or "").strip()
             if input_file_path:
-                restored_state["input_file_path"] = os.path.join(ROOT_DIR, input_file_path)
+                restored_state["input_file_path"] = os.path.normpath(
+                    os.path.join(ROOT_DIR, input_file_path)
+                )
         else:
             shutil.copy2(source_path, target_path)
 

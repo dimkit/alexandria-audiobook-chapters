@@ -132,6 +132,65 @@ def _clone_repo_git_ref(source_repo_dir: str, clone_root: str, *, source_ref: st
     return actual_commit
 
 
+def _overlay_worktree_changes(source_repo_dir: str, clone_root: str) -> None:
+    source_repo_dir = os.path.abspath(source_repo_dir)
+    clone_root = os.path.abspath(clone_root)
+
+    changed = str(
+        _run_command(
+            ["git", "-C", source_repo_dir, "diff", "--name-only", "HEAD"],
+            cwd=source_repo_dir,
+        ).stdout
+        or ""
+    )
+    deleted = str(
+        _run_command(
+            ["git", "-C", source_repo_dir, "diff", "--name-only", "--diff-filter=D", "HEAD"],
+            cwd=source_repo_dir,
+        ).stdout
+        or ""
+    )
+    untracked = str(
+        _run_command(
+            ["git", "-C", source_repo_dir, "ls-files", "--others", "--exclude-standard"],
+            cwd=source_repo_dir,
+        ).stdout
+        or ""
+    )
+
+    def _parse_git_paths(text: str) -> list[str]:
+        paths = []
+        for raw in str(text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line.lower().startswith("warning:"):
+                continue
+            paths.append(line)
+        return paths
+
+    changed_paths = _parse_git_paths(changed)
+    deleted_paths = set(_parse_git_paths(deleted))
+    untracked_paths = _parse_git_paths(untracked)
+
+    for rel_path in sorted(set(changed_paths + untracked_paths)):
+        if rel_path in deleted_paths:
+            continue
+        source_path = os.path.join(source_repo_dir, rel_path)
+        target_path = os.path.join(clone_root, rel_path)
+        if not os.path.exists(source_path):
+            continue
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        shutil.copy2(source_path, target_path)
+
+    for rel_path in sorted(deleted_paths):
+        target_path = os.path.join(clone_root, rel_path)
+        try:
+            os.remove(target_path)
+        except FileNotFoundError:
+            pass
+
+
 def _fresh_clone_install_commands(python_executable: str, *, host_platform: str | None = None, host_arch: str | None = None) -> list[list[str]]:
     current_platform = str(host_platform or sys.platform).lower()
     current_arch = str(host_arch or platform.machine()).lower()
@@ -180,11 +239,16 @@ def _bootstrap_clone_app_env(
     timeout_seconds: float = FRESH_CLONE_BOOTSTRAP_TIMEOUT_SECONDS,
 ) -> str:
     app_dir = os.path.join(clone_root, "app")
-    python_bin = os.path.join(app_dir, "env", "bin", "python")
+    if os.name == "nt":
+        python_bin = os.path.join(app_dir, "env", "Scripts", "python.exe")
+        source_env_python = os.path.join(SOURCE_APP_DIR, "env", "Scripts", "python.exe")
+    else:
+        python_bin = os.path.join(app_dir, "env", "bin", "python")
+        source_env_python = os.path.join(SOURCE_APP_DIR, "env", "bin", "python")
+
     if os.path.isdir(os.path.join(app_dir, "env")):
         shutil.rmtree(os.path.join(app_dir, "env"), ignore_errors=True)
 
-    source_env_python = os.path.join(SOURCE_APP_DIR, "env", "bin", "python")
     if os.path.exists(source_env_python):
         base_python = str(Path(source_env_python).resolve())
     else:
@@ -368,6 +432,7 @@ class _FreshCloneServer:
         env_overrides: dict | None = None,
         bootstrap_config_values: dict | None = None,
         bootstrap_timeout_seconds: float = FRESH_CLONE_BOOTSTRAP_TIMEOUT_SECONDS,
+        source_ref: str | None = None,
     ):
         self._temp_root = ""
         self._proc: subprocess.Popen[str] | None = None
@@ -381,6 +446,14 @@ class _FreshCloneServer:
         self._env_overrides = dict(env_overrides or {})
         self._bootstrap_config_values = dict(bootstrap_config_values or {})
         self._bootstrap_timeout_seconds = float(bootstrap_timeout_seconds)
+        self._source_ref = str(
+            source_ref
+            or os.environ.get("THREADSPEAK_E2E_FRESH_CLONE_REF")
+            or "HEAD"
+        ).strip()
+        self._include_worktree_changes = str(
+            os.environ.get("THREADSPEAK_E2E_FRESH_CLONE_INCLUDE_WORKTREE", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def __enter__(self):
         self._temp_root = tempfile.mkdtemp(prefix="threadspeak_e2e_fresh_clone_")
@@ -388,8 +461,10 @@ class _FreshCloneServer:
         self.checked_out_commit = _clone_repo_git_ref(
             SOURCE_REPO_DIR,
             self.repo_root,
-            source_ref="refs/remotes/origin/main",
+            source_ref=self._source_ref,
         )
+        if self._include_worktree_changes:
+            _overlay_worktree_changes(SOURCE_REPO_DIR, self.repo_root)
         self.app_dir = os.path.join(self.repo_root, "app")
         _seed_clone_config_values(self.app_dir, self._bootstrap_config_values)
         self.python_path = _bootstrap_clone_app_env(
@@ -858,6 +933,7 @@ def _reset_project_from_script_tab(page) -> None:
 
 
 def _save_project_from_projects_tab(page, layout: RuntimeLayout, *, expected_name: str) -> None:
+    _confirm_modal_if_present(page, timeout_ms=750)
     page.locator('.nav-link[data-tab="saved-scripts"]').click()
 
     def _projects_probe() -> dict:
@@ -1393,6 +1469,46 @@ def _assert_editor_whole_project_audio_restored(page) -> dict:
         }"""
     )
     return {"rows": editor_snapshot, "playback": playback_snapshot}
+
+
+def _assert_editor_compact_player_playback(page) -> dict:
+    play_button = page.locator("#chunks-table-body .chunk-audio-toggle").first
+    play_button.wait_for(state="visible", timeout=10000)
+    play_button.click()
+
+    playback_snapshot = _wait_for_activity(
+        "Waiting for editor compact player playback",
+        lambda: page.evaluate(
+            """() => {
+                const button = document.querySelector('#chunks-table-body .chunk-audio-toggle');
+                const preview = window._editorPreviewAudio;
+                return {
+                    button_active: !!button && button.classList.contains('active'),
+                    preview_src: String(preview?.src || '').trim(),
+                    paused: preview ? !!preview.paused : true,
+                    current_time: Number(preview?.currentTime || 0),
+                    has_error: !!(preview && preview.error),
+                };
+            }"""
+        ),
+        lambda snapshot: bool(
+            snapshot.get("preview_src")
+            and not bool(snapshot.get("has_error"))
+            and (
+                bool(snapshot.get("button_active"))
+                or not bool(snapshot.get("paused"))
+                or float(snapshot.get("current_time") or 0.0) > 0.0
+            )
+        ),
+    )
+
+    page.evaluate(
+        """() => {
+            const preview = window._editorPreviewAudio;
+            if (preview) preview.pause();
+        }"""
+    )
+    return playback_snapshot
 
 
 def _assert_proofread_whole_project_restored(page) -> dict:

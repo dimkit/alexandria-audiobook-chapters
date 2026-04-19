@@ -180,12 +180,21 @@ class ProjectRuntimeStateMixin:
             return dirty_count
 
         def _chunks_flush_loop(self):
+            stop_event = getattr(self, "_runtime_workers_stop", None)
             while True:
                 with self._chunks_flush_condition:
                     while not self._dirty_chunk_uids:
-                        self._chunks_flush_condition.wait()
+                        if stop_event is not None and stop_event.is_set():
+                            return
+                        self._chunks_flush_condition.wait(timeout=self._chunk_state_flush_interval_s)
+                        if stop_event is not None and stop_event.is_set():
+                            return
                     if len(self._dirty_chunk_uids) < self._chunk_state_flush_batch_size:
                         self._chunks_flush_condition.wait(timeout=self._chunk_state_flush_interval_s)
+                        if stop_event is not None and stop_event.is_set():
+                            return
+                if stop_event is not None and stop_event.is_set():
+                    return
                 self.flush_dirty_chunks(force=False)
 
         def _claim_chunk_generation(self, index, generation_token=None):
@@ -545,9 +554,13 @@ class ProjectRuntimeStateMixin:
             return restored
 
         def _audio_finalize_worker_loop(self):
+            stop_event = getattr(self, "_runtime_workers_stop", None)
             while True:
                 task = self._audio_finalize_queue.get()
                 if not task:
+                    self._audio_finalize_queue.task_done()
+                    if stop_event is not None and stop_event.is_set():
+                        return
                     continue
                 local_id = self._audio_finalize_task_local_id(task)
                 live_task = self._update_audio_finalize_task_state(local_id, status="processing")

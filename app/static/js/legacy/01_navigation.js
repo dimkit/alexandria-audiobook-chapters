@@ -167,6 +167,8 @@
                     }
                 }
 
-                reconnectTaskLogs().catch(err => console.error('Task log reconnect error', err));
+                if (typeof reconnectTaskLogs === 'function') {
+                    reconnectTaskLogs().catch(err => console.error('Task log reconnect error', err));
+                }
             });
         });

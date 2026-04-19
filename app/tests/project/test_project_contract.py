@@ -46,6 +46,8 @@ EXPECTED_PROJECT_MANAGER_METHODS = {
     "is_render_prep_complete",
     "set_render_prep_complete",
     "_init_script_store",
+    "_ensure_runtime_workers_started",
+    "_stop_runtime_workers",
     "shutdown_script_store",
     "reload_script_store",
     "_escape_concat_path",

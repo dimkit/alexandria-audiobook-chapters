@@ -309,7 +309,7 @@
 
         async function loadSavedScripts() {
             try {
-                const res = await fetch('/api/scripts');
+                const res = await fetch(`/api/scripts?t=${Date.now()}`, { cache: 'no-store' });
                 const scripts = await res.json();
                 const container = document.getElementById('saved-scripts-list');
 
@@ -346,6 +346,24 @@
             }
         }
 
+        function markSavedProjectBadge(name) {
+            if (!name) return;
+            const container = document.getElementById('saved-scripts-list');
+            if (!container) return;
+            const rows = Array.from(container.querySelectorAll('.d-flex.align-items-center.py-2.border-bottom'));
+            for (const row of rows) {
+                const strong = row.querySelector('strong');
+                const rowName = String(strong?.innerText || '').trim();
+                if (rowName !== name) continue;
+                const badge = row.querySelector('.badge');
+                if (!badge) return;
+                badge.className = 'badge bg-primary me-2';
+                badge.title = 'Full saved project';
+                badge.textContent = 'Project';
+                return;
+            }
+        }
+
         async function saveScript() {
             const nameInput = document.getElementById('save-script-name');
             const name = nameInput.value.trim();
@@ -360,8 +378,11 @@
                     showToast(err.detail || 'Failed to save project.', 'error');
                     return;
                 }
+                const payload = await res.json().catch(() => ({}));
+                const savedName = String(payload?.name || name || '').trim();
+                markSavedProjectBadge(savedName);
                 nameInput.value = '';
-                loadSavedScripts();
+                await loadSavedScripts();
             } catch (e) {
                 showToast('Error saving project: ' + e.message, 'error');
             }

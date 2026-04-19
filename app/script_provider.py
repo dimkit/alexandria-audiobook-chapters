@@ -373,7 +373,13 @@ class SQLiteScriptStore(ScriptStore):
         self._writer_stop.set()
         self._command_queue.put(None)
         if self._writer_thread is not None:
-            self._writer_thread.join(timeout=5.0)
+            join_timeout = 20.0 if flush else 8.0
+            self._writer_thread.join(timeout=join_timeout)
+            if self._writer_thread.is_alive():
+                # Give long-running writer transactions extra time to close SQLite handles.
+                deadline = time.time() + 10.0
+                while self._writer_thread.is_alive() and time.time() < deadline:
+                    time.sleep(0.1)
         self._writer_thread = None
         self._started = False
 

@@ -304,6 +304,13 @@ def test_e2e_stage3_editor_render_pending_nonlegacy_ui_only():
                                 )
                                 assert int(audio_check.get("text_rows") or 0) > 0, "Expected at least one text clip row in Whole Project view."
                                 assert not audio_check.get("missing"), f"Rows missing audio or done status: {audio_check.get('missing')}"
+                                playback_check = _assert_editor_compact_player_playback(page)
+                                assert not bool(playback_check.get("has_error")), (
+                                    f"Compact player reported an error: {playback_check}"
+                                )
+                                assert bool(playback_check.get("preview_src")), (
+                                    f"Compact player did not resolve a preview src: {playback_check}"
+                                )
 
                                 assert not console_errors, _report_console(console_errors, page_errors, warnings)
                                 assert not page_errors, _report_console(console_errors, page_errors, warnings)
