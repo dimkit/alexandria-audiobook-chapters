@@ -5,17 +5,21 @@ import unittest
 
 from ._stage_ui_helpers import (
     SOURCE_REPO_DIR,
-    _clone_repo_git_ref,
+    _copy_repo_git_metadata_and_tracked_files,
     _fresh_clone_install_commands,
+    _reset_repo_copy_to_ref,
 )
 
 
 class FreshCloneSupportTests(unittest.TestCase):
-    def test_clone_repo_git_ref_checks_out_requested_ref(self):
+    def test_repo_copy_reset_checks_out_requested_ref(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             clone_root = os.path.join(temp_dir, "repo")
-            checked_out_commit = _clone_repo_git_ref(
+            _copy_repo_git_metadata_and_tracked_files(
                 SOURCE_REPO_DIR,
+                clone_root,
+            )
+            checked_out_commit = _reset_repo_copy_to_ref(
                 clone_root,
                 source_ref="refs/remotes/origin/main",
             )
