@@ -11,12 +11,16 @@ from ._stage_ui_helpers import (
 
 
 class FreshCloneSupportTests(unittest.TestCase):
-    def test_clone_repo_git_ref_checks_out_head_by_default(self):
+    def test_clone_repo_git_ref_checks_out_requested_ref(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             clone_root = os.path.join(temp_dir, "repo")
-            checked_out_commit = _clone_repo_git_ref(SOURCE_REPO_DIR, clone_root)
+            checked_out_commit = _clone_repo_git_ref(
+                SOURCE_REPO_DIR,
+                clone_root,
+                source_ref="refs/remotes/origin/main",
+            )
             expected_commit = subprocess.run(
-                ["git", "-C", SOURCE_REPO_DIR, "rev-parse", "HEAD"],
+                ["git", "-C", SOURCE_REPO_DIR, "rev-parse", "refs/remotes/origin/main"],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

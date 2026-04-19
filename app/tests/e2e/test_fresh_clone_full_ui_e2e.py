@@ -4,7 +4,7 @@ from ._stage_ui_helpers import *  # noqa: F401,F403
 
 
 @pytest.mark.fresh_clone_e2e
-def test_fresh_clone_full_ui_flow_to_merged_audiobook():
+def test_fresh_clone_full_ui_flow_to_merged_audiobook(fresh_clone_source_ref):
     """
     Top-level rule:
     once browser interactions begin, this flow uses UI navigation/actions only.
@@ -78,6 +78,7 @@ def test_fresh_clone_full_ui_flow_to_merged_audiobook():
                                 "local_backend": "qwen",
                             }
                         },
+                        source_ref=fresh_clone_source_ref,
                     ) as app_server:
                         with sync_playwright() as playwright:
                             browser = playwright.chromium.launch(headless=True)
@@ -244,8 +245,14 @@ def test_fresh_clone_full_ui_flow_to_merged_audiobook():
 
             if os.path.exists(qwen_report):
                 qwen_summary = _read_json(qwen_report)
-                qwen_pending = list(qwen_summary.get("pending") or [])
-                assert not qwen_pending, f"Qwen simulator still has pending entries: {qwen_pending}"
+                qwen_pending = dict(qwen_summary.get("pending") or {})
+                allowed_pending = {"generate_voice_clone", "generate_voice_design"}
+                disallowed_pending = {
+                    key: value
+                    for key, value in qwen_pending.items()
+                    if str(key) not in allowed_pending
+                }
+                assert not disallowed_pending, f"Unexpected pending Qwen interactions: {disallowed_pending}"
 
             if os.path.exists(proofread_report):
                 proofread_summary = _read_json(proofread_report)

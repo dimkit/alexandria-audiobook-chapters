@@ -132,31 +132,6 @@ def _clone_repo_git_ref(source_repo_dir: str, clone_root: str, *, source_ref: st
     return actual_commit
 
 
-def _apply_source_worktree_patch(source_repo_dir: str, clone_root: str) -> None:
-    diff = _run_command(
-        ["git", "-C", source_repo_dir, "diff", "--binary", "HEAD", "--", "."],
-        cwd=source_repo_dir,
-    ).stdout or ""
-    if not diff.strip():
-        return
-    completed = subprocess.run(
-        ["git", "-C", clone_root, "apply", "--binary", "--whitespace=nowarn", "-"],
-        cwd=clone_root,
-        input=diff,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise AssertionError(
-            "Failed to apply current source worktree patch to fresh clone.\n"
-            f"{(completed.stdout or '')[-4000:]}"
-        )
-
-
 def _fresh_clone_install_commands(python_executable: str, *, host_platform: str | None = None, host_arch: str | None = None) -> list[list[str]]:
     current_platform = str(host_platform or sys.platform).lower()
     current_arch = str(host_arch or platform.machine()).lower()
@@ -392,7 +367,7 @@ class _FreshCloneServer:
         env_overrides: dict | None = None,
         bootstrap_config_values: dict | None = None,
         bootstrap_timeout_seconds: float = FRESH_CLONE_BOOTSTRAP_TIMEOUT_SECONDS,
-        source_ref: str = "HEAD",
+        source_ref: str = "refs/remotes/origin/main",
     ):
         self._temp_root = ""
         self._proc: subprocess.Popen[str] | None = None
@@ -416,7 +391,6 @@ class _FreshCloneServer:
             self.repo_root,
             source_ref=self._source_ref,
         )
-        _apply_source_worktree_patch(SOURCE_REPO_DIR, self.repo_root)
         self.app_dir = os.path.join(self.repo_root, "app")
         _seed_clone_config_values(self.app_dir, self._bootstrap_config_values)
         self.python_path = _bootstrap_clone_app_env(
