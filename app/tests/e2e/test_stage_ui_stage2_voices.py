@@ -2,6 +2,15 @@
 
 from ._stage_ui_helpers import *  # noqa: F401,F403
 
+pytestmark = pytest.mark.skipif(
+    not _env_true("THREADSPEAK_E2E_RUN_SPLIT_STAGE_UI"),
+    reason=(
+        "Split Stage-UI tests are disabled by default. "
+        "Consolidated Stage-7 flow covers this pipeline end-to-end. "
+        "Set THREADSPEAK_E2E_RUN_SPLIT_STAGE_UI=1 to run split stages."
+    ),
+)
+
 def test_e2e_stage2_voices_nonlegacy_ui_only():
     """
     Top-level rule:

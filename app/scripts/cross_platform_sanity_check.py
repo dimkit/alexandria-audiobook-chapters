@@ -19,6 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "cross_platform_sanity.json"
+SELF_RELATIVE_PATH = Path(__file__).resolve().relative_to(REPO_ROOT).as_posix()
 SCANNABLE_EXTENSIONS = {
     ".py",
     ".js",
@@ -156,6 +157,9 @@ def _list_candidate_files(staged: bool) -> list[Path]:
 
 def _should_skip(path: Path, config: dict) -> bool:
     rel = path.relative_to(REPO_ROOT).as_posix()
+    if rel == SELF_RELATIVE_PATH:
+        # Avoid self-referential false positives from this checker's own regex definitions.
+        return True
     if path.suffix.lower() not in SCANNABLE_EXTENSIONS:
         return True
     for pattern in config.get("exclude_globs", []):

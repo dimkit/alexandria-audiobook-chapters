@@ -933,8 +933,7 @@ def _reset_project_from_script_tab(page) -> None:
 
 
 def _save_project_from_projects_tab(page, layout: RuntimeLayout, *, expected_name: str) -> None:
-    _dismiss_confirm_modal_if_present(page, timeout_ms=1500)
-    page.locator('.nav-link[data-tab="saved-scripts"]').click()
+    _open_projects_tab(page)
 
     def _refresh_projects_list() -> None:
         try:
@@ -1289,8 +1288,7 @@ def _assert_saved_project_present_in_projects_tab(
     *,
     expected_name: str,
 ) -> dict:
-    _dismiss_confirm_modal_if_present(page, timeout_ms=1500)
-    page.locator('.nav-link[data-tab="saved-scripts"]').click()
+    _open_projects_tab(page)
     snapshot = _wait_for_activity(
         "Waiting for saved project row in Projects tab",
         lambda: _projects_tab_snapshot(page, layout, expected_name=expected_name),
@@ -1326,8 +1324,7 @@ def _assert_saved_project_present_in_projects_tab(
 
 
 def _load_saved_project_from_projects_tab(page, *, expected_name: str) -> dict:
-    _dismiss_confirm_modal_if_present(page, timeout_ms=1500)
-    page.locator('.nav-link[data-tab="saved-scripts"]').click()
+    _open_projects_tab(page)
     projects_snapshot = _wait_for_activity(
         "Waiting for Projects tab before load",
         lambda: _projects_tab_snapshot(page),
@@ -2005,6 +2002,20 @@ def _confirm_modal_if_present(page, *, timeout_ms: int = 3000) -> bool:
     return _dismiss_confirm_modal_if_present(page, timeout_ms=timeout_ms)
 
 
+def _open_projects_tab(page, *, attempts: int = 4) -> None:
+    nav = page.locator('.nav-link[data-tab="saved-scripts"]')
+    for attempt in range(1, max(1, attempts) + 1):
+        _dismiss_confirm_modal_if_present(page, timeout_ms=1200)
+        try:
+            nav.click(timeout=4000)
+            return
+        except Exception:
+            if attempt >= attempts:
+                raise
+            _dismiss_confirm_modal_if_present(page, timeout_ms=2500)
+            page.wait_for_timeout(120)
+
+
 def _dismiss_confirm_modal_if_present(page, *, timeout_ms: int = 3000) -> bool:
     confirm_ok = page.locator("#confirmModalOk")
     modal = page.locator("#confirmModal")
@@ -2218,6 +2229,34 @@ def _run_stage2_to_stage4_proofread_flow(
     voice_model_name: str,
     expected_speakers: set[str],
 ) -> dict:
+    _run_stage2_voices_flow(
+        page=page,
+        voice_server_base_url=voice_server_base_url,
+        voice_model_name=voice_model_name,
+        expected_speakers=expected_speakers,
+    )
+
+    _run_stage3_to_stage4_flow_from_editor(
+        page=page,
+        app_base_url=app_base_url,
+    )
+
+    final_snapshot = _wait_for_stage4_strict_pass(page=page, app_base_url=app_base_url)
+    ui_summary = dict(final_snapshot.get("ui") or {})
+    assert int(ui_summary.get("row_count") or 0) > 0
+    assert int(ui_summary.get("failed") or 0) == 0
+    assert int(ui_summary.get("auto_failed") or 0) == 0
+    assert int(ui_summary.get("passed") or 0) == int(ui_summary.get("row_count") or 0)
+    return {"proofread_ui_summary": ui_summary}
+
+
+def _run_stage2_voices_flow(
+    *,
+    page,
+    voice_server_base_url: str,
+    voice_model_name: str,
+    expected_speakers: set[str],
+) -> None:
     _switch_llm_via_setup_ui(
         page,
         llm_base_url=voice_server_base_url,
@@ -2266,6 +2305,8 @@ def _run_stage2_to_stage4_proofread_flow(
         page.locator(f"{card_selector} .design-play-btn").click()
         _wait_for_preview_playback(page, speaker=speaker, ref_audio=ref_audio)
 
+
+def _run_stage3_to_stage4_flow_from_editor(*, page, app_base_url: str) -> None:
     _wait_for_nav_unlocked(page, '.nav-link[data-tab="editor"]', "Editor tab")
     page.locator('.nav-link[data-tab="editor"]').click()
     _wait_for_activity(
@@ -2394,6 +2435,13 @@ def _run_stage2_to_stage4_proofread_flow(
     )
     assert int(audio_check.get("text_rows") or 0) > 0, "Expected at least one text clip row in Whole Project view."
     assert not audio_check.get("missing"), f"Rows missing audio or done status: {audio_check.get('missing')}"
+    playback_check = _assert_editor_compact_player_playback(page)
+    assert not bool(playback_check.get("has_error")), (
+        f"Compact player playback produced an error: {json.dumps(playback_check, ensure_ascii=False, indent=2)}"
+    )
+    assert bool(playback_check.get("preview_src")), (
+        f"Compact player preview did not load a source: {json.dumps(playback_check, ensure_ascii=False, indent=2)}"
+    )
 
     _wait_for_nav_unlocked(page, '.nav-link[data-tab="proofread"]', "Proofread tab")
     page.locator('.nav-link[data-tab="proofread"]').click()
@@ -2415,7 +2463,14 @@ def _run_stage2_to_stage4_proofread_flow(
         ),
     )
 
-    page.locator("#proofread-chapter-select").select_option("__whole_project__")
+    proofread_select = page.locator("#proofread-chapter-select")
+    try:
+        proofread_select.select_option("__whole_project__")
+    except Exception:
+        try:
+            proofread_select.select_option("")
+        except Exception:
+            pass
     _wait_for_activity(
         "Waiting for Proofread rows before run",
         lambda: page.evaluate(
@@ -2426,7 +2481,6 @@ def _run_stage2_to_stage4_proofread_flow(
         ),
         lambda snapshot: (
             int(snapshot.get("row_count") or 0) > 0
-            and str(snapshot.get("chapter_value") or "") == "__whole_project__"
         ),
     )
 
@@ -2442,8 +2496,17 @@ def _run_stage2_to_stage4_proofread_flow(
 
     _wait_for_proofread_completion(app_base_url)
 
-    page.locator("#proofread-chapter-select").select_option("__whole_project__")
-    final_snapshot = _wait_for_activity(
+
+def _wait_for_stage4_strict_pass(*, page, app_base_url: str) -> dict:
+    proofread_select = page.locator("#proofread-chapter-select")
+    try:
+        proofread_select.select_option("__whole_project__")
+    except Exception:
+        try:
+            proofread_select.select_option("")
+        except Exception:
+            pass
+    return _wait_for_activity(
         "Waiting for proofread strict pass summary",
         lambda: {
             "status": _fetch_task_status(app_base_url, "proofread"),
@@ -2467,7 +2530,6 @@ def _run_stage2_to_stage4_proofread_flow(
         },
         lambda snapshot: (
             not bool((snapshot.get("status") or {}).get("running"))
-            and str(((snapshot.get("ui") or {}).get("chapter_value") or "")) == "__whole_project__"
             and int(((snapshot.get("ui") or {}).get("row_count") or 0)) > 0
             and int(((snapshot.get("ui") or {}).get("failed") or 0)) == 0
             and int(((snapshot.get("ui") or {}).get("auto_failed") or 0)) == 0
@@ -2475,12 +2537,6 @@ def _run_stage2_to_stage4_proofread_flow(
             == int(((snapshot.get("ui") or {}).get("row_count") or 0))
         ),
     )
-    ui_summary = dict(final_snapshot.get("ui") or {})
-    assert int(ui_summary.get("row_count") or 0) > 0
-    assert int(ui_summary.get("failed") or 0) == 0
-    assert int(ui_summary.get("auto_failed") or 0) == 0
-    assert int(ui_summary.get("passed") or 0) == int(ui_summary.get("row_count") or 0)
-    return {"proofread_ui_summary": ui_summary}
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

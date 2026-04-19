@@ -1,4 +1,4 @@
-"""Non-legacy UI E2E saved-project reload coverage after reset."""
+"""Consolidated non-legacy UI E2E flow (stages 1-7) with saved-project reload."""
 
 from ._stage_ui_helpers import *  # noqa: F401,F403
 
@@ -12,12 +12,14 @@ def test_e2e_stage7_load_saved_project_after_reset_nonlegacy_ui_only():
         fixtures_dir = os.path.join(SOURCE_APP_DIR, "test_fixtures", "e2e_sim")
         script_fixture_path = os.path.join(fixtures_dir, "lmstudio_generate_script_test_book.json")
         voice_fixture_path = os.path.join(fixtures_dir, "lmstudio_voice_profiles_test_book.json")
+        qwen_voice_fixture_path = os.path.join(fixtures_dir, "qwen_local_voice_profiles_test_book.json")
         qwen_fixture_path = os.path.join(fixtures_dir, "qwen_local_full_e2e_test_book.json")
         proofread_fixture_path = os.path.join(fixtures_dir, "proofread_text_test_book.json")
         book_path = os.path.join(SOURCE_APP_DIR, "test_fixtures", "files", "test_book.epub")
 
         assert os.path.exists(script_fixture_path), f"Missing fixture: {script_fixture_path}"
         assert os.path.exists(voice_fixture_path), f"Missing fixture: {voice_fixture_path}"
+        assert os.path.exists(qwen_voice_fixture_path), f"Missing fixture: {qwen_voice_fixture_path}"
         assert os.path.exists(qwen_fixture_path), f"Missing fixture: {qwen_fixture_path}"
         assert os.path.exists(proofread_fixture_path), f"Missing fixture: {proofread_fixture_path}"
         assert os.path.exists(book_path), f"Missing book fixture: {book_path}"
@@ -67,6 +69,103 @@ def test_e2e_stage7_load_saved_project_after_reset_nonlegacy_ui_only():
             if str(item).strip()
         }
         assert expected_speakers, "Voice fixture metadata.speakers must include at least one speaker."
+
+        # Stage-2 fixture parity pass: ensures voice-profile simulator lane is covered by
+        # the consolidated test before the full end-to-end fixture run.
+        preflight_config_patch = {
+            "llm": {
+                "base_url": "http://127.0.0.1:1/v1",
+                "api_key": "local",
+                "model_name": script_model,
+                "llm_workers": 1,
+            },
+            "tts": {
+                "mode": "local",
+                "local_backend": "qwen",
+                "device": "cpu",
+                "language": "English",
+                "parallel_workers": 1,
+            },
+            "generation": {
+                "legacy_mode": False,
+                "chunk_size": 600,
+                "max_tokens": 1024,
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 0.0,
+                "banned_tokens": [],
+                "temperament_words": 150,
+            },
+        }
+        preflight_console_errors: list[str] = []
+        preflight_page_errors: list[str] = []
+        preflight_warnings: list[str] = []
+        preflight_http_failures: list[str] = []
+        preflight_env = {
+            "THREADSPEAK_E2E_SIM_ENABLED": "1",
+            "THREADSPEAK_E2E_QWEN_FIXTURE": os.path.abspath(qwen_voice_fixture_path),
+            "THREADSPEAK_E2E_SIM_STRICT": "1",
+        }
+        with LMStudioSimServer(script_fixture_path, trace_label="stage7-preflight-script-lm") as pre_script_server:
+            with LMStudioSimServer(voice_fixture_path, trace_label="stage7-preflight-voice-lm") as pre_voice_server:
+                preflight_config_patch["llm"]["base_url"] = f"{pre_script_server.base_url}/v1"
+                with _IsolatedServer(config_patch=preflight_config_patch, env_overrides=preflight_env) as pre_app_server:
+                    with sync_playwright() as playwright:
+                        browser = playwright.chromium.launch(headless=True)
+                        context = browser.new_context()
+                        page = context.new_page()
+                        page.on(
+                            "console",
+                            lambda message: (
+                                preflight_console_errors.append(str(message.text or "").strip())
+                                if str(message.type or "").strip().lower() == "error"
+                                else preflight_warnings.append(str(message.text or "").strip())
+                                if str(message.type or "").strip().lower() == "warning"
+                                else None
+                            ),
+                        )
+                        page.on("pageerror", lambda err: preflight_page_errors.append(str(err)))
+                        page.on(
+                            "response",
+                            lambda response: preflight_http_failures.append(
+                                f"{int(response.status)} {str(getattr(response.request, 'method', '') or '')} {response.url}"
+                            )
+                            if int(getattr(response, "status", 0)) >= 400
+                            else None,
+                        )
+                        try:
+                            _run_stage1_to_voices_tab(
+                                page=page,
+                                app_base_url=pre_app_server.base_url,
+                                book_path=book_path,
+                            )
+                            _run_stage2_voices_flow(
+                                page=page,
+                                voice_server_base_url=f"{pre_voice_server.base_url}/v1",
+                                voice_model_name=voice_model,
+                                expected_speakers=expected_speakers,
+                            )
+                            assert not preflight_console_errors, _report_console(preflight_console_errors, preflight_page_errors, preflight_warnings)
+                            assert not preflight_page_errors, _report_console(preflight_console_errors, preflight_page_errors, preflight_warnings)
+                        except Exception as exc:
+                            script_logs = ""
+                            try:
+                                script_logs = page.locator("#script-logs").inner_text(timeout=2000)
+                            except Exception:
+                                script_logs = ""
+                            raise AssertionError(
+                                f"Stage-7 preflight voice fixture flow failed: {exc}\n"
+                                f"Script logs tail:\n{script_logs[-2000:]}\n"
+                                f"HTTP failures:\n{chr(10).join(preflight_http_failures[-20:]) or 'none'}\n"
+                                f"{_report_console(preflight_console_errors, preflight_page_errors, preflight_warnings)}"
+                            ) from exc
+                        finally:
+                            context.close()
+                            browser.close()
+                pre_script_server.assert_all_consumed()
+                pre_voice_server.assert_all_consumed()
 
         with _report_directory("threadspeak_stage7_load_saved_project_report_") as report_root:
             script_lm_trace = os.path.join(report_root, "lm-script-trace.jsonl")
