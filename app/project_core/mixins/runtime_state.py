@@ -655,8 +655,8 @@ class ProjectRuntimeStateMixin:
                             self._dirty_chunk_uids.discard(uid)
                 return flushed_count
 
-        def _finalize_retry_requested(self, attempt):
-            return attempt < self._get_auto_regen_retry_attempts()
+        def _finalize_retry_requested(self, attempt, error=None):
+            return self._should_request_auto_regen_retry(attempt, error=error)
 
         def _spool_audio_relative_path(self, chunk_uid, generation_token, attempt=0):
             token_slug = sanitize_filename(generation_token or "manual") or "manual"
@@ -815,7 +815,11 @@ class ProjectRuntimeStateMixin:
                 self._complete_audio_finalize_task_ledger(task)
                 return
             if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-                next_attempt = attempt + 1 if self._finalize_retry_requested(attempt) else attempt
+                should_retry = self._finalize_retry_requested(
+                    attempt,
+                    error="Generated audio file is missing or empty",
+                )
+                next_attempt = attempt + 1 if should_retry else attempt
                 self._update_chunk_fields_if_token(
                     chunk_uid,
                     generation_token,
@@ -835,7 +839,7 @@ class ProjectRuntimeStateMixin:
                     len(re.findall(r"\b\w+\b", task.get("text", ""))),
                     0,
                     {
-                        "retry_requested": self._finalize_retry_requested(attempt),
+                        "retry_requested": should_retry,
                         "attempt": attempt,
                         "error": "Generated audio file is missing or empty",
                     },
@@ -852,7 +856,11 @@ class ProjectRuntimeStateMixin:
                 chunk_uid=chunk_uid,
             )
             elapsed = time.time() - start
-            next_attempt = attempt + 1 if result["status"] == "error" and self._finalize_retry_requested(attempt) else attempt
+            should_retry = result["status"] == "error" and self._finalize_retry_requested(
+                attempt,
+                error=result.get("error"),
+            )
+            next_attempt = attempt + 1 if should_retry else attempt
             updated_chunk = self._update_chunk_fields_if_token(
                 chunk_uid,
                 generation_token,
@@ -878,7 +886,7 @@ class ProjectRuntimeStateMixin:
                 len(re.findall(r"\b\w+\b", task.get("text", ""))),
                 len(re.findall(r"\b\w+\b", task.get("text", ""))) if result["status"] == "done" else 0,
                 {
-                    "retry_requested": result["status"] == "error" and self._finalize_retry_requested(attempt),
+                    "retry_requested": should_retry,
                     "attempt": attempt,
                     "error": result.get("error"),
                 },

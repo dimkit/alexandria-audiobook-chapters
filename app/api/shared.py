@@ -4314,6 +4314,24 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
             total_ms=round((time.perf_counter() - callback_started) * 1000.0, 3),
         )
 
+    def log_callback(message):
+        callback_started = time.perf_counter()
+        refresh_ms = 0.0
+        with audio_queue_lock:
+            if not is_active():
+                return
+            _mark_audio_generation_activity_locked(job)
+            _append_audio_log_locked(str(message or ""))
+            refresh_started = time.perf_counter()
+            _refresh_audio_process_state_locked(persist=False)
+            refresh_ms = (time.perf_counter() - refresh_started) * 1000.0
+        record_audio_perf(
+            "audio_callback_log",
+            job_id=job["id"],
+            refresh_ms=round(refresh_ms, 3),
+            total_ms=round((time.perf_counter() - callback_started) * 1000.0, 3),
+        )
+
     def cancel_check():
         with audio_queue_lock:
             if not is_active():
@@ -4355,6 +4373,7 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
                 item_callback=item_callback,
                 generation_token=run_token,
                 item_started_callback=item_started_callback,
+                log_callback=log_callback,
             )
     except BaseException as e:
         result_holder["error"] = str(e)

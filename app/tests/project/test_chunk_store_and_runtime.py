@@ -1414,7 +1414,7 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
         generation_order = []
 
         class FakeBatchEngine:
-            def generate_batch(engine_self, batch_chunks, voice_config, output_dir, batch_seed, cancel_check=None):
+            def generate_batch(engine_self, batch_chunks, voice_config, output_dir, batch_seed, cancel_check=None, log_callback=None):
                 generation_order.append([chunk["index"] for chunk in batch_chunks])
                 if len(generation_order) == 1:
                     first_batch_started.set()
@@ -1481,6 +1481,52 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
 
         self.assertEqual(view["clip-batch-0"]["status"], "done")
         self.assertEqual(view["clip-batch-1"]["status"], "done")
+
+    def test_generate_chunks_batch_forwards_batch_log_callback_to_engine(self):
+        self.manager.save_chunks([
+            {
+                "id": 7,
+                "uid": "clip-log-7",
+                "speaker": "Jordan",
+                "text": "Jordan line seven is long enough to exercise batch logging.",
+                "chapter": "Chapter 1",
+                "instruct": "",
+                "status": "pending",
+            }
+        ])
+
+        forwarded = {"messages": [], "batch_chunks": None}
+
+        class FakeBatchEngine:
+            def generate_batch(engine_self, batch_chunks, voice_config, output_dir, batch_seed, cancel_check=None, log_callback=None):
+                forwarded["batch_chunks"] = batch_chunks
+                self.assertIsNotNone(log_callback)
+                log_callback("Sub-batch 1/1 [custom] active 15.0s; chunk_ids=[7], uids=[clip-log], text_chars=[58], total_chars=58")
+                sample_rate = 24000
+                samples = np.zeros(int(sample_rate * 2.0), dtype=np.float32)
+                for chunk in batch_chunks:
+                    sf.write(os.path.join(output_dir, f"temp_batch_{chunk['index']}.wav"), samples, sample_rate)
+                return {"completed": [chunk["index"] for chunk in batch_chunks], "failed": []}
+
+        self.manager.get_engine = lambda: FakeBatchEngine()
+        self.manager._load_voice_config = lambda: {"Jordan": {}}
+
+        results = self.manager.generate_chunks_batch(
+            ["clip-log-7"],
+            batch_size=1,
+            log_callback=forwarded["messages"].append,
+        )
+
+        self.assertEqual(results["failed"], [])
+        self.assertEqual(results["completed"], ["clip-log-7"])
+        self.assertEqual(
+            forwarded["messages"],
+            ["Sub-batch 1/1 [custom] active 15.0s; chunk_ids=[7], uids=[clip-log], text_chars=[58], total_chars=58"],
+        )
+        self.assertEqual(
+            forwarded["batch_chunks"][0]["display_id"],
+            self.manager.get_chunk_raw("clip-log-7")["id"],
+        )
 
     def test_enqueue_audio_finalize_task_returns_before_ledger_persist_completes(self):
         chunk = {
@@ -1612,6 +1658,31 @@ class ChunkRuntimeOverlayTests(unittest.TestCase):
         self.assertEqual(recovered[0]["status"], "done")
         self.assertTrue(recovered[0]["audio_validation"]["is_valid"])
         self.assertNotIn("generation_token", recovered[0])
+
+    def test_should_request_auto_regen_retry_skips_overlong_audio_failures(self):
+        self.manager._load_tts_settings = lambda: {
+            "auto_regenerate_bad_clips": True,
+            "auto_regenerate_bad_clip_attempts": 3,
+        }
+
+        self.assertFalse(
+            self.manager._should_request_auto_regen_retry(
+                0,
+                error="Audio is too long for 5 words: 10.56s vs expected 2.35s (maximum 5.88s).",
+            )
+        )
+        self.assertTrue(
+            self.manager._should_request_auto_regen_retry(
+                0,
+                error="Generated audio file is missing or empty",
+            )
+        )
+        self.assertFalse(
+            self.manager._should_request_auto_regen_retry(
+                3,
+                error="Generated audio file is missing or empty",
+            )
+        )
 
     def test_sync_chunks_from_script_if_stale_rebuilds_when_script_is_newer(self):
         self.manager.script_store.replace_script_document(

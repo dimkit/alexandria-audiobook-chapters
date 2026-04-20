@@ -63,6 +63,13 @@ def _run(cmd: list[str], *, cwd: Path, env: dict[str, str]) -> int:
     return int(completed.returncode)
 
 
+def _has_explicit_pytest_selection(pytest_args: str) -> bool:
+    extra_args = _split_args(pytest_args)
+    if not extra_args:
+        return False
+    return any(not str(arg).startswith("-") for arg in extra_args)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Canonical Threadspeak test runner. Use this instead of custom pytest commands."
@@ -114,7 +121,7 @@ def main() -> int:
     if rc != 0:
         return rc
 
-    if args.fresh_clone_e2e:
+    if args.fresh_clone_e2e and not _has_explicit_pytest_selection(args.pytest_args):
         fresh_cmd = [
             str(python_bin),
             "-m",

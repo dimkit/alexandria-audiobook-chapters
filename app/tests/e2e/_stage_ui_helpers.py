@@ -1,5 +1,6 @@
 """Shared helpers for stage UI E2E tests."""
 
+import ctypes
 import json
 import os
 import platform
@@ -8,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Dict
@@ -2349,6 +2351,41 @@ def _pid_is_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 87:
+            return False
+        raise
+
+
+@contextmanager
+def _hard_test_timeout(seconds: float, *, label: str):
+    deadline_seconds = max(1.0, float(seconds))
+    current_thread = threading.current_thread()
+    timed_out = {"value": False}
+
+    def _inject_timeout() -> None:
+        timed_out["value"] = True
+        thread_id = getattr(current_thread, "ident", None)
+        if not thread_id:
+            return
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(thread_id),
+            ctypes.py_object(TimeoutError),
+        )
+
+    timer = threading.Timer(deadline_seconds, _inject_timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    except TimeoutError as exc:
+        if timed_out["value"]:
+            raise AssertionError(
+                f"{label} exceeded hard timeout of {int(deadline_seconds)} seconds."
+            ) from exc
+        raise
+    finally:
+        timer.cancel()
 
 
 def _read_lock_owner_pid(lock_path: str) -> int | None:

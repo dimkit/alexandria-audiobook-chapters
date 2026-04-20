@@ -128,9 +128,11 @@ class AudioQueueMetricsTests(unittest.TestCase):
         def fake_generate_chunks_batch(indices, batch_seed, batch_size, progress_callback=None,
                                        batch_group_by_type=False, cancel_check=None,
                                        item_callback=None, generation_token=None,
-                                       item_started_callback=None):
+                                       item_started_callback=None, log_callback=None):
             captured["indices"] = list(indices)
             captured["generation_token"] = generation_token
+            if log_callback:
+                log_callback("Sub-batch 1/1 [clone speaker='Jordan'] active 15.0s; chunk_ids=[2, 3], uids=[u2, u3], text_chars=[120, 160], total_chars=280")
             return {"completed": [], "failed": [], "cancelled": 0}
 
         original_generate = app_module.project_manager.generate_chunks_batch
@@ -177,6 +179,9 @@ class AudioQueueMetricsTests(unittest.TestCase):
             self.assertTrue(done_event.is_set())
             self.assertEqual(captured["indices"], ["u2", "u3"])
             self.assertEqual(captured["generation_token"], "run-restored")
+            self.assertTrue(
+                any("Sub-batch 1/1 [clone speaker='Jordan'] active 15.0s" in entry for entry in app_module.process_state["audio"]["logs"])
+            )
         finally:
             app_module.project_manager.generate_chunks_batch = original_generate
             with app_module.audio_queue_lock:

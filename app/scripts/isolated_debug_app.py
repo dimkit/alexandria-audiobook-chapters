@@ -22,6 +22,7 @@ For commands that should always clean up when they finish, use `exec`:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -45,6 +46,8 @@ DEFAULT_MANIFEST_NAME = "isolated-debug.json"
 DEFAULT_READY_TIMEOUT_SECONDS = 30.0
 DEFAULT_READY_POLL_SECONDS = 0.2
 COPY_EXCLUDES = (
+    ".tmp",
+    ".tmp/*",
     ".git",
     ".pytest_cache",
     "__pycache__",
@@ -53,6 +56,8 @@ COPY_EXCLUDES = (
     "app/env",
     "node_modules",
     "cache",
+    "cache/t",
+    "cache/t/*",
     "logs",
     "app/.pytest_cache",
     "app/__pycache__",
@@ -82,6 +87,10 @@ def _pid_is_running(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 87:
+            return False
+        raise
     return True
 
 
@@ -151,16 +160,38 @@ def _find_free_port() -> int:
 
 
 def _python_for_clone(source_root: Path) -> Path:
-    preferred = source_root / "app" / "env" / "bin" / "python"
-    if preferred.exists():
-        return preferred
+    candidates = [
+        source_root / "app" / "env" / "Scripts" / "python.exe",
+        source_root / "app" / "env" / "bin" / "python",
+    ]
+    for preferred in candidates:
+        if preferred.exists():
+            return preferred
     return Path(sys.executable)
 
 
 def _ignore_copy(_dir: str, names: Iterable[str]) -> set[str]:
+    current_dir = Path(_dir)
+    try:
+        relative_dir = current_dir.resolve().relative_to(REPO_ROOT.resolve())
+        relative_dir_posix = relative_dir.as_posix()
+    except Exception:
+        relative_dir_posix = ""
     ignored = set()
     for name in names:
+        candidate = f"{relative_dir_posix}/{name}" if relative_dir_posix else name
+        candidate = candidate.replace("\\", "/")
         if name in {".git", ".pytest_cache", "__pycache__", ".DS_Store"}:
+            ignored.add(name)
+            continue
+        for pattern in COPY_EXCLUDES:
+            normalized_pattern = str(pattern or "").replace("\\", "/").strip()
+            if not normalized_pattern:
+                continue
+            if fnmatch.fnmatch(candidate, normalized_pattern) or fnmatch.fnmatch(name, normalized_pattern):
+                ignored.add(name)
+                break
+        if name == "env":
             ignored.add(name)
     return ignored
 
@@ -249,6 +280,14 @@ def _tail_log(path: Path, max_lines: int = 40) -> str:
 def _terminate_process_group(pid: int, timeout_seconds: float = 5.0) -> None:
     if pid <= 0:
         return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
     try:
         pgid = os.getpgid(pid)
     except ProcessLookupError:
@@ -284,7 +323,7 @@ def _terminate_process_group(pid: int, timeout_seconds: float = 5.0) -> None:
 
 
 def _create_clone_root(prefix: str) -> Path:
-    return Path(tempfile.mkdtemp(prefix=prefix, dir="/tmp"))
+    return Path(tempfile.mkdtemp(prefix=prefix))
 
 
 def _start_harness(source_root: Path, port: int | None, prefix: str, ready_timeout_seconds: float) -> dict:

@@ -17,10 +17,18 @@ import soundfile as sf
 from pydub import AudioSegment
 import httpx
 from runtime_layout import LAYOUT
+from audio_validation import estimate_expected_duration_seconds
 
 DEFAULT_PAUSE_MS = 500  # Pause between different speakers
 SAME_SPEAKER_PAUSE_MS = 250  # Shorter pause for same speaker continuing
 TRUE_VALUES = {"1", "true", "yes", "on"}
+QWEN_AUDIO_TOKENS_PER_SECOND = 12.0
+QWEN_MIN_GENERATION_SECONDS = 8.0
+QWEN_MAX_GENERATION_SECONDS = 45.0
+QWEN_GENERATION_SECONDS_MARGIN = 1.0
+QWEN_GENERATION_TOKEN_BUFFER_FACTOR = 1.15
+QWEN_MIN_MAX_NEW_TOKENS = 96
+QWEN_MAX_MAX_NEW_TOKENS = 768
 
 
 def sanitize_filename(name):
@@ -81,6 +89,10 @@ class TTSEngine:
         self._sub_batch_ratio = max(1.0, float(tts_config.get("sub_batch_ratio", 5)))
         self._sub_batch_max_chars = max(500, int(tts_config.get("sub_batch_max_chars", 3000)))
         self._sub_batch_max_items = int(tts_config.get("sub_batch_max_items", 0))  # 0 = auto
+        self._progress_log_interval_seconds = max(
+            5.0,
+            float(tts_config.get("progress_log_interval_seconds", 15.0)),
+        )
 
         # Lazy-loaded backends (guarded by _model_lock to prevent concurrent loads)
         self._model_lock = threading.Lock()
@@ -206,6 +218,74 @@ class TTSEngine:
         return wav
 
     @staticmethod
+    def _short_uid(value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return text[:8]
+
+    @staticmethod
+    def _summarize_list(values, limit=4):
+        items = [str(value) for value in (values or []) if str(value).strip()]
+        if not items:
+            return "[]"
+        if len(items) <= limit:
+            return "[" + ", ".join(items) + "]"
+        visible = ", ".join(items[:limit])
+        return f"[{visible}, +{len(items) - limit} more]"
+
+    def _describe_batch_targets(self, chunk_ids=None, chunk_uids=None, text_lengths=None):
+        parts = []
+        if chunk_ids:
+            parts.append(f"chunk_ids={self._summarize_list(chunk_ids)}")
+        if chunk_uids:
+            parts.append(f"uids={self._summarize_list([self._short_uid(uid) for uid in chunk_uids])}")
+        if text_lengths:
+            parts.append(f"text_chars={self._summarize_list(text_lengths)}")
+            parts.append(f"total_chars={sum(int(length) for length in text_lengths)}")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _emit_log(message, log_callback=None):
+        print(message)
+        if callable(log_callback):
+            try:
+                log_callback(message)
+            except Exception:
+                pass
+
+    @contextlib.contextmanager
+    def _progress_log_context(self, message_factory, log_callback=None):
+        interval = float(self._progress_log_interval_seconds or 0.0)
+        if interval <= 0:
+            yield
+            return
+
+        stop_event = threading.Event()
+        started_at = time.time()
+
+        def _worker():
+            while not stop_event.wait(interval):
+                try:
+                    message = message_factory(max(0.0, time.time() - started_at))
+                except Exception:
+                    continue
+                if message:
+                    self._emit_log(message, log_callback=log_callback)
+
+        worker = threading.Thread(
+            target=_worker,
+            name="threadspeak-tts-progress-log",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            worker.join(timeout=1.0)
+
+    @staticmethod
     def _clear_gpu_cache():
         """Free GPU memory: garbage-collect Python objects, then clear CUDA cache."""
         import gc
@@ -286,6 +366,40 @@ class TTSEngine:
 
         return max_batch
 
+    def _estimate_generation_seconds_for_text(self, text):
+        """Estimate a bounded generation budget for one utterance.
+
+        Qwen3-TTS-12Hz uses acoustic tokens, so a very large fixed
+        max_new_tokens allows tiny lines to overgenerate for minutes.
+        Keep the budget proportional to the text and cap it globally so
+        local generation fails fast instead of hanging indefinitely.
+        """
+        normalized = (text or "").strip()
+        expected_duration = estimate_expected_duration_seconds(text=normalized)
+        if expected_duration <= 0:
+            expected_duration = max(0.75, len(normalized) / 24.0)
+
+        budget_seconds = (expected_duration * 2.5) + QWEN_GENERATION_SECONDS_MARGIN
+        return max(
+            QWEN_MIN_GENERATION_SECONDS,
+            min(QWEN_MAX_GENERATION_SECONDS, budget_seconds),
+        )
+
+    def _qwen_max_new_tokens_for_text(self, text):
+        generation_seconds = self._estimate_generation_seconds_for_text(text)
+        budget_tokens = int(
+            generation_seconds * QWEN_AUDIO_TOKENS_PER_SECOND * QWEN_GENERATION_TOKEN_BUFFER_FACTOR
+        )
+        return max(
+            QWEN_MIN_MAX_NEW_TOKENS,
+            min(QWEN_MAX_MAX_NEW_TOKENS, budget_tokens),
+        )
+
+    def _qwen_max_new_tokens_for_texts(self, texts):
+        if not texts:
+            return QWEN_MIN_MAX_NEW_TOKENS
+        return max(self._qwen_max_new_tokens_for_text(text) for text in texts)
+
     def _build_sub_batches(self, texts, max_items=None):
         """Split sorted-by-length texts into sub-batches.
 
@@ -346,13 +460,17 @@ class TTSEngine:
         import time
         t0 = time.time()
         try:
+            warmup_text = (
+                "The ancient library stood at the crossroads of two forgotten paths, "
+                "its weathered stone walls covered in ivy that had been growing for centuries."
+            )
             model.generate_custom_voice(
-                text="The ancient library stood at the crossroads of two forgotten paths, its weathered stone walls covered in ivy that had been growing for centuries.",
+                text=warmup_text,
                 language=self._language,
                 speaker="serena",
                 instruct="neutral",
                 non_streaming_mode=True,
-                max_new_tokens=2048,
+                max_new_tokens=self._qwen_max_new_tokens_for_text(warmup_text),
             )
             print(f"Warmup done in {time.time()-t0:.1f}s")
         except Exception as e:
@@ -1077,13 +1195,18 @@ class TTSEngine:
             torch.manual_seed(seed)
 
         t_start = time.time()
+        max_new_tokens = self._qwen_max_new_tokens_for_text(sample_text)
+        print(
+            f"VoiceDesign: generation budget {max_new_tokens} tokens "
+            f"for ~{self._estimate_generation_seconds_for_text(sample_text):.1f}s max audio"
+        )
         with self._design_inference_lock:
             wavs, sr = model.generate_voice_design(
                 text=sample_text,
                 instruct=description,
                 language=lang,
                 non_streaming_mode=True,
-                max_new_tokens=2048,
+                max_new_tokens=max_new_tokens,
             )
         gen_time = time.time() - t_start
 
@@ -1222,12 +1345,17 @@ class TTSEngine:
                 gen_extra["instruct_ids"] = model._tokenize_texts([instruct_formatted])
 
             t_start = time.time()
+            max_new_tokens = self._qwen_max_new_tokens_for_text(text)
+            print(
+                f"TTS [local lora] generation budget: {max_new_tokens} tokens "
+                f"for ~{self._estimate_generation_seconds_for_text(text):.1f}s max audio"
+            )
             with self._lora_inference_lock:
                 wavs, sr = model.generate_voice_clone(
                     text=text,
                     voice_clone_prompt=prompt,
                     non_streaming_mode=True,
-                    max_new_tokens=2048,
+                    max_new_tokens=max_new_tokens,
                     **gen_extra,
                 )
             gen_time = time.time() - t_start
@@ -1249,7 +1377,7 @@ class TTSEngine:
 
     # ── Batch generation ─────────────────────────────────────────
 
-    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None, log_callback=None):
         """Generate multiple audio files.
 
         Local mode: uses native list-based batch API for custom voices.
@@ -1331,6 +1459,7 @@ class TTSEngine:
                     output_dir,
                     batch_seed,
                     cancel_check=cancel_check,
+                    log_callback=log_callback,
                 )
             else:
                 batch_results = self._sequential_custom(
@@ -1352,6 +1481,7 @@ class TTSEngine:
                     voice_config,
                     output_dir,
                     cancel_check=cancel_check,
+                    log_callback=log_callback,
                 )
             else:
                 batch_results = {"completed": [], "failed": []}
@@ -1383,6 +1513,7 @@ class TTSEngine:
                     voice_config,
                     output_dir,
                     cancel_check=cancel_check,
+                    log_callback=log_callback,
                 )
             else:
                 batch_results = {"completed": [], "failed": []}
@@ -1541,6 +1672,11 @@ class TTSEngine:
                 torch.manual_seed(seed)
 
             t_start = time.time()
+            max_new_tokens = self._qwen_max_new_tokens_for_text(text)
+            print(
+                f"TTS [local] generation budget: {max_new_tokens} tokens "
+                f"for ~{self._estimate_generation_seconds_for_text(text):.1f}s max audio"
+            )
             with self._custom_inference_lock:
                 wavs, sr = model.generate_custom_voice(
                     text=text,
@@ -1548,7 +1684,7 @@ class TTSEngine:
                     speaker=voice,
                     instruct=instruct,
                     non_streaming_mode=True,
-                    max_new_tokens=2048,
+                    max_new_tokens=max_new_tokens,
                 )
             gen_time = time.time() - t_start
 
@@ -1591,12 +1727,17 @@ class TTSEngine:
                 torch.manual_seed(seed)
 
             t_start = time.time()
+            max_new_tokens = self._qwen_max_new_tokens_for_text(text)
+            print(
+                f"TTS [local clone] generation budget: {max_new_tokens} tokens "
+                f"for ~{self._estimate_generation_seconds_for_text(text):.1f}s max audio"
+            )
             with self._clone_inference_lock:
                 wavs, sr = model.generate_voice_clone(
                     text=text,
                     voice_clone_prompt=prompt,
                     non_streaming_mode=True,
-                    max_new_tokens=2048,
+                    max_new_tokens=max_new_tokens,
                 )
             gen_time = time.time() - t_start
 
@@ -1615,7 +1756,7 @@ class TTSEngine:
             print(f"Error generating clone voice for '{speaker}': {e}")
             return False
 
-    def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None):
+    def _local_batch_custom(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None, log_callback=None):
         """Batch generate custom voice using native list API with sub-batching.
 
         Autoregressive batch generation runs for as long as the longest sequence.
@@ -1633,6 +1774,7 @@ class TTSEngine:
         speakers = []
         instructs = []
         indices = []
+        display_ids = []
 
         for chunk in chunks:
             idx = chunk["index"]
@@ -1652,6 +1794,7 @@ class TTSEngine:
             speakers.append(voice)
             instructs.append(instruct)
             indices.append(idx)
+            display_ids.append(chunk.get("display_id") if chunk.get("display_id") is not None else idx)
 
         total_text_chars = sum(len(t) for t in texts)
 
@@ -1664,6 +1807,7 @@ class TTSEngine:
         speakers = [speakers[i] for i in sort_order]
         instructs = [instructs[i] for i in sort_order]
         indices = [indices[i] for i in sort_order]
+        display_ids = [display_ids[i] for i in sort_order]
 
         model = self._init_local_custom()
 
@@ -1696,24 +1840,46 @@ class TTSEngine:
             sb_speakers = speakers[start:end]
             sb_instructs = instructs[start:end]
             sb_indices = indices[start:end]
+            sb_display_ids = display_ids[start:end]
             sb_chars = sum(len(t) for t in sb_texts)
+            sb_text_lengths = [len(text) for text in sb_texts]
+            sb_summary = self._describe_batch_targets(
+                chunk_ids=sb_display_ids,
+                chunk_uids=sb_indices,
+                text_lengths=sb_text_lengths,
+            )
 
-            print(f"  Sub-batch {sb_idx+1}/{len(sub_batches)}: {len(sb_texts)} chunks "
-                  f"({sb_chars} chars, {len(sb_texts[0])}-{len(sb_texts[-1])} chars/chunk)")
+            self._emit_log(
+                f"  Sub-batch {sb_idx+1}/{len(sub_batches)} [custom]: {len(sb_texts)} chunks "
+                f"({sb_chars} chars, {len(sb_texts[0])}-{len(sb_texts[-1])} chars/chunk); {sb_summary}",
+                log_callback=log_callback,
+            )
 
             try:
                 if batch_seed >= 0:
                     torch.manual_seed(batch_seed)
 
                 t_start = time.time()
-                wavs_list, sr = model.generate_custom_voice(
-                    text=sb_texts,
-                    language=[self._language] * len(sb_texts),
-                    speaker=sb_speakers,
-                    instruct=sb_instructs,
-                    non_streaming_mode=True,
-                    max_new_tokens=2048,
+                max_new_tokens = self._qwen_max_new_tokens_for_texts(sb_texts)
+                self._emit_log(
+                    f"  Sub-batch {sb_idx+1}/{len(sub_batches)} [custom] token budget={max_new_tokens}",
+                    log_callback=log_callback,
                 )
+                with self._progress_log_context(
+                    lambda elapsed: (
+                        f"  Sub-batch {sb_idx+1}/{len(sub_batches)} [custom] active {elapsed:.1f}s; "
+                        f"{sb_summary}"
+                    ),
+                    log_callback=log_callback,
+                ):
+                    wavs_list, sr = model.generate_custom_voice(
+                        text=sb_texts,
+                        language=[self._language] * len(sb_texts),
+                        speaker=sb_speakers,
+                        instruct=sb_instructs,
+                        non_streaming_mode=True,
+                        max_new_tokens=max_new_tokens,
+                    )
                 gen_time = time.time() - t_start
 
                 if wavs_list is None:
@@ -1747,7 +1913,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_clone(self, chunks, voice_config, output_dir, cancel_check=None):
+    def _local_batch_clone(self, chunks, voice_config, output_dir, cancel_check=None, log_callback=None):
         """Batch generate clone voices, grouped by speaker.
 
         Chunks sharing the same speaker (same reference audio) are batched
@@ -1792,17 +1958,23 @@ class TTSEngine:
 
             texts = [c["text"] for c in group]
             indices = [c["index"] for c in group]
+            display_ids = [c.get("display_id") if c.get("display_id") is not None else c["index"] for c in group]
 
             # Sort by text length for sub-batching efficiency
             sort_order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
             texts = [texts[i] for i in sort_order]
             indices = [indices[i] for i in sort_order]
+            display_ids = [display_ids[i] for i in sort_order]
 
             # Estimate max batch size from VRAM + clone prompt overhead
             clone_tokens = prompt[0].ref_code.shape[0] if prompt[0].ref_code is not None else 0
             ref_text_chars = len(prompt[0].ref_text) if prompt[0].ref_text else 0
             max_items = self._estimate_max_batch_size(
-                model, clone_tokens, ref_text_chars, len(texts[-1]),
+                model,
+                clone_tokens,
+                ref_text_chars,
+                len(texts[-1]),
+                max_new_tokens=self._qwen_max_new_tokens_for_text(texts[-1]),
             )
             sub_batches = self._build_sub_batches(texts, max_items=max_items)
 
@@ -1815,18 +1987,41 @@ class TTSEngine:
                     break
                 sb_texts = texts[start:end]
                 sb_indices = indices[start:end]
+                sb_display_ids = display_ids[start:end]
+                sb_text_lengths = [len(text) for text in sb_texts]
+                sb_summary = self._describe_batch_targets(
+                    chunk_ids=sb_display_ids,
+                    chunk_uids=sb_indices,
+                    text_lengths=sb_text_lengths,
+                )
 
-                print(f"  Sub-batch {sb_idx+1}/{len(sub_batches)}: {len(sb_texts)} chunks "
-                      f"({len(sb_texts[0])}-{len(sb_texts[-1])} chars/chunk)")
+                self._emit_log(
+                    f"  Sub-batch {sb_idx+1}/{len(sub_batches)} [clone speaker='{speaker}']: "
+                    f"{len(sb_texts)} chunks ({len(sb_texts[0])}-{len(sb_texts[-1])} chars/chunk); {sb_summary}",
+                    log_callback=log_callback,
+                )
 
                 try:
                     t_start = time.time()
-                    wavs_list, sr = model.generate_voice_clone(
-                        text=sb_texts,
-                        voice_clone_prompt=prompt,
-                        non_streaming_mode=True,
-                        max_new_tokens=2048,
+                    max_new_tokens = self._qwen_max_new_tokens_for_texts(sb_texts)
+                    self._emit_log(
+                        f"  Sub-batch {sb_idx+1}/{len(sub_batches)} [clone speaker='{speaker}'] "
+                        f"token budget={max_new_tokens}",
+                        log_callback=log_callback,
                     )
+                    with self._progress_log_context(
+                        lambda elapsed: (
+                            f"  Sub-batch {sb_idx+1}/{len(sub_batches)} [clone speaker='{speaker}'] "
+                            f"active {elapsed:.1f}s; {sb_summary}"
+                        ),
+                        log_callback=log_callback,
+                    ):
+                        wavs_list, sr = model.generate_voice_clone(
+                            text=sb_texts,
+                            voice_clone_prompt=prompt,
+                            non_streaming_mode=True,
+                            max_new_tokens=max_new_tokens,
+                        )
                     gen_time = time.time() - t_start
 
                     if wavs_list is None:
@@ -1859,7 +2054,7 @@ class TTSEngine:
 
         return results
 
-    def _local_batch_lora(self, chunks, voice_config, output_dir, cancel_check=None):
+    def _local_batch_lora(self, chunks, voice_config, output_dir, cancel_check=None, log_callback=None):
         """Batch generate LoRA voices, grouped by adapter.
 
         Chunks sharing the same adapter are batched together through
@@ -1951,18 +2146,24 @@ class TTSEngine:
             texts = [c["text"] for c in group]
             instructs_raw = [c.get("instruct", "") for c in group]
             indices = [c["index"] for c in group]
+            display_ids = [c.get("display_id") if c.get("display_id") is not None else c["index"] for c in group]
 
             # Sort by text length
             sort_order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
             texts = [texts[i] for i in sort_order]
             instructs_raw = [instructs_raw[i] for i in sort_order]
             indices = [indices[i] for i in sort_order]
+            display_ids = [display_ids[i] for i in sort_order]
 
             # Estimate max batch size from VRAM + clone prompt overhead
             clone_tokens = prompt[0].ref_code.shape[0] if prompt[0].ref_code is not None else 0
             ref_text_chars = len(prompt[0].ref_text) if prompt[0].ref_text else 0
             max_items = self._estimate_max_batch_size(
-                model, clone_tokens, ref_text_chars, len(texts[-1]),
+                model,
+                clone_tokens,
+                ref_text_chars,
+                len(texts[-1]),
+                max_new_tokens=self._qwen_max_new_tokens_for_text(texts[-1]),
             )
             sub_batches = self._build_sub_batches(texts, max_items=max_items)
 
@@ -1976,9 +2177,19 @@ class TTSEngine:
                 sb_texts = texts[start:end]
                 sb_instructs = instructs_raw[start:end]
                 sb_indices = indices[start:end]
+                sb_display_ids = display_ids[start:end]
+                sb_text_lengths = [len(text) for text in sb_texts]
+                sb_summary = self._describe_batch_targets(
+                    chunk_ids=sb_display_ids,
+                    chunk_uids=sb_indices,
+                    text_lengths=sb_text_lengths,
+                )
 
-                print(f"  Sub-batch {sb_idx+1}/{len(sub_batches)}: {len(sb_texts)} chunks "
-                      f"({len(sb_texts[0])}-{len(sb_texts[-1])} chars/chunk)")
+                self._emit_log(
+                    f"  Sub-batch {sb_idx+1}/{len(sub_batches)} [lora adapter='{os.path.basename(adapter_path)}']: "
+                    f"{len(sb_texts)} chunks ({len(sb_texts[0])}-{len(sb_texts[-1])} chars/chunk); {sb_summary}",
+                    log_callback=log_callback,
+                )
 
                 try:
                     # Build instruct_ids list for this sub-batch
@@ -1998,13 +2209,27 @@ class TTSEngine:
                         gen_extra["instruct_ids"] = instruct_ids
 
                     t_start = time.time()
-                    wavs_list, sr = model.generate_voice_clone(
-                        text=sb_texts,
-                        voice_clone_prompt=prompt,
-                        non_streaming_mode=True,
-                        max_new_tokens=2048,
-                        **gen_extra,
+                    max_new_tokens = self._qwen_max_new_tokens_for_texts(sb_texts)
+                    self._emit_log(
+                        f"  Sub-batch {sb_idx+1}/{len(sub_batches)} "
+                        f"[lora adapter='{os.path.basename(adapter_path)}'] token budget={max_new_tokens}",
+                        log_callback=log_callback,
                     )
+                    with self._progress_log_context(
+                        lambda elapsed: (
+                            f"  Sub-batch {sb_idx+1}/{len(sub_batches)} "
+                            f"[lora adapter='{os.path.basename(adapter_path)}'] active {elapsed:.1f}s; "
+                            f"{sb_summary}"
+                        ),
+                        log_callback=log_callback,
+                    ):
+                        wavs_list, sr = model.generate_voice_clone(
+                            text=sb_texts,
+                            voice_clone_prompt=prompt,
+                            non_streaming_mode=True,
+                            max_new_tokens=max_new_tokens,
+                            **gen_extra,
+                        )
                     gen_time = time.time() - t_start
 
                     if wavs_list is None:

@@ -2,11 +2,13 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from ._stage_ui_helpers import (
     SOURCE_REPO_DIR,
     _copy_repo_git_metadata_and_tracked_files,
     _fresh_clone_install_commands,
+    _pid_is_alive,
     _reset_repo_copy_to_ref,
 )
 
@@ -53,6 +55,12 @@ class FreshCloneSupportTests(unittest.TestCase):
             ["python", "-m", "pip", "install", "mlx-audio==0.4.2", "sentencepiece", "tiktoken"],
             darwin_commands,
         )
+
+    def test_pid_is_alive_treats_windows_invalid_parameter_as_dead(self):
+        error = OSError(87, "The parameter is incorrect")
+        error.winerror = 87
+        with mock.patch("os.kill", side_effect=error):
+            self.assertFalse(_pid_is_alive(10032))
 
 
 if __name__ == "__main__":

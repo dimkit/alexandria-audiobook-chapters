@@ -125,6 +125,14 @@ class ProjectGenerationMixin:
                 return 0
             return attempts if attempts > 0 else 0
 
+        def _should_request_auto_regen_retry(self, attempt, error=None):
+            if attempt >= self._get_auto_regen_retry_attempts():
+                return False
+            normalized_error = str(error or "").strip().lower()
+            if "audio is too long" in normalized_error:
+                return False
+            return True
+
         @staticmethod
         def _cleanup_temp_file(temp_path):
             if os.path.exists(temp_path):
@@ -298,7 +306,11 @@ class ProjectGenerationMixin:
                     self._cleanup_temp_file(temp_path)
                     if updated_chunk is None:
                         return False, "Generation abandoned"
-                    if result["status"] == "error" and auto_regen_retry_attempts > 0 and attempt < auto_regen_retry_attempts:
+                    should_retry = result["status"] == "error" and self._should_request_auto_regen_retry(
+                        attempt,
+                        error=result.get("error"),
+                    )
+                    if should_retry:
                         print(f"Chunk {display_index} failed sanity check; auto-regenerating attempt {attempt + 1}/{auto_regen_retry_attempts}")
                         return self._generate_chunk_audio_internal(
                             chunk_uid,
@@ -565,7 +577,7 @@ class ProjectGenerationMixin:
 
         def generate_chunks_batch(self, indices, batch_seed=-1, batch_size=4, progress_callback=None,
                                    batch_group_by_type=False, cancel_check=None, item_callback=None,
-                                   generation_token=None, item_started_callback=None):
+                                   generation_token=None, item_started_callback=None, log_callback=None):
             """Generate multiple chunks using batch TTS API with a single seed.
 
             Args:
@@ -674,6 +686,7 @@ class ProjectGenerationMixin:
                     )
                     batch_chunks.append({
                         "index": uid,
+                        "display_id": chunk.get("id"),
                         "text": transformed_text,
                         "instruct": chunk.get("instruct", ""),
                         "speaker": resolved_speaker,
@@ -691,12 +704,21 @@ class ProjectGenerationMixin:
                 )
                 os.makedirs(batch_output_dir, exist_ok=True)
                 batch_generate_started = time.perf_counter()
+                batch_call_kwargs = {
+                    "cancel_check": cancel_check,
+                }
+                try:
+                    generate_batch_signature = inspect.signature(engine.generate_batch)
+                except (TypeError, ValueError):
+                    generate_batch_signature = None
+                if generate_batch_signature and "log_callback" in generate_batch_signature.parameters:
+                    batch_call_kwargs["log_callback"] = log_callback
                 batch_results = engine.generate_batch(
                     batch_chunks,
                     voice_config,
                     batch_output_dir,
                     batch_seed,
-                    cancel_check=cancel_check,
+                    **batch_call_kwargs,
                 )
                 record_audio_perf(
                     "audio_batch_generate",

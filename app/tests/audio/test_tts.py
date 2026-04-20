@@ -194,6 +194,21 @@ class LocalBackendResolutionTests(unittest.TestCase):
 
 
 class LocalBatchRegressionTests(unittest.TestCase):
+    def test_qwen_token_budget_scales_with_text_length_and_stays_bounded(self):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
+
+        short_budget = engine._qwen_max_new_tokens_for_text("Now,")
+        medium_budget = engine._qwen_max_new_tokens_for_text(
+            "This is a medium sentence with enough words to require a larger generation budget."
+        )
+        long_budget = engine._qwen_max_new_tokens_for_text(
+            " ".join(["extended"] * 120)
+        )
+
+        self.assertEqual(short_budget, 110)
+        self.assertGreater(medium_budget, short_budget)
+        self.assertEqual(long_budget, 621)
+
     def test_persist_batch_audio_outputs_marks_missing_outputs_as_failed(self):
         engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
         results = {"completed": [], "failed": []}
@@ -244,6 +259,45 @@ class LocalBatchRegressionTests(unittest.TestCase):
             self.assertEqual(results["completed"], ["uid-1"])
             self.assertEqual(results["failed"], [])
             self.assertTrue(os.path.exists(os.path.join(output_dir, "temp_batch_uid-1.wav")))
+
+    def test_local_batch_clone_uses_dynamic_text_budget(self):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
+        chunks = [{
+            "index": "uid-1",
+            "display_id": 21,
+            "text": "Now,",
+            "speaker": "Bitera",
+        }]
+        voice_config = {
+            "Bitera": {
+                "type": "clone",
+                "ref_audio": "clone_voices/bitera.wav",
+                "ref_text": "Reference line",
+            }
+        }
+
+        prompt_item = mock.Mock()
+        prompt_item.ref_code = np.zeros(12, dtype=np.int32)
+        prompt_item.ref_text = "Reference line"
+        prompt = [prompt_item]
+
+        fake_model = mock.Mock()
+        fake_model.generate_voice_clone.return_value = ([np.zeros(2400, dtype=np.float32)], 24000)
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            with mock.patch.object(engine, "_init_local_clone", return_value=fake_model), \
+                 mock.patch.object(engine, "_get_clone_prompt", return_value=prompt), \
+                 mock.patch.object(engine, "_estimate_max_batch_size", return_value=8), \
+                 mock.patch.object(engine, "_build_sub_batches", return_value=[(0, 1)]), \
+                 mock.patch.object(engine, "_clear_gpu_cache"), \
+                 mock.patch.object(engine, "_warmup_model"):
+                engine._warmup_needed = False
+                results = engine._local_batch_clone(chunks, voice_config, output_dir)
+
+        self.assertEqual(results["completed"], ["uid-1"])
+        self.assertEqual(results["failed"], [])
+        fake_model.generate_voice_clone.assert_called_once()
+        self.assertEqual(fake_model.generate_voice_clone.call_args.kwargs["max_new_tokens"], 110)
 
 if __name__ == "__main__":
     unittest.main()
