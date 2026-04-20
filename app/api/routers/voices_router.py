@@ -244,22 +244,6 @@ def _save_runtime_voice_config(config: Dict[str, dict]):
     raise RuntimeError("Voice config requires the project SQLite store")
 
 
-def _voice_config_is_blank_for_reuse(config: Dict[str, object] | None) -> bool:
-    cfg = dict(config or {})
-    if str(cfg.get("alias") or "").strip():
-        return False
-    meaningful_fields = (
-        cfg.get("ref_audio"),
-        cfg.get("ref_text"),
-        cfg.get("generated_ref_text"),
-        cfg.get("description"),
-        cfg.get("adapter_id"),
-        cfg.get("adapter_path"),
-        cfg.get("voice") if str(cfg.get("type") or "").strip() not in {"", "design"} else "",
-    )
-    return not any(str(value or "").strip() for value in meaningful_fields)
-
-
 @router.get("/api/voices")
 async def get_voices():
     chunks = project_manager.load_chunks() if _can_use_project_chunk_store() else []
@@ -309,25 +293,6 @@ async def get_voices():
     if not voice_rows:
         return []
 
-    for voice in voice_rows:
-        voice_name = str((voice or {}).get("name") or "").strip()
-        if not voice_name:
-            continue
-        config = dict((voice or {}).get("config") or {})
-        if not _voice_config_is_blank_for_reuse(config):
-            continue
-        reusable_match = _find_saved_voice_option_for_speaker(voice_name)
-        if not reusable_match:
-            continue
-        config.update({
-            "type": reusable_match.get("type") or "clone",
-            "ref_audio": reusable_match.get("ref_audio") or config.get("ref_audio"),
-            "ref_text": reusable_match.get("ref_text") or config.get("ref_text"),
-            "generated_ref_text": reusable_match.get("generated_ref_text") or config.get("generated_ref_text"),
-            "description": reusable_match.get("description") or config.get("description"),
-        })
-        voice["config"] = config
-
     # Count paragraphs per speaker from the persisted paragraphs document.
     para_counts_by_norm: dict[str, int] = {}
     try:
@@ -347,6 +312,8 @@ async def get_voices():
         config = dict((voice or {}).get("config") or {})
         sample_suggestion = project_manager.suggest_design_sample_text(voice_name, chunks)
         line_count = int((voice or {}).get("line_count") or 0)
+        if line_count <= 0:
+            continue
         auto_alias_target = str((voice or {}).get("auto_alias_target") or "")
         auto_narrator_alias = bool((voice or {}).get("auto_narrator_alias"))
         ref_audio = (config.get("ref_audio") or "").strip()
@@ -645,21 +612,6 @@ def run_voice_processing_task(run_id: str, stop_check=None, relay_fn=None):
                 log(f"Auto-aliased {speaker} to {inferred_alias}.")
             ref_audio = (entry.get("ref_audio") or "").strip()
             ref_audio_path = os.path.join(ROOT_DIR, ref_audio) if ref_audio else ""
-            reusable_match = _find_saved_voice_option_for_speaker(speaker)
-            if reusable_match and not (ref_audio and os.path.exists(ref_audio_path)):
-                entry["type"] = reusable_match["type"]
-                entry["ref_audio"] = reusable_match["ref_audio"]
-                if reusable_match.get("ref_text") and not (entry.get("ref_text") or "").strip():
-                    entry["ref_text"] = reusable_match["ref_text"]
-                if reusable_match.get("generated_ref_text") and not (entry.get("generated_ref_text") or "").strip():
-                    entry["generated_ref_text"] = reusable_match["generated_ref_text"]
-                if reusable_match.get("description") and not (entry.get("description") or "").strip():
-                    entry["description"] = reusable_match["description"]
-                changed = True
-                log(
-                    f"Auto-populated {speaker} from saved voice '{reusable_match.get('source_name') or reusable_match['ref_audio']}'."
-                )
-                continue
             if not (entry.get("ref_text") or "").strip():
                 suggested = voice.get("suggested_sample_text") or project_manager.suggest_design_sample_text(speaker, chunks)
                 if suggested:

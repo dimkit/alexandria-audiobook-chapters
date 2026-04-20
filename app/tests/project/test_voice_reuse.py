@@ -46,7 +46,7 @@ class SavedVoiceReuseTests(unittest.TestCase):
             "Sadie",
         )
 
-    def test_voice_processing_auto_populates_same_project_reusable_voice(self):
+    def test_voice_processing_same_project_reusable_voice_is_regenerated_instead_of_auto_populated(self):
         with tempfile.TemporaryDirectory() as temp_root:
             clone_dir = os.path.join(temp_root, "clone_voices")
             designed_dir = os.path.join(temp_root, "designed_voices")
@@ -85,6 +85,7 @@ class SavedVoiceReuseTests(unittest.TestCase):
             original_append_log = app_module._append_task_log
             original_finish = app_module._finish_task_run
             original_pm = app_module.project_manager
+            original_suggest = app_module.suggest_voice_description_sync
             manager = None
             try:
                 manager = _seed_project_manager(
@@ -94,7 +95,20 @@ class SavedVoiceReuseTests(unittest.TestCase):
                 )
                 manager._current_script_title = lambda: "Book One"
                 manager.load_chunks = lambda: []
+                manager.suggest_design_sample_text = lambda speaker, chunks: "Friendship is magic."
                 manager.unload_tts_engine = lambda: False
+                materialized = []
+
+                def _materialize_design_voice(speaker, description, sample_text, force, voice_config):
+                    materialized.append((speaker, description, sample_text))
+                    updated = json.loads(json.dumps(voice_config))
+                    updated.setdefault(speaker, {})
+                    updated[speaker]["ref_audio"] = "clone_voices/generated.wav"
+                    updated[speaker]["generated_ref_text"] = sample_text
+                    manager._save_voice_config(updated)
+                    return {"voice_config": updated}
+
+                manager.materialize_design_voice = _materialize_design_voice
                 app_module.ROOT_DIR = temp_root
                 app_module.CLONE_VOICES_MANIFEST = os.path.join(clone_dir, "manifest.json")
                 app_module.DESIGNED_VOICES_MANIFEST = os.path.join(designed_dir, "manifest.json")
@@ -103,17 +117,23 @@ class SavedVoiceReuseTests(unittest.TestCase):
                 ]
                 app_module._task_is_current = lambda task_name, run_id: True
                 logs = []
-                materialized = []
                 app_module._append_task_log = lambda task_name, run_id, message: logs.append(message)
                 app_module._finish_task_run = lambda task_name, run_id: None
                 app_module.project_manager = manager
+                app_module.suggest_voice_description_sync = lambda speaker: {"voice": "Warm, bright voice"}
                 success = app_module.run_voice_processing_task("run-1")
                 self.assertTrue(success)
+                self.assertEqual(
+                    materialized,
+                    [("twilight sparkle", "Warm, bright voice", "Friendship is magic.")],
+                )
                 cfg = manager._load_voice_config()
-                self.assertEqual(cfg["twilight sparkle"]["type"], "clone")
-                self.assertEqual(cfg["twilight sparkle"]["ref_audio"], f"clone_voices/{clone_filename}")
+                self.assertEqual(cfg["twilight sparkle"]["type"], "design")
+                self.assertEqual(cfg["twilight sparkle"]["ref_audio"], "clone_voices/generated.wav")
                 self.assertEqual(cfg["twilight sparkle"]["ref_text"], "Friendship is magic.")
-                self.assertTrue(any("Auto-populated twilight sparkle" in message for message in logs))
+                self.assertEqual(cfg["twilight sparkle"]["generated_ref_text"], "Friendship is magic.")
+                self.assertEqual(cfg["twilight sparkle"]["description"], "Warm, bright voice")
+                self.assertFalse(any("Auto-populated twilight sparkle" in message for message in logs))
             finally:
                 app_module.ROOT_DIR = original_root
                 app_module.CLONE_VOICES_MANIFEST = original_clone_manifest
@@ -123,6 +143,7 @@ class SavedVoiceReuseTests(unittest.TestCase):
                 app_module._append_task_log = original_append_log
                 app_module._finish_task_run = original_finish
                 app_module.project_manager = original_pm
+                app_module.suggest_voice_description_sync = original_suggest
                 _shutdown_manager(manager)
 
     def test_voice_processing_does_not_auto_populate_voice_from_other_project(self):
@@ -393,7 +414,7 @@ class SavedVoiceReuseTests(unittest.TestCase):
                 app_module.DESIGNED_VOICES_MANIFEST = original_designed_manifest
                 app_module.project_manager = original_pm
 
-    def test_get_voices_populates_blank_row_from_project_prefixed_saved_voice(self):
+    def test_get_voices_does_not_auto_populate_blank_row_from_project_prefixed_saved_voice(self):
         with tempfile.TemporaryDirectory() as temp_root:
             clone_dir = os.path.join(temp_root, "clone_voices")
             designed_dir = os.path.join(temp_root, "designed_voices")
@@ -448,24 +469,41 @@ class SavedVoiceReuseTests(unittest.TestCase):
 
                 voices = asyncio.run(app_module.get_voices())
                 voices_by_name = {voice["name"]: voice for voice in voices}
-                self.assertEqual(voices_by_name["Aerial"]["config"].get("type"), "clone")
-                self.assertEqual(
-                    voices_by_name["Aerial"]["config"].get("ref_audio"),
-                    f"clone_voices/{clone_filename}",
-                )
-                self.assertEqual(
-                    voices_by_name["Aerial"]["config"].get("generated_ref_text"),
-                    "The horizon brightened.",
-                )
-                self.assertEqual(
-                    voices_by_name["Aerial"]["config"].get("description"),
-                    "Airy young heroine voice",
-                )
+                self.assertEqual(voices_by_name["Aerial"]["config"].get("type"), "design")
+                self.assertFalse((voices_by_name["Aerial"]["config"].get("ref_audio") or "").strip())
+                self.assertFalse((voices_by_name["Aerial"]["config"].get("generated_ref_text") or "").strip())
+                self.assertFalse((voices_by_name["Aerial"]["config"].get("description") or "").strip())
             finally:
                 app_module.ROOT_DIR = original_root
                 app_module.CLONE_VOICES_MANIFEST = original_clone_manifest
                 app_module.DESIGNED_VOICES_MANIFEST = original_designed_manifest
                 app_module.project_manager = original_pm
+                _shutdown_manager(manager)
+
+    def test_script_store_list_voice_rows_excludes_profile_only_speakers(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            manager = None
+            try:
+                manager = _seed_project_manager(
+                    temp_root,
+                    voice_config={
+                        "Aerial": {"type": "design", "description": "live"},
+                        "Retired": {"type": "design", "description": "stale"},
+                    },
+                )
+                manager.save_chunks(
+                    [
+                        {"id": 0, "uid": "chunk-1", "speaker": "Aerial", "text": "Hello.", "status": "pending"},
+                        {"id": 1, "uid": "chunk-2", "speaker": "Aerial", "text": "Again.", "status": "pending"},
+                    ]
+                )
+
+                rows = manager.script_store.list_voice_rows()
+                rows_by_name = {row["name"]: row for row in rows}
+                self.assertEqual(set(rows_by_name.keys()), {"Aerial"})
+                self.assertEqual(rows_by_name["Aerial"]["line_count"], 2)
+                self.assertEqual(rows_by_name["Aerial"]["config"].get("description"), "live")
+            finally:
                 _shutdown_manager(manager)
 
     def test_does_not_reuse_saved_voice_for_narrator(self):

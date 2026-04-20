@@ -8,14 +8,17 @@ from api.routers import voices_router
 
 
 class _StubScriptStore:
+    def __init__(self, voice_rows=None):
+        self._voice_rows = list(voice_rows or [])
+
     def list_voice_rows(self):
-        return []
+        return list(self._voice_rows)
 
 
 class _StubProjectManager:
-    def __init__(self, root_dir, chunks):
+    def __init__(self, root_dir, chunks, voice_rows=None):
         self.root_dir = root_dir
-        self.script_store = _StubScriptStore()
+        self.script_store = _StubScriptStore(voice_rows=voice_rows)
         self._chunks = chunks
 
     def load_chunks(self):
@@ -64,6 +67,45 @@ class VoicesRouterTests(unittest.TestCase):
 
         names = {row.get("name") for row in result}
         self.assertIn("Edited", names)
+
+    def test_get_voices_hides_zero_line_profiles_from_store_rows(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            original_project_manager = voices_router.project_manager
+            original_root_dir = voices_router.ROOT_DIR
+            original_load_runtime_voice_config = voices_router._load_runtime_voice_config
+            try:
+                voices_router.project_manager = _StubProjectManager(
+                    temp_root,
+                    [],
+                    voice_rows=[
+                        {
+                            "name": "Live",
+                            "config": {"type": "design", "description": "current"},
+                            "line_count": 2,
+                            "auto_narrator_alias": False,
+                            "auto_alias_target": "",
+                        },
+                        {
+                            "name": "Dead",
+                            "config": {"type": "design", "description": "stale"},
+                            "line_count": 0,
+                            "auto_narrator_alias": False,
+                            "auto_alias_target": "",
+                        },
+                    ],
+                )
+                voices_router.ROOT_DIR = temp_root
+                voices_router._load_runtime_voice_config = lambda: {}
+
+                result = asyncio.run(voices_router.get_voices())
+            finally:
+                voices_router.project_manager = original_project_manager
+                voices_router.ROOT_DIR = original_root_dir
+                voices_router._load_runtime_voice_config = original_load_runtime_voice_config
+
+        names = {row.get("name") for row in result}
+        self.assertIn("Live", names)
+        self.assertNotIn("Dead", names)
 
 
 if __name__ == "__main__":

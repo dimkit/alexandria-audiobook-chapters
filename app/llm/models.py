@@ -52,8 +52,8 @@ class LLMRuntimeConfig:
 
         return cls(
             base_url=cls.normalize_base_url(cfg.get("base_url", ""), default_base_url),
-            api_key=str(cfg.get("api_key", default_api_key) or default_api_key),
-            model_name=str(cfg.get("model_name", default_model_name) or default_model_name),
+            api_key=str(cfg.get("api_key", default_api_key) or default_api_key).strip(),
+            model_name=str(cfg.get("model_name", default_model_name) or default_model_name).strip(),
             timeout=timeout_value,
             llm_workers=workers,
         )

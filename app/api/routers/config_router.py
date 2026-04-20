@@ -289,7 +289,7 @@ async def get_config():
             "sub_batch_ratio": 5.0,
             "sub_batch_max_chars": 3000,
             "sub_batch_max_items": 0,
-            "script_max_length": 100,
+            "script_max_length": 250,
             "auto_regenerate_bad_clips": False,
             "auto_regenerate_bad_clip_attempts": 3
         },
@@ -299,7 +299,7 @@ async def get_config():
             "voice_prompt": ""
         },
         "proofread": {
-            "certainty_threshold": 1.0
+            "certainty_threshold": 0.75
         },
         "generation": {
             "legacy_mode": False,
@@ -436,11 +436,11 @@ async def get_config():
 
     # Include current input file info if available
     if "proofread" not in config or not isinstance(config.get("proofread"), dict):
-        config["proofread"] = {"certainty_threshold": 1.0}
+        config["proofread"] = {"certainty_threshold": 0.75}
         config_changed = True
     else:
         if config["proofread"].get("certainty_threshold") is None:
-            config["proofread"]["certainty_threshold"] = 1.0
+            config["proofread"]["certainty_threshold"] = 0.75
             config_changed = True
     if "tts" not in config or not isinstance(config.get("tts"), dict):
         config["tts"] = dict(default_config["tts"])
@@ -502,11 +502,18 @@ async def get_config():
             input_path = state.get("input_file_path", "")
             if input_path and os.path.exists(input_path):
                 config["current_file"] = os.path.basename(input_path)
+            else:
+                if config.get("current_file") is not None:
+                    config_changed = True
+                config["current_file"] = None
             config["render_prep_complete"] = bool(state.get("render_prep_complete"))
             config["generation_mode_locked"] = bool(state.get("generation_mode_locked"))
         except (json.JSONDecodeError, ValueError):
             pass
     else:
+        if config.get("current_file") is not None:
+            config_changed = True
+        config["current_file"] = None
         config["generation_mode_locked"] = False
     if "generation_mode_locked" not in config:
         config["generation_mode_locked"] = False

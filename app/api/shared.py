@@ -894,10 +894,15 @@ class LLMConfig(BaseModel):
     @field_validator("base_url")
     @classmethod
     def normalize_base_url(cls, v: str) -> str:
-        url = v.rstrip("/")
+        url = str(v or "").strip().rstrip("/")
         if not url.endswith("/v1"):
             url = url + "/v1"
         return url
+
+    @field_validator("api_key", "model_name")
+    @classmethod
+    def strip_text_fields(cls, v: str) -> str:
+        return str(v or "").strip()
 
 class TTSConfig(BaseModel):
     mode: str = "local"  # "local" or "external"
@@ -916,7 +921,7 @@ class TTSConfig(BaseModel):
     sub_batch_max_chars: int = 3000  # max total chars per sub-batch (lower for less VRAM)
     sub_batch_max_items: int = 0  # hard cap on sequences per sub-batch (0 = auto from VRAM estimate)
     batch_group_by_type: bool = False  # group chunks by voice type for efficient batching
-    script_max_length: int = 100  # Max chars per chunk in Create Script (-1 = one chunk per sentence)
+    script_max_length: int = 250  # Max chars per chunk in Create Script (-1 = one chunk per sentence)
 
 class GenerationConfig(BaseModel):
     chunk_size: int = 3000
@@ -1023,17 +1028,17 @@ class LostAudioRepairRequest(BaseModel):
 
 class ProofreadRequest(BaseModel):
     chapter: Optional[str] = None
-    threshold: float = 1.0
+    threshold: float = 0.75
 
 class ProofreadClearFailuresRequest(BaseModel):
     chapter: Optional[str] = None
-    threshold: float = 1.0
+    threshold: float = 0.75
 
 class ProofreadValidateRequest(BaseModel):
-    threshold: float = 1.0
+    threshold: float = 0.75
 
 class ProofreadCompareRequest(BaseModel):
-    threshold: float = 1.0
+    threshold: float = 0.75
 
 class ProofreadDiscardSelectionRequest(BaseModel):
     chapter: Optional[str] = None
@@ -5087,9 +5092,9 @@ def _load_script_max_length() -> int:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         tts = cfg.get("tts", {})
-        return int(tts.get("script_max_length", 100))
+        return int(tts.get("script_max_length", 250))
     except Exception:
-        return 100
+        return 250
 
 
 def _run_process_paragraphs_task(run_id: str, input_file: str):

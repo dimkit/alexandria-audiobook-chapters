@@ -22,6 +22,91 @@ def test_get_config():
     if "current_file" in data and data["current_file"] is not None and not isinstance(data["current_file"], str):
         raise TestFailure(f"current_file must be string or null, got {type(data['current_file']).__name__}")
 
+def test_get_config_exposes_expected_defaults():
+    r = get("/api/config")
+    assert_status(r, 200)
+    data = r.json()
+
+    if int((data.get("tts") or {}).get("script_max_length") or 0) != 250:
+        raise TestFailure(f"Expected default script_max_length=250, got {(data.get('tts') or {}).get('script_max_length')!r}")
+
+    proofread_threshold = (data.get("proofread") or {}).get("certainty_threshold")
+    if float(proofread_threshold or 0.0) != 0.75:
+        raise TestFailure(f"Expected default proofread certainty_threshold=0.75, got {proofread_threshold!r}")
+
+def test_get_config_backfills_missing_defaults_with_expected_values():
+    config_path = os.path.join(common.ACTIVE_APP_DIR, "config.json")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        original_config_raw = f.read()
+
+    modified = json.loads(original_config_raw)
+    modified.setdefault("tts", {})
+    modified["tts"]["script_max_length"] = None
+    modified["proofread"] = {"certainty_threshold": None}
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(modified, f, indent=2, ensure_ascii=False)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        data = r.json()
+        if int((data.get("tts") or {}).get("script_max_length") or 0) != 250:
+            raise TestFailure("GET /api/config did not backfill tts.script_max_length=250")
+        if float(((data.get("proofread") or {}).get("certainty_threshold") or 0.0)) != 0.75:
+            raise TestFailure("GET /api/config did not backfill proofread.certainty_threshold=0.75")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            persisted = json.load(f)
+        if int((persisted.get("tts") or {}).get("script_max_length") or 0) != 250:
+            raise TestFailure("Backfilled script_max_length was not persisted")
+        if float(((persisted.get("proofread") or {}).get("certainty_threshold") or 0.0)) != 0.75:
+            raise TestFailure("Backfilled proofread certainty_threshold was not persisted")
+    finally:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(original_config_raw)
+
+def test_get_config_clears_stale_current_file_when_runtime_has_no_input():
+    config_path = os.path.join(common.ACTIVE_APP_DIR, "config.json")
+    state_path = os.path.join(common.ACTIVE_APP_DIR, "state.json")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        original_config_raw = f.read()
+
+    original_state_raw = None
+    if os.path.exists(state_path):
+        with open(state_path, "r", encoding="utf-8") as f:
+            original_state_raw = f.read()
+
+    modified = json.loads(original_config_raw)
+    modified["current_file"] = "stale-loaded-book.epub"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(modified, f, indent=2, ensure_ascii=False)
+
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump({"render_prep_complete": False}, f, indent=2, ensure_ascii=False)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        data = r.json()
+        if data.get("current_file") is not None:
+            raise TestFailure(f"Expected current_file to be cleared, got {data.get('current_file')!r}")
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            persisted = json.load(f)
+        if persisted.get("current_file") is not None:
+            raise TestFailure("GET /api/config did not persist clearing stale current_file")
+    finally:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(original_config_raw)
+        if original_state_raw is None:
+            if os.path.exists(state_path):
+                os.remove(state_path)
+        else:
+            with open(state_path, "w", encoding="utf-8") as f:
+                f.write(original_state_raw)
+
 def test_save_config_roundtrip():
     # Read original
     r = get("/api/config")

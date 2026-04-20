@@ -287,7 +287,7 @@
                 if (config.tts.sub_batch_max_items != null) {
                     document.getElementById('sub-batch-max-items').value = config.tts.sub_batch_max_items;
                 }
-                document.getElementById('script-max-length').value = config.tts.script_max_length ?? 100;
+                document.getElementById('script-max-length').value = config.tts.script_max_length ?? 250;
                 toggleTTSMode();
                 applyBatchSettingsVisibility();
 
@@ -519,7 +519,7 @@
             document.getElementById('merge-narrators').checked = false;
             document.getElementById('orphaned-text-to-narrator-on-repair').checked = true;
             document.getElementById('auto-regenerate-bad-clip-attempts').value = 3;
-            document.getElementById('proofread-threshold').value = 0.7;
+            document.getElementById('proofread-threshold').value = 0.75;
             refreshPromptTextareaHeights();
             _setupAutoSaveEnabled = true;
             _setupDirtySections.add('prompts');
@@ -570,7 +570,7 @@
                 sub_batch_ratio: parseFloat(document.getElementById('sub-batch-ratio').value) || 5,
                 sub_batch_max_chars: parseInt(document.getElementById('sub-batch-max-chars').value) || 3000,
                 sub_batch_max_items: parseInt(document.getElementById('sub-batch-max-items').value) || 0,
-                script_max_length: parseInt(document.getElementById('script-max-length').value) || 100
+                script_max_length: parseInt(document.getElementById('script-max-length').value) || 250
             };
         }
 
@@ -609,7 +609,7 @@
 
         function collectProofreadConfig() {
             return {
-                certainty_threshold: parseFloat(document.getElementById('proofread-threshold').value) || 0.7
+                certainty_threshold: parseFloat(document.getElementById('proofread-threshold').value) || 0.75
             };
         }
 

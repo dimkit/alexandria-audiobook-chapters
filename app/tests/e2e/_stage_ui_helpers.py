@@ -150,6 +150,13 @@ def _reset_repo_copy_to_ref(clone_root: str, *, source_ref: str = "HEAD") -> str
     return actual_commit
 
 
+def _clone_repo_git_ref(source_repo_dir: str, clone_root: str, *, source_ref: str = "HEAD") -> str:
+    source_repo_dir = os.path.abspath(source_repo_dir)
+    clone_root = os.path.abspath(clone_root)
+    _copy_repo_git_metadata_and_tracked_files(source_repo_dir, clone_root)
+    return _reset_repo_copy_to_ref(clone_root, source_ref=source_ref)
+
+
 def _overlay_worktree_changes(source_repo_dir: str, clone_root: str) -> None:
     source_repo_dir = os.path.abspath(source_repo_dir)
     clone_root = os.path.abspath(clone_root)

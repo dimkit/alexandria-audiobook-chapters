@@ -799,7 +799,7 @@ class SQLiteScriptStore(ScriptStore):
             after = self._resolve_chunk_ref(after_uid) if str(after_uid or "").strip() else None
         except Exception:
             after = None
-        after_ordinal = int(after["ordinal"]) if after is not None else -1
+        after_ordinal = int(after["id"]) if after is not None else -1
 
         with self._connect() as conn:
             try:
@@ -862,7 +862,7 @@ class SQLiteScriptStore(ScriptStore):
 
         return {
             "uid": str(candidate["uid"]),
-            "chapter": str(candidate.get("chapter") or "").strip() or None,
+            "chapter": str(candidate["chapter"] or "").strip() or None,
             "ordinal": int(candidate["ordinal"]),
         }
 
@@ -1119,13 +1119,9 @@ class SQLiteScriptStore(ScriptStore):
         line_counts = summary.get("line_counts", {})
         profiles = self.load_voice_config()
         all_names = {}
-        for name in profiles.keys():
-            key = self._speaker_key(name)
-            if key:
-                all_names[key] = name
         for name in line_counts.keys():
             key = self._speaker_key(name)
-            if key and key not in all_names:
+            if key:
                 all_names[key] = name
         auto_aliases = self.get_auto_narrator_aliases()
         rows = []
