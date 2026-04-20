@@ -3,8 +3,8 @@ from fastapi import APIRouter
 from llm import (
     LLMClientFactory,
     LLMRuntimeConfig,
-    StructuredLLMService,
     VOICE_DESCRIPTION_CONTRACT,
+    get_llm_gateway,
 )
 from .. import shared as _shared
 
@@ -12,7 +12,7 @@ globals().update({k: v for k, v in vars(_shared).items() if not k.startswith("__
 
 router = APIRouter()
 _LLM_CLIENT_FACTORY = LLMClientFactory()
-_STRUCTURED_LLM_SERVICE = StructuredLLMService()
+_STRUCTURED_LLM_SERVICE = get_llm_gateway()
 
 class NarratorThresholdRequest(BaseModel):
     value: int
@@ -465,10 +465,17 @@ def suggest_voice_description_sync(speaker: str):
     )
     payload = result.parsed if isinstance(result.parsed, dict) else None
     voice = str((payload or {}).get("voice") or "").strip()
+    if not voice and result.mode == "json":
+        if payload:
+            voice = _extract_voice_field(json.dumps(payload, ensure_ascii=False))
+        if not voice:
+            voice = _extract_voice_field(result.raw_payload)
+        if not voice:
+            voice = _extract_voice_field(result.text)
     if not voice:
-        voice = _extract_voice_field(result.text)
-    if not voice:
-        raise ValueError("Model response did not include a valid JSON voice field")
+        if result.mode == "tool":
+            raise ValueError("Tool response did not include required 'voice' field")
+        raise ValueError("Model response did not include a voice description")
 
     return {
         "status": "ok",

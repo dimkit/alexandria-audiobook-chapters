@@ -8,6 +8,7 @@ import asyncio
 
 import app as app_module
 from api.routers import voice_designer_router as voice_designer_router
+from llm.models import StructuredLLMResult
 from project import ProjectManager
 
 
@@ -637,7 +638,20 @@ class SavedVoiceReuseTests(unittest.TestCase):
 
                     def create(self, **kwargs):
                         class _Msg:
-                            content = '{"voice":"Warm, measured narrator voice."}'
+                            content = ""
+                            tool_calls = [
+                                type(
+                                    "_ToolCall",
+                                    (),
+                                    {
+                                        "function": type(
+                                            "_Function",
+                                            (),
+                                            {"arguments": '{"voice":"Warm, measured narrator voice."}'},
+                                        )()
+                                    },
+                                )()
+                            ]
 
                         class _Choice:
                             message = _Msg()
@@ -665,6 +679,70 @@ class SavedVoiceReuseTests(unittest.TestCase):
                 app_module.CONFIG_PATH = original_config_path
                 app_module.project_manager = original_pm
                 app_module._LLM_CLIENT_FACTORY = original_llm_client_factory
+
+    def test_suggest_voice_description_sync_accepts_plain_text_result(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            config_path = os.path.join(temp_root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "llm": {
+                            "base_url": "http://localhost:11434/v1",
+                            "api_key": "local",
+                            "model_name": "test-model",
+                            "timeout": 5,
+                        },
+                        "prompts": {
+                            "voice_prompt": "Describe {character_name}",
+                        },
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            original_config_path = app_module.CONFIG_PATH
+            original_pm = app_module.project_manager
+            original_llm_client_factory = app_module._LLM_CLIENT_FACTORY
+            original_structured_llm = app_module._STRUCTURED_LLM_SERVICE
+            try:
+                app_module.CONFIG_PATH = config_path
+
+                class FakeProjectManager:
+                    def build_voice_suggestion_prompt(self, speaker, prompt_template):
+                        return {
+                            "prompt": f"{prompt_template} :: {speaker}",
+                            "paragraphs": [],
+                            "context_chars": 0,
+                        }
+
+                class FakeLLMClientFactory:
+                    def create_client(self, runtime):
+                        return object()
+
+                class FakeStructuredService:
+                    def run(self, **kwargs):
+                        return StructuredLLMResult(
+                            mode="json",
+                            parsed=None,
+                            text="Warm, measured narrator voice.",
+                            raw_payload="Warm, measured narrator voice.",
+                            tool_call_observed=False,
+                        )
+
+                app_module.project_manager = FakeProjectManager()
+                app_module._LLM_CLIENT_FACTORY = FakeLLMClientFactory()
+                app_module._STRUCTURED_LLM_SERVICE = FakeStructuredService()
+
+                result = app_module.suggest_voice_description_sync("Narrator")
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["speaker"], "Narrator")
+                self.assertEqual(result["voice"], "Warm, measured narrator voice.")
+            finally:
+                app_module.CONFIG_PATH = original_config_path
+                app_module.project_manager = original_pm
+                app_module._LLM_CLIENT_FACTORY = original_llm_client_factory
+                app_module._STRUCTURED_LLM_SERVICE = original_structured_llm
 
     def test_run_voice_processing_task_suggests_all_before_generation_and_unloads(self):
         with tempfile.TemporaryDirectory() as temp_root:

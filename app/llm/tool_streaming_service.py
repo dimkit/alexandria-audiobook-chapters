@@ -26,7 +26,7 @@ class ToolStreamingService:
     ) -> ToolStreamResult:
         tool_call_args = ""
         reasoning_content = ""
-        text_content = ""
+        tool_call_observed = False
 
         try:
             payload: Dict[str, Any] = {
@@ -58,15 +58,20 @@ class ToolStreamingService:
 
                 rc = self._field(delta, "reasoning_content")
                 if rc:
-                    reasoning_content += rc
-                content = self._field(delta, "content")
-                if content:
-                    text_content += content
+                    reasoning_content += str(rc)
 
                 delta_tool_calls = self._field(delta, "tool_calls") or []
                 if delta_tool_calls:
+                    tool_call_observed = True
                     function = self._field(delta_tool_calls[0], "function")
                     frag = self._field(function, "arguments") if function is not None else None
+                    if frag:
+                        tool_call_args += frag
+
+                legacy_function_call = self._field(delta, "function_call")
+                if legacy_function_call is not None:
+                    tool_call_observed = True
+                    frag = self._field(legacy_function_call, "arguments")
                     if frag:
                         tool_call_args += frag
 
@@ -78,8 +83,8 @@ class ToolStreamingService:
                         pass
                     return ToolStreamResult(
                         parsed_arguments=parsed,
+                        tool_call_observed=tool_call_observed,
                         raw_payload=tool_call_args,
-                        text_content=text_content,
                         reasoning_content=reasoning_content,
                     )
 
@@ -87,19 +92,28 @@ class ToolStreamingService:
             if parsed is not None:
                 return ToolStreamResult(
                     parsed_arguments=parsed,
-                    raw_payload=tool_call_args or text_content,
-                    text_content=text_content,
+                    tool_call_observed=tool_call_observed,
+                    raw_payload=tool_call_args,
                     reasoning_content=reasoning_content,
                 )
 
-            parsed = self._try_parse_json(text_content.strip())
-            if parsed is not None:
-                return ToolStreamResult(
-                    parsed_arguments=parsed,
-                    raw_payload=text_content,
-                    text_content=text_content,
-                    reasoning_content=reasoning_content,
-                )
+            reasoning_payload = self._extract_reasoning_parameters(reasoning_content)
+            if reasoning_payload:
+                if reasoning_parameter_name:
+                    if reasoning_parameter_name in reasoning_payload:
+                        return ToolStreamResult(
+                            parsed_arguments={reasoning_parameter_name: reasoning_payload[reasoning_parameter_name]},
+                            tool_call_observed=True,
+                            raw_payload=reasoning_content,
+                            reasoning_content=reasoning_content,
+                        )
+                else:
+                    return ToolStreamResult(
+                        parsed_arguments=reasoning_payload,
+                        tool_call_observed=True,
+                        raw_payload=reasoning_content,
+                        reasoning_content=reasoning_content,
+                    )
         except Exception as exc:
             raise LLMTransportError(f"Streamed LLM request failed: {exc}") from exc
 
@@ -107,25 +121,33 @@ class ToolStreamingService:
         if parsed is not None:
             return ToolStreamResult(
                 parsed_arguments=parsed,
+                tool_call_observed=tool_call_observed,
                 raw_payload=tool_call_args,
-                text_content=text_content,
                 reasoning_content=reasoning_content,
             )
 
-        if reasoning_parameter_name and reasoning_content:
-            extracted = self._extract_reasoning_parameter(reasoning_content, reasoning_parameter_name)
-            if extracted:
+        reasoning_payload = self._extract_reasoning_parameters(reasoning_content)
+        if reasoning_payload:
+            if reasoning_parameter_name:
+                if reasoning_parameter_name in reasoning_payload:
+                    return ToolStreamResult(
+                        parsed_arguments={reasoning_parameter_name: reasoning_payload[reasoning_parameter_name]},
+                        tool_call_observed=True,
+                        raw_payload=reasoning_content,
+                        reasoning_content=reasoning_content,
+                    )
+            else:
                 return ToolStreamResult(
-                    parsed_arguments={reasoning_parameter_name: extracted},
+                    parsed_arguments=reasoning_payload,
+                    tool_call_observed=True,
                     raw_payload=reasoning_content,
-                    text_content=text_content,
                     reasoning_content=reasoning_content,
                 )
 
         return ToolStreamResult(
             parsed_arguments=None,
-            raw_payload=tool_call_args or reasoning_content or text_content,
-            text_content=text_content,
+            tool_call_observed=tool_call_observed,
+            raw_payload=tool_call_args,
             reasoning_content=reasoning_content,
         )
 
@@ -146,7 +168,28 @@ class ToolStreamingService:
         return parsed if isinstance(parsed, dict) else None
 
     @staticmethod
-    def _extract_reasoning_parameter(reasoning_content: str, parameter_name: str) -> str:
-        pattern = rf"<parameter={re.escape(parameter_name)}>\s*(.*?)\s*</parameter>"
-        match = re.search(pattern, reasoning_content, re.DOTALL | re.IGNORECASE)
-        return (match.group(1).strip() if match else "")
+    def _extract_reasoning_parameters(reasoning_content: str) -> Optional[Dict[str, Any]]:
+        content = str(reasoning_content or "").strip()
+        if not content:
+            return None
+
+        matches = re.findall(
+            r"<parameter=([A-Za-z0-9_:-]+)>([\s\S]*?)</parameter>",
+            content,
+            flags=re.IGNORECASE,
+        )
+        if not matches:
+            return None
+
+        parsed: Dict[str, Any] = {}
+        for raw_name, raw_value in matches:
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            value = str(raw_value or "").strip()
+            if not value:
+                parsed[name] = ""
+                continue
+            maybe_json = ToolStreamingService._try_parse_json(value)
+            parsed[name] = maybe_json if maybe_json is not None else value
+        return parsed or None

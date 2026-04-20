@@ -1,4 +1,7 @@
 import asyncio
+import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -224,6 +227,117 @@ class ToolCapabilityVerificationTests(unittest.TestCase):
         kwargs = unload_mock.call_args.kwargs
         self.assertEqual(kwargs["base_url"], "http://127.0.0.1:1234/v1")
         self.assertEqual(kwargs["api_key"], "local")
+
+
+class LLMGatewayCacheInvalidationTests(unittest.TestCase):
+    def _base_config_payload(self):
+        return {
+            "llm": {
+                "base_url": "http://localhost:1234/v1",
+                "api_key": "local",
+                "model_name": "model-a",
+                "llm_workers": 1,
+            },
+            "tts": {
+                "mode": "external",
+                "url": "http://127.0.0.1:7860",
+                "device": "auto",
+                "language": "English",
+                "parallel_workers": 4,
+                "script_max_length": 250,
+            },
+            "prompts": {},
+            "generation": {},
+        }
+
+    def test_save_config_clears_gateway_cache_when_model_changes(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            config_path = os.path.join(temp_root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(self._base_config_payload(), handle, indent=2, ensure_ascii=False)
+
+            updated = self._base_config_payload()
+            updated["llm"]["model_name"] = "model-b"
+
+            with (
+                mock.patch.object(config_router, "CONFIG_PATH", config_path),
+                mock.patch.object(config_router, "_sync_prompt_files", return_value={}),
+                mock.patch.object(config_router, "clear_llm_gateway_cache") as clear_mock,
+            ):
+                result = asyncio.run(config_router.save_config(config_router.AppConfig(**updated)))
+
+            self.assertEqual(result["status"], "saved")
+            self.assertTrue(result["llm_cache_cleared"])
+            clear_mock.assert_called_once()
+
+    def test_save_config_does_not_clear_gateway_cache_when_llm_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            config_path = os.path.join(temp_root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(self._base_config_payload(), handle, indent=2, ensure_ascii=False)
+
+            updated = self._base_config_payload()
+
+            with (
+                mock.patch.object(config_router, "CONFIG_PATH", config_path),
+                mock.patch.object(config_router, "_sync_prompt_files", return_value={}),
+                mock.patch.object(config_router, "clear_llm_gateway_cache") as clear_mock,
+            ):
+                result = asyncio.run(config_router.save_config(config_router.AppConfig(**updated)))
+
+            self.assertEqual(result["status"], "saved")
+            self.assertFalse(result["llm_cache_cleared"])
+            clear_mock.assert_not_called()
+
+    def test_save_setup_config_clears_gateway_cache_when_base_url_changes(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            config_path = os.path.join(temp_root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(self._base_config_payload(), handle, indent=2, ensure_ascii=False)
+
+            update = config_router.SetupConfigUpdate(
+                llm=config_router.LLMConfig(
+                    base_url="http://localhost:2234/v1",
+                    api_key="local",
+                    model_name="model-a",
+                    llm_workers=1,
+                )
+            )
+
+            with (
+                mock.patch.object(config_router, "CONFIG_PATH", config_path),
+                mock.patch.object(config_router, "clear_llm_gateway_cache") as clear_mock,
+            ):
+                result = asyncio.run(config_router.save_setup_config(update))
+
+            self.assertEqual(result["status"], "saved")
+            self.assertTrue(result["llm_cache_cleared"])
+            clear_mock.assert_called_once()
+
+    def test_save_setup_config_does_not_clear_cache_for_equivalent_base_url(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            config_path = os.path.join(temp_root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(self._base_config_payload(), handle, indent=2, ensure_ascii=False)
+
+            update = config_router.SetupConfigUpdate(
+                llm=config_router.LLMConfig(
+                    base_url="http://localhost:1234",
+                    api_key="local",
+                    model_name="model-a",
+                    llm_workers=1,
+                )
+            )
+
+            with (
+                mock.patch.object(config_router, "CONFIG_PATH", config_path),
+                mock.patch.object(config_router, "clear_llm_gateway_cache") as clear_mock,
+            ):
+                result = asyncio.run(config_router.save_setup_config(update))
+
+            self.assertEqual(result["status"], "saved")
+            self.assertFalse(result["llm_cache_cleared"])
+            clear_mock.assert_not_called()
 
 
 if __name__ == "__main__":

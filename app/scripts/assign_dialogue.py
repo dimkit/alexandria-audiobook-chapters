@@ -19,7 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from llm import DIALOGUE_SPEAKER_CONTRACT, LLMClientFactory, LLMRuntimeConfig, StructuredLLMService
+from llm import DIALOGUE_SPEAKER_CONTRACT, LLMClientFactory, LLMRuntimeConfig, get_llm_gateway
 from stdio_utils import configure_utf8_stdio
 from scripts.legacy_cli_project import infer_project_root, import_project_document_from_path
 from script_provider import open_project_script_store
@@ -28,7 +28,7 @@ configure_utf8_stdio()
 
 TASK_PROGRESS_PREFIX = "__TASK_PROGRESS__:"
 _LLM_CLIENT_FACTORY = LLMClientFactory()
-_STRUCTURED_LLM_SERVICE = StructuredLLMService()
+_STRUCTURED_LLM_SERVICE = get_llm_gateway()
 
 # Matches straight (") or curly (\u201c / \u201d) double-quotes enclosing ≥2 chars.
 QUOTE_RE = re.compile(r'["\u201c]([^"\u201d]{2,})["\u201d]', re.DOTALL)
@@ -179,7 +179,7 @@ def _call_identify_dialogue(client, runtime: LLMRuntimeConfig, system_prompt: st
     )
     payload = result.parsed if isinstance(result.parsed, dict) else None
     raw_speaker = str((payload or {}).get("speaker") or "").strip()
-    if not raw_speaker:
+    if not raw_speaker and result.mode == "json":
         raw_speaker = _extract_speaker_from_text(result.text)
     speaker = _normalize_speaker_name(raw_speaker)
     return (

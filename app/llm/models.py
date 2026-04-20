@@ -99,6 +99,7 @@ class ToolStreamResult:
     """Parsed result of a streamed tool-call response."""
 
     parsed_arguments: Optional[Dict[str, Any]] = None
+    tool_call_observed: bool = False
     raw_payload: str = ""
     text_content: str = ""
     reasoning_content: str = ""

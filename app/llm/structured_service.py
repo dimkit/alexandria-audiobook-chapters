@@ -8,6 +8,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from .chat_service import ChatCompletionService
+from .errors import LLMResponseParseError
 from .models import (
     ChatCompletionParams,
     LLMRuntimeConfig,
@@ -66,16 +67,15 @@ class StructuredLLMService:
                 runtime.api_key,
                 runtime.model_name,
             )
-            if capability.status == "supported":
-                strategy = "tool"
-                self._set_cached_strategy(key, strategy)
-            elif capability.status == "unsupported":
+            if capability.status == "unsupported":
                 strategy = "json"
-                self._set_cached_strategy(key, strategy)
             else:
-                strategy = "unknown"
+                # Treat unknown capability as tool-first so tool-capable models
+                # still take the strict tool path when verification is transiently unavailable.
+                strategy = "tool"
+            self._set_cached_strategy(key, strategy)
 
-        if strategy in ("tool", "unknown"):
+        if strategy == "tool":
             tool_result = self._run_tool_mode(
                 client=client,
                 runtime=runtime,
@@ -89,24 +89,11 @@ class StructuredLLMService:
                 use_streaming_tool=use_streaming_tool,
                 reasoning_parameter_name=reasoning_parameter_name,
             )
-            if tool_result is not None:
-                self._set_cached_strategy(key, "tool")
-                return tool_result
-
-            # Unknown policy and runtime failure fallback: try JSON and cache fallback.
-            json_result = self._run_json_mode(
-                client=client,
-                runtime=runtime,
-                messages=sanitized_messages,
-                contract=contract,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                presence_penalty=presence_penalty,
-                extra_body=extra_body,
-            )
-            self._set_cached_strategy(key, "json")
-            return json_result
+            if tool_result is None:
+                raise LLMResponseParseError(
+                    f"Tool mode response for contract '{contract.name}' did not return a valid tool payload."
+                )
+            return tool_result
 
         json_result = self._run_json_mode(
             client=client,
@@ -162,6 +149,8 @@ class StructuredLLMService:
             except Exception:
                 return None
 
+            if not bool(stream_result.tool_call_observed):
+                return None
             parsed = self._unwrap_contract_payload(contract, stream_result.parsed_arguments)
             if self._matches_contract(parsed, contract):
                 return StructuredLLMResult(
@@ -208,20 +197,6 @@ class StructuredLLMService:
                     text=self._payload_to_text(parsed),
                     raw_payload=self._payload_to_text(args_payload),
                     tool_call_observed=True,
-                    finish_reason=completion.finish_reason,
-                    prompt_tokens=completion.prompt_tokens,
-                    completion_tokens=completion.completion_tokens,
-                )
-
-            # Some models ignore tool-calling and still return valid JSON text.
-            parsed_text = self._parse_json_like_payload(completion.text, contract.root_type)
-            if self._matches_contract(parsed_text, contract):
-                return StructuredLLMResult(
-                    mode="tool",
-                    parsed=parsed_text,
-                    text=self._payload_to_text(parsed_text),
-                    raw_payload=completion.text,
-                    tool_call_observed=False,
                     finish_reason=completion.finish_reason,
                     prompt_tokens=completion.prompt_tokens,
                     completion_tokens=completion.completion_tokens,
@@ -322,24 +297,53 @@ class StructuredLLMService:
 
     @staticmethod
     def _extract_tool_arguments(raw_response: Any) -> Optional[Dict[str, Any]]:
-        choices = getattr(raw_response, "choices", None) or []
+        choices = getattr(raw_response, "choices", None)
+        if choices is None and isinstance(raw_response, dict):
+            choices = raw_response.get("choices")
+        choices = choices or []
         if not choices:
             return None
-        message = getattr(choices[0], "message", None)
+        choice = choices[0]
+        message = getattr(choice, "message", None)
+        if message is None and isinstance(choice, dict):
+            message = choice.get("message")
         if message is None:
             return None
-        tool_calls = getattr(message, "tool_calls", None) or []
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls is None and isinstance(message, dict):
+            tool_calls = message.get("tool_calls")
+        tool_calls = tool_calls or []
         if tool_calls:
-            function = getattr(tool_calls[0], "function", None)
+            first_tool_call = tool_calls[0]
+            function = getattr(first_tool_call, "function", None)
+            if function is None and isinstance(first_tool_call, dict):
+                function = first_tool_call.get("function")
             if function is not None:
                 arguments = getattr(function, "arguments", None)
+                if arguments is None and isinstance(function, dict):
+                    arguments = function.get("arguments")
                 parsed = StructuredLLMService._parse_tool_arguments_payload(arguments)
                 if parsed is not None:
                     return parsed
 
-        # LM Studio can emit tool invocations in reasoning_content tags without
-        # populating message.tool_calls for some models/prompts.
+        # Legacy OpenAI-compatible payloads can expose a single function call
+        # under message.function_call instead of message.tool_calls.
+        function_call = getattr(message, "function_call", None)
+        if function_call is None and isinstance(message, dict):
+            function_call = message.get("function_call")
+        if function_call is not None:
+            arguments = getattr(function_call, "arguments", None)
+            if arguments is None and isinstance(function_call, dict):
+                arguments = function_call.get("arguments")
+            parsed = StructuredLLMService._parse_tool_arguments_payload(arguments)
+            if parsed is not None:
+                return parsed
+
+        # Legacy LM Studio compatibility: some tool-capable models surface
+        # tool parameter payloads under reasoning_content tags.
         reasoning_payload = getattr(message, "reasoning_content", None)
+        if reasoning_payload is None and isinstance(message, dict):
+            reasoning_payload = message.get("reasoning_content")
         return StructuredLLMService._extract_reasoning_tool_arguments(reasoning_payload)
 
     @staticmethod
@@ -404,7 +408,14 @@ class StructuredLLMService:
         if contract.root_type == "array":
             return isinstance(payload, list)
         if contract.root_type == "object":
-            return isinstance(payload, dict)
+            if not isinstance(payload, dict):
+                return False
+            required = None
+            if isinstance(contract.tool_schema, dict):
+                required = contract.tool_schema.get("required")
+            if isinstance(required, list):
+                return all(str(field or "").strip() in payload for field in required)
+            return True
         return False
 
     @staticmethod

@@ -4,7 +4,7 @@ import json
 import re
 import argparse
 from stdio_utils import configure_utf8_stdio
-from llm import LLMClientFactory, LLMRuntimeConfig, SCRIPT_ENTRIES_CONTRACT, StructuredLLMService
+from llm import LLMClientFactory, LLMRuntimeConfig, SCRIPT_ENTRIES_CONTRACT, get_llm_gateway
 from review_prompts import REVIEW_SYSTEM_PROMPT, REVIEW_USER_PROMPT
 from runtime_layout import LAYOUT
 from scripts.generate_script import clean_json_string, repair_json_array, salvage_json_entries
@@ -15,7 +15,7 @@ configure_utf8_stdio()
 
 CHECKPOINT_PATH = LAYOUT.script_review_checkpoint_path
 _LLM_CLIENT_FACTORY = LLMClientFactory()
-_STRUCTURED_LLM_SERVICE = StructuredLLMService()
+_STRUCTURED_LLM_SERVICE = get_llm_gateway()
 
 
 def _is_section_break(text):

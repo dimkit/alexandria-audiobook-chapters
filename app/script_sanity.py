@@ -4,10 +4,8 @@ from difflib import SequenceMatcher
 
 from llm import (
     ATTRIBUTION_DECISION_CONTRACT,
-    ChatCompletionParams,
-    ChatCompletionService,
     LLMRuntimeConfig,
-    StructuredLLMService,
+    get_llm_gateway,
 )
 
 
@@ -460,8 +458,7 @@ def build_attribution_classifier(
     structured_service=None,
     runtime=None,
 ):
-    chat_service = completion_service or ChatCompletionService()
-    adaptive_service = structured_service or StructuredLLMService()
+    adaptive_service = structured_service or get_llm_gateway()
 
     def classify(payload):
         user_prompt = (user_prompt_template or "")
@@ -486,42 +483,24 @@ def build_attribution_classifier(
         text = ""
         llm_mode = ""
         llm_tool_call_observed = False
-        try:
-            result = adaptive_service.run(
-                client=client,
-                runtime=effective_runtime,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                contract=ATTRIBUTION_DECISION_CONTRACT,
-                temperature=0,
-                top_p=1,
-                max_tokens=max_tokens,
-            )
-            payload = result.parsed if isinstance(result.parsed, dict) else None
-            text = str((payload or {}).get("result") or "").strip()
-            if not text:
-                text = (result.text or "").strip()
-            llm_mode = str(result.mode or "").strip()
-            llm_tool_call_observed = bool(result.tool_call_observed)
-        except Exception:
-            completion = chat_service.complete(
-                client=client,
-                model_name=model_name,
-                params=ChatCompletionParams(
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0,
-                    top_p=1,
-                    max_tokens=max_tokens,
-                ),
-            )
-            text = (completion.text or "").strip()
-            llm_mode = "chat"
-            llm_tool_call_observed = False
+        result = adaptive_service.run(
+            client=client,
+            runtime=effective_runtime,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            contract=ATTRIBUTION_DECISION_CONTRACT,
+            temperature=0,
+            top_p=1,
+            max_tokens=max_tokens,
+        )
+        payload = result.parsed if isinstance(result.parsed, dict) else None
+        text = str((payload or {}).get("result") or "").strip()
+        if not text:
+            text = (result.text or "").strip()
+        llm_mode = str(result.mode or "").strip()
+        llm_tool_call_observed = bool(result.tool_call_observed)
 
         normalized = text.upper()
         if _AFFIRMATIVE_RE.search(text) and not _NEGATIVE_RE.search(text):

@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from llm.contracts import SCRIPT_ENTRIES_CONTRACT
+from llm.errors import LLMResponseParseError
 from llm.models import ChatCompletionResult, LLMRuntimeConfig, ToolCapabilityResult
 from llm.structured_service import StructuredLLMService
 
@@ -28,7 +29,23 @@ class StructuredLLMServiceTests(unittest.TestCase):
         payload = StructuredLLMService._extract_tool_arguments(response)
         self.assertEqual(payload, {"voice": "Warm and measured"})
 
-    def test_extract_tool_arguments_from_reasoning_content_tags(self):
+    def test_extract_tool_arguments_from_legacy_function_call(self):
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        tool_calls=[],
+                        function_call=SimpleNamespace(arguments='{"voice":"Legacy format voice"}'),
+                        reasoning_content="",
+                    )
+                )
+            ]
+        )
+
+        payload = StructuredLLMService._extract_tool_arguments(response)
+        self.assertEqual(payload, {"voice": "Legacy format voice"})
+
+    def test_extract_tool_arguments_from_legacy_reasoning_content_tags(self):
         response = SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -49,10 +66,10 @@ class StructuredLLMServiceTests(unittest.TestCase):
         )
 
         payload = StructuredLLMService._extract_tool_arguments(response)
-        self.assertIsInstance(payload, dict)
-        self.assertIn("entries", payload)
-        self.assertIsInstance(payload["entries"], list)
-        self.assertEqual(payload["entries"][0]["speaker"], "NARRATOR")
+        self.assertEqual(
+            payload,
+            {"entries": [{"speaker": "NARRATOR", "text": "Hello", "instruct": "Calm."}]},
+        )
 
     def test_extract_tool_arguments_returns_none_when_missing(self):
         response = SimpleNamespace(
@@ -147,6 +164,107 @@ class StructuredLLMServiceTests(unittest.TestCase):
         self.assertEqual(len(chat_service.calls), 2)
         self.assertEqual(chat_service.calls[0].max_tokens, 512)
         self.assertEqual(chat_service.calls[1].max_tokens, 1024)
+
+    def test_run_tool_mode_raises_when_response_is_not_tool_payload(self):
+        class _FakeCapabilityService:
+            def verify_tool_capability(self, base_url, api_key, model_name):
+                return ToolCapabilityResult(status="supported", provider="lmstudio", message="supported")
+
+        class _FakeChatService:
+            def complete(self, *, client, model_name, params):
+                # Text-only JSON should be rejected in strict tool mode.
+                return ChatCompletionResult(
+                    text='{"entries":[{"speaker":"NARRATOR","text":"Hello","instruct":"Calm"}]}',
+                    finish_reason="stop",
+                    raw_response=SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[], reasoning_content=""))]
+                    ),
+                )
+
+        service = StructuredLLMService(
+            chat_service=_FakeChatService(),
+            capability_service=_FakeCapabilityService(),
+        )
+
+        with self.assertRaises(LLMResponseParseError):
+            service.run(
+                client=object(),
+                runtime=LLMRuntimeConfig(
+                    base_url="http://127.0.0.1:1234/v1",
+                    api_key="local",
+                    model_name="tool-model",
+                ),
+                messages=[{"role": "user", "content": "Test"}],
+                contract=SCRIPT_ENTRIES_CONTRACT,
+            )
+
+    def test_run_unknown_capability_routes_to_tool_and_caches(self):
+        class _FakeCapabilityService:
+            def __init__(self):
+                self.calls = 0
+
+            def verify_tool_capability(self, base_url, api_key, model_name):
+                self.calls += 1
+                return ToolCapabilityResult(status="unknown", provider="lmstudio", message="unknown")
+
+        class _FakeChatService:
+            def __init__(self):
+                self.calls = []
+
+            def complete(self, *, client, model_name, params):
+                self.calls.append(params)
+                return ChatCompletionResult(
+                    text="",
+                    finish_reason="stop",
+                    raw_response=SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            function=SimpleNamespace(
+                                                arguments='{"entries":[{"speaker":"NARRATOR","text":"Hello","instruct":"Calm"}]}'
+                                            )
+                                        )
+                                    ]
+                                )
+                            )
+                        ]
+                    ),
+                )
+
+        capability_service = _FakeCapabilityService()
+        chat_service = _FakeChatService()
+        service = StructuredLLMService(
+            chat_service=chat_service,
+            capability_service=capability_service,
+        )
+
+        runtime = LLMRuntimeConfig(
+            base_url="http://127.0.0.1:1234/v1",
+            api_key="local",
+            model_name="unknown-model",
+        )
+        result = service.run(
+            client=object(),
+            runtime=runtime,
+            messages=[{"role": "user", "content": "Test"}],
+            contract=SCRIPT_ENTRIES_CONTRACT,
+        )
+        self.assertEqual(result.mode, "tool")
+        self.assertEqual(capability_service.calls, 1)
+        self.assertEqual(len(chat_service.calls), 1)
+        self.assertIsNotNone(chat_service.calls[0].tools)
+
+        # Second call should use cache and avoid remote verification.
+        result2 = service.run(
+            client=object(),
+            runtime=runtime,
+            messages=[{"role": "user", "content": "Test 2"}],
+            contract=SCRIPT_ENTRIES_CONTRACT,
+        )
+        self.assertEqual(result2.mode, "tool")
+        self.assertEqual(capability_service.calls, 1)
 
 
 if __name__ == "__main__":

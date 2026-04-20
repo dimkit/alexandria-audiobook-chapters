@@ -4,7 +4,7 @@ import json
 import re
 from stdio_utils import configure_utf8_stdio
 from default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT
-from llm import LLMClientFactory, LLMRuntimeConfig, SCRIPT_ENTRIES_CONTRACT, StructuredLLMService
+from llm import LLMClientFactory, LLMRuntimeConfig, SCRIPT_ENTRIES_CONTRACT, get_llm_gateway
 from runtime_layout import LAYOUT
 from script_provider import open_project_script_store
 from task_checkpoint import (
@@ -20,7 +20,7 @@ configure_utf8_stdio()
 
 CHECKPOINT_PATH = LAYOUT.script_generation_checkpoint_path
 _LLM_CLIENT_FACTORY = LLMClientFactory()
-_STRUCTURED_LLM_SERVICE = StructuredLLMService()
+_STRUCTURED_LLM_SERVICE = get_llm_gateway()
 
 def clean_json_string(text):
     """Clean and extract valid JSON array from LLM response."""

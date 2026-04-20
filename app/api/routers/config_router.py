@@ -1,7 +1,7 @@
 import asyncio
 
 from fastapi import APIRouter
-from llm import LMStudioModelLoadService, ToolCapabilityService
+from llm import LMStudioModelLoadService, ToolCapabilityService, clear_llm_gateway_cache
 from .. import shared as _shared
 from factory_prompt_defaults import load_factory_default_prompts
 from runtime_layout import LAYOUT
@@ -159,6 +159,22 @@ def _read_saved_llm_config() -> dict:
     if not isinstance(llm_payload, dict):
         return {}
     return llm_payload
+
+
+def _normalize_llm_base_for_cache(raw_base_url: str) -> str:
+    value = str(raw_base_url or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if not value.endswith("/v1"):
+        value = f"{value}/v1"
+    return value
+
+
+def _llm_cache_key(llm_payload: dict | None) -> tuple[str, str]:
+    payload = llm_payload if isinstance(llm_payload, dict) else {}
+    base_url = _normalize_llm_base_for_cache(payload.get("base_url") or "")
+    model_name = str(payload.get("model_name") or "").strip()
+    return base_url, model_name
 
 
 def _write_prompt_pair(path: str, system_prompt: str, user_prompt: str):
@@ -574,6 +590,7 @@ async def save_config(config: AppConfig):
                 existing_config = json.load(f)
         except (json.JSONDecodeError, ValueError):
             existing_config = {}
+    old_llm_key = _llm_cache_key(existing_config.get("llm"))
 
     prompts = payload.get("prompts") or {}
     existing_prompts = existing_config.get("prompts") or {}
@@ -583,9 +600,13 @@ async def save_config(config: AppConfig):
 
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+    llm_cache_cleared = False
+    if _llm_cache_key(payload.get("llm")) != old_llm_key:
+        clear_llm_gateway_cache()
+        llm_cache_cleared = True
     # Reset engine so it picks up new TTS settings on next use
     project_manager.engine = None
-    return {"status": "saved"}
+    return {"status": "saved", "llm_cache_cleared": llm_cache_cleared}
 
 
 @router.post("/api/config/setup")
@@ -597,6 +618,7 @@ async def save_setup_config(update: SetupConfigUpdate):
                 existing_config = json.load(f)
         except (json.JSONDecodeError, ValueError):
             existing_config = {}
+    old_llm_key = _llm_cache_key(existing_config.get("llm"))
 
     engine_reset = False
 
@@ -639,8 +661,16 @@ async def save_setup_config(update: SetupConfigUpdate):
 
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(existing_config, f, indent=2, ensure_ascii=False)
+    llm_cache_cleared = False
+    if _llm_cache_key(existing_config.get("llm")) != old_llm_key:
+        clear_llm_gateway_cache()
+        llm_cache_cleared = True
 
-    return {"status": "saved", "engine_reset": engine_reset}
+    return {
+        "status": "saved",
+        "engine_reset": engine_reset,
+        "llm_cache_cleared": llm_cache_cleared,
+    }
 
 
 @router.post("/api/config/export")

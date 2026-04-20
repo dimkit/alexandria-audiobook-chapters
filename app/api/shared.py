@@ -812,16 +812,35 @@ def _extract_voice_field(text):
         return direct_match.group(1).strip()
 
     json_blob = _extract_first_json_object(candidate)
-    if not json_blob:
+    payload = None
+    if json_blob:
+        try:
+            payload = json.loads(json_blob)
+        except json.JSONDecodeError:
+            payload = None
+
+    if isinstance(payload, dict):
+        voice = payload.get("voice")
+        if isinstance(voice, str) and voice.strip():
+            return voice.strip()
+
+    plain = candidate
+    if "```" in plain:
+        plain = re.sub(r"^```(?:json)?\s*", "", plain, flags=re.IGNORECASE)
+        plain = re.sub(r"\s*```$", "", plain)
+    first_line = ""
+    for line in plain.splitlines():
+        stripped = line.strip()
+        if stripped:
+            first_line = stripped
+            break
+    if not first_line:
         return ""
 
-    try:
-        payload = json.loads(json_blob)
-    except json.JSONDecodeError:
-        return ""
-
-    voice = payload.get("voice")
-    return voice.strip() if isinstance(voice, str) else ""
+    first_line = re.sub(r"(?i)^voice\s*[:=-]\s*", "", first_line).strip().strip("`").strip()
+    if len(first_line) >= 2 and first_line[0] == first_line[-1] and first_line[0] in {"'", '"'}:
+        first_line = first_line[1:-1].strip()
+    return first_line
 
 
 def _any_project_task_running():

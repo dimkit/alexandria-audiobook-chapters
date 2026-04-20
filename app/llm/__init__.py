@@ -10,6 +10,7 @@ from .contracts import (
     VOICE_DESCRIPTION_CONTRACT,
 )
 from .errors import LLMResponseParseError, LLMServiceError, LLMTransportError
+from .gateway import clear_llm_gateway_cache, get_llm_gateway
 from .model_load_service import LMStudioModelLoadService
 from .models import (
     ChatCompletionParams,
@@ -30,6 +31,8 @@ __all__ = [
     "ChatCompletionResult",
     "ChatCompletionService",
     "DIALOGUE_SPEAKER_CONTRACT",
+    "clear_llm_gateway_cache",
+    "get_llm_gateway",
     "LLMClientFactory",
     "LMStudioModelLoadService",
     "LLMRuntimeConfig",
