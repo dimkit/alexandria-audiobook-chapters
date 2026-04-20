@@ -486,7 +486,9 @@ class _FreshCloneServer:
             self._include_worktree_changes = bool(include_worktree_changes)
         self._reuse_source_env = bool(reuse_source_env)
 
-    def __enter__(self):
+    def _prepare_clone_root(self) -> None:
+        if self.repo_root and os.path.isdir(self.repo_root):
+            return
         self._temp_root = tempfile.mkdtemp(prefix="threadspeak_e2e_fresh_clone_")
         self.repo_root = self._temp_root
         _copy_repo_git_metadata_and_tracked_files(SOURCE_REPO_DIR, self.repo_root)
@@ -510,6 +512,10 @@ class _FreshCloneServer:
             )
         self.log_path = os.path.join(self.repo_root, "fresh-clone-server.log")
 
+    def start(self):
+        self._prepare_clone_root()
+        if self._proc is not None and self._proc.poll() is None:
+            raise AssertionError("Fresh clone server is already running.")
         port = _find_free_port()
         self.base_url = f"http://127.0.0.1:{port}"
 
@@ -556,7 +562,7 @@ class _FreshCloneServer:
 
         raise AssertionError(f"Timed out waiting for fresh clone server at {self.base_url}")
 
-    def __exit__(self, exc_type, exc, tb):
+    def stop(self):
         if self._proc is not None:
             try:
                 self._proc.terminate()
@@ -566,8 +572,23 @@ class _FreshCloneServer:
                     self._proc.kill()
                 except Exception:
                     pass
+            finally:
+                self._proc = None
         if self.log_path and os.path.exists(self.log_path):
-            _assert_no_model_download_attempts(_tail_file(self.log_path, max_chars=12000), context="fresh clone server runtime")
+            _assert_no_model_download_attempts(
+                _tail_file(self.log_path, max_chars=12000),
+                context="fresh clone server runtime",
+            )
+
+    def restart(self):
+        self.stop()
+        return self.start()
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
         if self._temp_root and os.path.isdir(self._temp_root) and not _env_true("THREADSPEAK_E2E_KEEP_ISOLATED_ROOT"):
             shutil.rmtree(self._temp_root, ignore_errors=True)
 
@@ -1860,6 +1881,101 @@ def _switch_llm_via_setup_ui(
         if tts_parallel_workers is not None:
             parallel_workers_locator.fill(str(int(tts_parallel_workers)))
             parallel_workers_locator.blur()
+
+
+def _wait_for_setup_tab_ready(page, *, expect_active: bool = False) -> dict:
+    def probe():
+        return page.evaluate(
+            """() => {
+                const setupTab = document.querySelector('#setup-tab');
+                const setupNav = document.querySelector('.nav-link[data-tab="setup"]');
+                const llmUrl = document.querySelector('#llm-url');
+                const llmKey = document.querySelector('#llm-key');
+                const llmModel = document.querySelector('#llm-model');
+                const llmWorkers = document.querySelector('#llm-workers');
+                const scriptMaxLength = document.querySelector('#script-max-length');
+                const retryToggle = document.querySelector('#auto-regenerate-bad-clips');
+                const retryAttempts = document.querySelector('#auto-regenerate-bad-clip-attempts');
+                const ttsMode = document.querySelector('#tts-mode');
+                const parallelWorkers = document.querySelector('#parallel-workers');
+                return {
+                    setup_visible: !!setupTab && getComputedStyle(setupTab).display !== 'none',
+                    setup_active: !!setupNav && setupNav.classList.contains('active'),
+                    has_llm_url: !!llmUrl,
+                    has_llm_key: !!llmKey,
+                    has_llm_model: !!llmModel,
+                    has_llm_workers: !!llmWorkers,
+                    has_script_max_length: !!scriptMaxLength,
+                    has_retry_toggle: !!retryToggle,
+                    has_retry_attempts: !!retryAttempts,
+                    has_tts_mode: !!ttsMode,
+                    has_parallel_workers: !!parallelWorkers,
+                };
+            }"""
+        )
+
+    def done(snapshot):
+        if expect_active and not bool(snapshot.get("setup_active")):
+            return False
+        return bool(
+            snapshot.get("setup_visible")
+            and snapshot.get("has_llm_url")
+            and snapshot.get("has_llm_key")
+            and snapshot.get("has_llm_model")
+            and snapshot.get("has_llm_workers")
+            and snapshot.get("has_script_max_length")
+            and snapshot.get("has_retry_toggle")
+            and snapshot.get("has_retry_attempts")
+            and snapshot.get("has_tts_mode")
+            and snapshot.get("has_parallel_workers")
+        )
+
+    return _wait_for_activity("Waiting for Setup tab UI", probe, done)
+
+
+def _open_setup_tab(page) -> dict:
+    page.locator('.nav-link[data-tab="setup"]').click()
+    return _wait_for_setup_tab_ready(page, expect_active=True)
+
+
+def _read_setup_settings_snapshot(page) -> dict:
+    return page.evaluate(
+        """() => ({
+            llm_base_url: String(document.querySelector('#llm-url')?.value || ''),
+            llm_api_key: String(document.querySelector('#llm-key')?.value || ''),
+            llm_model_name: String(document.querySelector('#llm-model')?.value || ''),
+            llm_workers: Number.parseInt(document.querySelector('#llm-workers')?.value || '0', 10) || 0,
+            script_max_length: Number.parseInt(document.querySelector('#script-max-length')?.value || '0', 10) || 0,
+            bad_clip_retries_enabled: !!document.querySelector('#auto-regenerate-bad-clips')?.checked,
+            bad_clip_retries_attempts: Number.parseInt(document.querySelector('#auto-regenerate-bad-clip-attempts')?.value || '0', 10) || 0,
+            tts_mode: String(document.querySelector('#tts-mode')?.value || ''),
+            parallel_workers: Number.parseInt(document.querySelector('#parallel-workers')?.value || '0', 10) || 0,
+        })"""
+    )
+
+
+def _apply_setup_settings_snapshot(page, values: dict) -> None:
+    page.locator("#llm-url").fill(str(values["llm_base_url"]))
+    page.locator("#llm-url").blur()
+    page.locator("#llm-key").fill(str(values["llm_api_key"]))
+    page.locator("#llm-key").blur()
+    page.locator("#llm-model").fill(str(values["llm_model_name"]))
+    page.locator("#llm-model").blur()
+    page.locator("#llm-workers").fill(str(int(values["llm_workers"])))
+    page.locator("#llm-workers").blur()
+    page.locator("#script-max-length").fill(str(int(values["script_max_length"])))
+    page.locator("#script-max-length").blur()
+
+    retry_toggle = page.locator("#auto-regenerate-bad-clips")
+    should_enable_retries = bool(values["bad_clip_retries_enabled"])
+    if retry_toggle.is_checked() != should_enable_retries:
+        retry_toggle.click()
+    page.locator("#auto-regenerate-bad-clip-attempts").fill(str(int(values["bad_clip_retries_attempts"])))
+    page.locator("#auto-regenerate-bad-clip-attempts").blur()
+
+    page.locator("#tts-mode").select_option(str(values["tts_mode"]))
+    page.locator("#parallel-workers").fill(str(int(values["parallel_workers"])))
+    page.locator("#parallel-workers").blur()
 
 
 def _wait_for_voice_generation_completion(page, expected_speakers: set[str]) -> dict:

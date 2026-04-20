@@ -271,7 +271,7 @@ async def get_config():
     default_config = {
         "llm": {
             "base_url": "",
-            "api_key": "local",
+            "api_key": "",
             "model_name": "",
             "llm_workers": 1
         },
@@ -281,7 +281,7 @@ async def get_config():
             "url": "http://127.0.0.1:7860",
             "device": "auto",
             "language": "English",
-            "parallel_workers": 2,
+            "parallel_workers": 4,
             "batch_seed": None,
             "compile_codec": False,
             "batch_group_by_type": False,
@@ -291,7 +291,7 @@ async def get_config():
             "sub_batch_max_chars": 3000,
             "sub_batch_max_items": 0,
             "script_max_length": 250,
-            "auto_regenerate_bad_clips": False,
+            "auto_regenerate_bad_clips": True,
             "auto_regenerate_bad_clip_attempts": 3
         },
         "prompts": {

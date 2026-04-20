@@ -1,7 +1,7 @@
 {
   "llm": {
     "base_url": "",
-    "api_key": "local",
+    "api_key": "",
     "model_name": "",
     "llm_workers": 1
   },
@@ -11,8 +11,8 @@
     "url": "http://127.0.0.1:7860",
     "device": "auto",
     "language": "English",
-    "parallel_workers": 2,
-    "auto_regenerate_bad_clips": false,
+    "parallel_workers": 4,
+    "auto_regenerate_bad_clips": true,
     "auto_regenerate_bad_clip_attempts": 3,
     "batch_seed": null,
     "compile_codec": false,

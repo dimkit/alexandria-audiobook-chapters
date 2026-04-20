@@ -15,7 +15,7 @@
                         </div>
                         <div class="mb-3">
                             <label class="form-label">API Key</label>
-                            <input type="password" class="form-control" id="llm-key" value="local">
+                            <input type="password" class="form-control" id="llm-key" value="">
                         </div>
                         <div class="row mb-3">
                             <div class="col-md-6">
@@ -189,7 +189,7 @@
                             </div>
                             <div class="col-md-2">
                                 <label class="form-label" title="Concurrent TTS requests">Parallel Workers</label>
-                                <input type="number" class="form-control" id="parallel-workers" value="2" min="1" title="Concurrent TTS requests">
+                                <input type="number" class="form-control" id="parallel-workers" value="4" min="1" title="Concurrent TTS requests">
                             </div>
                             <div class="col-md-2" id="batch-seed-group">
                                 <label class="form-label" title="Seed for reproducibility">Batch Seed</label>
@@ -199,7 +199,7 @@
                                 <label class="form-label" title="Attempts controls retry count after an error. Positive numbers retry that many times. 0 or invalid disables retries.">Bad Clip Retries</label>
                                 <div class="d-flex align-items-center gap-2">
                                     <div class="form-check form-switch m-0">
-                                        <input class="form-check-input" type="checkbox" id="auto-regenerate-bad-clips" title="Attempts controls retry count after an error. Positive numbers retry that many times. 0 or invalid disables retries.">
+                                        <input class="form-check-input" type="checkbox" id="auto-regenerate-bad-clips" checked title="Attempts controls retry count after an error. Positive numbers retry that many times. 0 or invalid disables retries.">
                                     </div>
                                     <input type="number" class="form-control" id="auto-regenerate-bad-clip-attempts" value="3" min="0" step="1" style="max-width: 96px;" title="Attempts controls retry count after an error. Positive numbers retry that many times. 0 or invalid disables retries.">
                                 </div>

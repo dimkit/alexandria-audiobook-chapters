@@ -913,8 +913,8 @@ class TTSConfig(BaseModel):
     url: str = "http://127.0.0.1:7860"  # external mode only
     device: str = "auto"  # local mode: "auto", "cuda:0", "cpu", etc.
     language: str = "English"  # TTS language
-    parallel_workers: int = 2  # concurrent TTS workers
-    auto_regenerate_bad_clips: bool = False
+    parallel_workers: int = 4  # concurrent TTS workers
+    auto_regenerate_bad_clips: bool = True
     auto_regenerate_bad_clip_attempts: int = 3
     batch_seed: Optional[int] = None  # Single seed for batch mode, None/-1 = random
     compile_codec: bool = False  # torch.compile the codec for ~3-4x batch throughput (slow first run)

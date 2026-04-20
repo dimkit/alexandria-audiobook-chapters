@@ -260,13 +260,13 @@
             try {
                 const config = await API.get('/api/config');
                 document.getElementById('llm-url').value = config.llm.base_url;
-                document.getElementById('llm-key').value = config.llm.api_key;
+                document.getElementById('llm-key').value = config.llm.api_key ?? '';
                 document.getElementById('llm-model').value = config.llm.model_name;
                 document.getElementById('llm-workers').value = config.llm.llm_workers ?? 1;
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
                 document.getElementById('tts-language').value = config.tts.language || 'English';
-                document.getElementById('parallel-workers').value = config.tts.parallel_workers || 2;
+                document.getElementById('parallel-workers').value = config.tts.parallel_workers || 4;
                 if (config.tts.batch_seed != null) {
                     document.getElementById('batch-seed').value = config.tts.batch_seed;
                 }

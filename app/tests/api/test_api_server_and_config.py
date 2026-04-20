@@ -87,8 +87,22 @@ def test_get_config_bootstraps_local_config_from_default_template():
             recreated = json.load(f)
         if recreated.get("llm", {}).get("api_key") != default_config.get("llm", {}).get("api_key"):
             raise TestFailure("Recreated local config did not come from the tracked default template")
+        if data.get("llm", {}).get("base_url") != default_config.get("llm", {}).get("base_url"):
+            raise TestFailure("Bootstrapped config did not preserve default llm.base_url")
+        if data.get("llm", {}).get("api_key") != default_config.get("llm", {}).get("api_key"):
+            raise TestFailure("Bootstrapped config did not preserve default llm.api_key")
+        if data.get("llm", {}).get("model_name") != default_config.get("llm", {}).get("model_name"):
+            raise TestFailure("Bootstrapped config did not preserve default llm.model_name")
+        if data.get("llm", {}).get("llm_workers") != default_config.get("llm", {}).get("llm_workers"):
+            raise TestFailure("Bootstrapped config did not preserve default llm.llm_workers")
         if data.get("tts", {}).get("script_max_length") != default_config.get("tts", {}).get("script_max_length"):
             raise TestFailure("Bootstrapped config did not preserve default template values")
+        if data.get("tts", {}).get("parallel_workers") != default_config.get("tts", {}).get("parallel_workers"):
+            raise TestFailure("Bootstrapped config did not preserve default tts.parallel_workers")
+        if data.get("tts", {}).get("auto_regenerate_bad_clips") != default_config.get("tts", {}).get("auto_regenerate_bad_clips"):
+            raise TestFailure("Bootstrapped config did not preserve default tts.auto_regenerate_bad_clips")
+        if data.get("tts", {}).get("auto_regenerate_bad_clip_attempts") != default_config.get("tts", {}).get("auto_regenerate_bad_clip_attempts"):
+            raise TestFailure("Bootstrapped config did not preserve default tts.auto_regenerate_bad_clip_attempts")
     finally:
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(original_config_raw)
@@ -419,6 +433,9 @@ def test_get_config_persists_missing_llm_and_tts_defaults():
     modified.pop("llm", None)
     tts = modified.setdefault("tts", {})
     tts.pop("language", None)
+    tts.pop("parallel_workers", None)
+    tts.pop("auto_regenerate_bad_clips", None)
+    tts.pop("auto_regenerate_bad_clip_attempts", None)
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(modified, f, indent=2, ensure_ascii=False)
 
@@ -428,17 +445,29 @@ def test_get_config_persists_missing_llm_and_tts_defaults():
         data = r.json()
         if data.get("llm", {}).get("base_url") != "":
             raise TestFailure("GET /api/config did not backfill llm.base_url")
+        if data.get("llm", {}).get("api_key") != "":
+            raise TestFailure("GET /api/config did not backfill llm.api_key")
         if data.get("llm", {}).get("model_name") != "":
             raise TestFailure("GET /api/config did not backfill llm.model_name")
         if data.get("tts", {}).get("language") != "English":
             raise TestFailure("GET /api/config did not backfill tts.language")
+        if int((data.get("tts") or {}).get("parallel_workers") or 0) != 4:
+            raise TestFailure("GET /api/config did not backfill tts.parallel_workers=4")
+        if (data.get("tts") or {}).get("auto_regenerate_bad_clips") is not True:
+            raise TestFailure("GET /api/config did not backfill tts.auto_regenerate_bad_clips=true")
 
         with open(config_path, "r", encoding="utf-8") as f:
             persisted = json.load(f)
         if persisted.get("llm", {}).get("base_url") != "":
             raise TestFailure("GET /api/config did not persist llm defaults")
+        if persisted.get("llm", {}).get("api_key") != "":
+            raise TestFailure("GET /api/config did not persist llm.api_key default")
         if persisted.get("tts", {}).get("language") != "English":
             raise TestFailure("GET /api/config did not persist tts.language default")
+        if int((persisted.get("tts") or {}).get("parallel_workers") or 0) != 4:
+            raise TestFailure("GET /api/config did not persist tts.parallel_workers=4")
+        if (persisted.get("tts") or {}).get("auto_regenerate_bad_clips") is not True:
+            raise TestFailure("GET /api/config did not persist tts.auto_regenerate_bad_clips=true")
     finally:
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(original_raw)
