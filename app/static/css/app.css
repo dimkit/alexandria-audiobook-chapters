@@ -288,6 +288,35 @@
         .llm-tool-capability-status.text-muted {
             color: var(--app-muted) !important;
         }
+        .llm-model-suggestion-popup {
+            position: absolute;
+            top: calc(100% + 0.25rem);
+            left: 0;
+            right: 0;
+            z-index: 1200;
+            max-height: 14rem;
+            overflow-y: auto;
+            border: 1px solid var(--app-input-border);
+            border-radius: 0.5rem;
+            background: var(--app-card-bg);
+            box-shadow: 0 8px 18px rgba(0, 0, 0, 0.25);
+            padding: 0.25rem 0;
+        }
+        .llm-model-suggestion-popup button {
+            width: 100%;
+            text-align: left;
+            background: transparent;
+            border: 0;
+            color: var(--app-text);
+            padding: 0.4rem 0.7rem;
+            font-size: 0.92rem;
+            line-height: 1.25;
+        }
+        .llm-model-suggestion-popup button:hover,
+        .llm-model-suggestion-popup button:focus {
+            background: var(--app-table-hover);
+            outline: none;
+        }
         .form-check-input {
             background-color: var(--app-input-bg);
             border-color: var(--app-input-border);

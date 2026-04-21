@@ -228,6 +228,94 @@ class ToolCapabilityVerificationTests(unittest.TestCase):
         self.assertEqual(kwargs["base_url"], "http://127.0.0.1:1234/v1")
         self.assertEqual(kwargs["api_key"], "local")
 
+    def test_lm_studio_list_models_normalizes_payload(self):
+        with mock.patch.object(
+            config_router,
+            "_lmstudio_request_json",
+            return_value={
+                "models": [
+                    {
+                        "key": "qwen/qwen3.5-9b",
+                        "display_name": "Qwen3.5 9B",
+                        "loaded_instances": [{"id": "qwen-instance"}, {"id": "qwen-instance"}],
+                        "capabilities": {"trained_for_tool_use": True},
+                    },
+                    {
+                        "key": "gemma/gemma-3",
+                        "display_name": "Gemma 3",
+                        "loaded_instances": [],
+                        "capabilities": {},
+                    },
+                ]
+            },
+        ):
+            result = config_router.list_lmstudio_models(
+                base_url="http://127.0.0.1:1234/v1",
+                api_key="local",
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            result["models"][0],
+            {
+                "key": "qwen/qwen3.5-9b",
+                "display_name": "Qwen3.5 9B",
+                "loaded_instance_ids": ["qwen-instance"],
+                "trained_for_tool_use": True,
+            },
+        )
+        self.assertEqual(
+            result["models"][1],
+            {
+                "key": "gemma/gemma-3",
+                "display_name": "Gemma 3",
+                "loaded_instance_ids": [],
+                "trained_for_tool_use": None,
+            },
+        )
+
+    def test_lm_studio_list_models_endpoint_uses_saved_defaults(self):
+        with (
+            mock.patch.object(
+                config_router,
+                "_read_saved_llm_config",
+                return_value={
+                    "base_url": "http://127.0.0.1:1234/v1",
+                    "api_key": "local",
+                },
+            ),
+            mock.patch.object(
+                config_router,
+                "list_lmstudio_models",
+                return_value={"status": "ok", "models": []},
+            ) as list_mock,
+        ):
+            result = asyncio.run(
+                config_router.list_lmstudio_models_endpoint(
+                    config_router.LMStudioListModelsRequest()
+                )
+            )
+
+        self.assertEqual(result["status"], "ok")
+        list_mock.assert_called_once()
+        kwargs = list_mock.call_args.kwargs
+        self.assertEqual(kwargs["base_url"], "http://127.0.0.1:1234/v1")
+        self.assertEqual(kwargs["api_key"], "local")
+
+    def test_lm_studio_list_models_endpoint_returns_502_on_failure(self):
+        with mock.patch.object(config_router, "list_lmstudio_models", side_effect=RuntimeError("offline")):
+            with self.assertRaises(config_router.HTTPException) as ctx:
+                asyncio.run(
+                    config_router.list_lmstudio_models_endpoint(
+                        config_router.LMStudioListModelsRequest(
+                            base_url="http://127.0.0.1:1234/v1",
+                            api_key="local",
+                        )
+                    )
+                )
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertIn("Failed to list LM Studio models", str(ctx.exception.detail))
+
 
 class LLMGatewayCacheInvalidationTests(unittest.TestCase):
     def _base_config_payload(self):

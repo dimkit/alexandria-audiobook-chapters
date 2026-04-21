@@ -70,6 +70,9 @@
         let _llmToolCapabilityCache = null;
         let _llmToolCapabilityTimer = null;
         let _llmToolCapabilityRequestId = 0;
+        let _lmStudioModelSuggestionsCache = null;
+        let _lmStudioModelSuggestionsInFlight = null;
+        let _lmStudioModelSuggestionKeys = new Set();
 
         function _getLLMToolCapabilityElements() {
             return {
@@ -179,6 +182,116 @@
                 _llmToolCapabilityTimer = null;
                 _verifyLLMToolCapabilityNow();
             }, delayMs);
+        }
+
+        function _getLLMModelSuggestionElements() {
+            const llmElements = _getLLMToolCapabilityElements();
+            return {
+                ...llmElements,
+                popup: document.getElementById('llm-model-suggestion-popup'),
+            };
+        }
+
+        function _llmSuggestionsCacheKey(baseUrl, apiKey) {
+            return `${String(baseUrl || '').trim()}::${String(apiKey || '')}`;
+        }
+
+        function _hideLLMModelSuggestionPopup() {
+            const { popup } = _getLLMModelSuggestionElements();
+            if (!popup) return;
+            popup.style.display = 'none';
+        }
+
+        function _renderLLMModelSuggestions(models, { showPopup = false } = {}) {
+            const { popup, model: modelInput } = _getLLMModelSuggestionElements();
+            if (!popup || !modelInput) return;
+
+            popup.innerHTML = '';
+            _lmStudioModelSuggestionKeys = new Set();
+            for (const modelEntry of Array.isArray(models) ? models : []) {
+                const key = String(modelEntry?.key || '').trim();
+                if (!key) continue;
+                const displayName = String(modelEntry?.display_name || '').trim();
+                const option = document.createElement('button');
+                option.type = 'button';
+                option.className = 'llm-model-suggestion-option';
+                option.dataset.modelKey = key;
+                if (displayName && displayName !== key) {
+                    option.textContent = `${displayName} (${key})`;
+                } else {
+                    option.textContent = key;
+                }
+                option.addEventListener('click', () => {
+                    modelInput.value = key;
+                    _hideLLMModelSuggestionPopup();
+                    _clearLLMToolCapabilityCache();
+                    _renderLLMToolCapabilityStatus('hidden');
+                    modelInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    modelInput.dispatchEvent(new Event('change', { bubbles: true }));
+                });
+                popup.appendChild(option);
+                _lmStudioModelSuggestionKeys.add(key);
+            }
+            if (showPopup && popup.childElementCount > 0) {
+                popup.style.display = '';
+            } else if (popup.childElementCount === 0) {
+                popup.style.display = 'none';
+            }
+        }
+
+        function _clearLLMModelSuggestionsCache() {
+            _lmStudioModelSuggestionsCache = null;
+            _lmStudioModelSuggestionsInFlight = null;
+            _renderLLMModelSuggestions([], { showPopup: false });
+        }
+
+        function _isKnownLMStudioModelSuggestion(value) {
+            return _lmStudioModelSuggestionKeys.has(String(value || '').trim());
+        }
+
+        async function _fetchLMStudioModelSuggestions({ showPopup = false } = {}) {
+            const { url, key, popup } = _getLLMModelSuggestionElements();
+            if (!url || !popup) return [];
+            const baseUrl = String(url.value || '').trim();
+            const apiKey = String(key?.value || '');
+            if (!baseUrl) {
+                _renderLLMModelSuggestions([], { showPopup: false });
+                return [];
+            }
+
+            const cacheKey = _llmSuggestionsCacheKey(baseUrl, apiKey);
+            if (_lmStudioModelSuggestionsCache?.cacheKey === cacheKey) {
+                _renderLLMModelSuggestions(_lmStudioModelSuggestionsCache.models, { showPopup });
+                return _lmStudioModelSuggestionsCache.models;
+            }
+
+            if (_lmStudioModelSuggestionsInFlight?.cacheKey === cacheKey) {
+                return _lmStudioModelSuggestionsInFlight.promise;
+            }
+
+            const request = (async () => {
+                try {
+                    const response = await API.post('/api/config/lmstudio/list_models', {
+                        base_url: baseUrl,
+                        api_key: apiKey,
+                    });
+                    const models = Array.isArray(response?.models) ? response.models : [];
+                    _lmStudioModelSuggestionsCache = { cacheKey, models };
+                    _renderLLMModelSuggestions(models, { showPopup });
+                    return models;
+                } catch (_error) {
+                    _lmStudioModelSuggestionsCache = { cacheKey, models: [] };
+                    _renderLLMModelSuggestions([], { showPopup: false });
+                    return [];
+                } finally {
+                    if (_lmStudioModelSuggestionsInFlight?.cacheKey === cacheKey) {
+                        _lmStudioModelSuggestionsInFlight = null;
+                    }
+                }
+            })();
+
+            _lmStudioModelSuggestionsInFlight = { cacheKey, promise: request };
+            return request;
         }
 
         function collectExportConfigFromUI() {
@@ -709,15 +822,37 @@
         wireSetupConfigAutoSave();
 
         function wireLLMToolCapabilityVerification() {
-            const { model, legacy } = _getLLMToolCapabilityElements();
+            const { model, url, key, legacy, popup } = _getLLMModelSuggestionElements();
             if (model && model.dataset.toolCapabilityBound !== '1') {
                 model.dataset.toolCapabilityBound = '1';
                 model.addEventListener('input', () => {
                     _clearLLMToolCapabilityCache();
                     _renderLLMToolCapabilityStatus('hidden');
+                    if (_isKnownLMStudioModelSuggestion(model.value)) {
+                        _verifyLLMToolCapabilityNow();
+                        return;
+                    }
                     scheduleLLMToolCapabilityVerification(650);
                 });
-                model.addEventListener('blur', () => scheduleLLMToolCapabilityVerification(0));
+                model.addEventListener('change', () => {
+                    _clearLLMToolCapabilityCache();
+                    _renderLLMToolCapabilityStatus('hidden');
+                    if (_isKnownLMStudioModelSuggestion(model.value)) {
+                        _verifyLLMToolCapabilityNow();
+                        return;
+                    }
+                    scheduleLLMToolCapabilityVerification(0);
+                });
+                model.addEventListener('blur', () => {
+                    setTimeout(() => _hideLLMModelSuggestionPopup(), 120);
+                    scheduleLLMToolCapabilityVerification(0);
+                });
+                model.addEventListener('focus', () => {
+                    _fetchLMStudioModelSuggestions({ showPopup: true });
+                });
+                model.addEventListener('click', () => {
+                    _fetchLMStudioModelSuggestions({ showPopup: true });
+                });
             }
             if (legacy && legacy.dataset.toolCapabilityBound !== '1') {
                 legacy.dataset.toolCapabilityBound = '1';
@@ -726,6 +861,40 @@
                         _renderLLMToolCapabilityStatus('hidden');
                     } else {
                         scheduleLLMToolCapabilityVerification(100);
+                    }
+                });
+            }
+            for (const sourceField of [url, key]) {
+                if (!sourceField || sourceField.dataset.modelSuggestionsBound === '1') continue;
+                sourceField.dataset.modelSuggestionsBound = '1';
+                sourceField.addEventListener('input', () => {
+                    _clearLLMToolCapabilityCache();
+                    _renderLLMToolCapabilityStatus('hidden');
+                    _clearLLMModelSuggestionsCache();
+                });
+                sourceField.addEventListener('change', () => {
+                    _clearLLMToolCapabilityCache();
+                    _renderLLMToolCapabilityStatus('hidden');
+                    _clearLLMModelSuggestionsCache();
+                });
+            }
+            if (popup && popup.dataset.modelSuggestionsPopupBound !== '1') {
+                popup.dataset.modelSuggestionsPopupBound = '1';
+                popup.addEventListener('mousedown', (event) => {
+                    event.preventDefault();
+                });
+            }
+            if (model && popup && document.body && document.body.dataset.modelSuggestionsDocBound !== '1') {
+                document.body.dataset.modelSuggestionsDocBound = '1';
+                document.addEventListener('click', (event) => {
+                    const target = event?.target;
+                    if (target === model) return;
+                    if (popup.contains(target)) return;
+                    _hideLLMModelSuggestionPopup();
+                });
+                document.addEventListener('keydown', (event) => {
+                    if (event?.key === 'Escape') {
+                        _hideLLMModelSuggestionPopup();
                     }
                 });
             }

@@ -44,6 +44,11 @@ class LMStudioUnloadAllModelsRequest(BaseModel):
     api_key: str | None = None
 
 
+class LMStudioListModelsRequest(BaseModel):
+    base_url: str = ""
+    api_key: str | None = None
+
+
 def _request_json(url: str, api_key: str):
     service = ToolCapabilityService(timeout_seconds=_TOOL_CAPABILITY_TIMEOUT_SECONDS)
     return service._request_json(url, api_key)
@@ -144,6 +149,51 @@ def unload_all_lmstudio_models(
         base_url=base_url,
         api_key=api_key,
     )
+
+
+def list_lmstudio_models(
+    *,
+    base_url: str,
+    api_key: str,
+):
+    payload = _lmstudio_model_load_service().list_models(
+        base_url=base_url,
+        api_key=api_key,
+    )
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        raise RuntimeError("LM Studio returned an unexpected model list.")
+
+    normalized_models = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        display_name = str(item.get("display_name") or "").strip() or key
+        if not key and not display_name:
+            continue
+
+        loaded_instance_ids = []
+        for instance in item.get("loaded_instances") or []:
+            if not isinstance(instance, dict):
+                continue
+            instance_id = str(instance.get("id") or "").strip()
+            if instance_id:
+                loaded_instance_ids.append(instance_id)
+        capabilities = item.get("capabilities") if isinstance(item.get("capabilities"), dict) else {}
+        trained_for_tool_use = capabilities.get("trained_for_tool_use")
+        if trained_for_tool_use is not None:
+            trained_for_tool_use = bool(trained_for_tool_use)
+
+        normalized_models.append(
+            {
+                "key": key,
+                "display_name": display_name,
+                "loaded_instance_ids": sorted(set(loaded_instance_ids)),
+                "trained_for_tool_use": trained_for_tool_use,
+            }
+        )
+    return {"status": "ok", "models": normalized_models}
 
 
 def _read_saved_llm_config() -> dict:
@@ -789,6 +839,27 @@ async def unload_all_lmstudio_models_endpoint(request: LMStudioUnloadAllModelsRe
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to unload LM Studio models: {exc}") from exc
+
+
+@router.post("/api/config/lmstudio/list_models")
+async def list_lmstudio_models_endpoint(request: LMStudioListModelsRequest):
+    saved = _read_saved_llm_config()
+    base_url = (request.base_url or "").strip() or str(saved.get("base_url") or "").strip()
+    api_key = request.api_key if request.api_key is not None else str(saved.get("api_key") or "")
+
+    if not base_url:
+        raise HTTPException(status_code=400, detail="LLM base URL is required.")
+
+    try:
+        return await asyncio.to_thread(
+            list_lmstudio_models,
+            base_url=base_url,
+            api_key=api_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to list LM Studio models: {exc}") from exc
 
 
 @router.post("/api/generation_mode_lock")
