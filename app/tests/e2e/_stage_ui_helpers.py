@@ -36,6 +36,12 @@ SCRIPT_LEAK_CHECK_SECONDS = 5.0
 WATCHDOG_POLL_SECONDS = 0.35
 WATCHDOG_MAX_SECONDS = 120.0
 FRESH_CLONE_BOOTSTRAP_TIMEOUT_SECONDS = 1800.0
+LMSTUDIO_DEFAULT_ORIGIN = "http://127.0.0.1:1234"
+LMSTUDIO_DEFAULT_V1_BASE_URL = f"{LMSTUDIO_DEFAULT_ORIGIN}/v1"
+LMSTUDIO_TOOL_MODEL_PREFERENCES = (
+    "qwen/qwen3.5-9b",
+    "google/gemma-4-26b-a4b",
+)
 _ACTIVE_E2E_PAGE = None
 MODEL_DOWNLOAD_DISABLE_ENV = "THREADSPEAK_DISABLE_MODEL_DOWNLOADS"
 MODEL_DOWNLOAD_FORBIDDEN_PATTERNS = (
@@ -67,6 +73,183 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _normalize_http_origin(raw_url: str) -> str:
+    value = str(raw_url or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"http://{value}"
+    return value.rstrip("/")
+
+
+def _lmstudio_model_candidates(payload: dict) -> list[str]:
+    candidates: list[str] = []
+    for key in ("key", "display_name", "id", "name", "model_name"):
+        text = str(payload.get(key) or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+    for instance in payload.get("loaded_instances") or []:
+        if not isinstance(instance, dict):
+            continue
+        text = str(instance.get("id") or "").strip()
+        if text and text not in candidates:
+            candidates.append(text)
+    return candidates
+
+
+def _model_matches_preference(candidate: str, preferred: str) -> bool:
+    left = str(candidate or "").strip().lower()
+    right = str(preferred or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return right in left or left in right
+
+
+def _discover_lmstudio_tool_model(
+    *,
+    origin: str = LMSTUDIO_DEFAULT_ORIGIN,
+    timeout_seconds: float = 4.0,
+) -> dict:
+    normalized_origin = _normalize_http_origin(origin) or LMSTUDIO_DEFAULT_ORIGIN
+    v1_base_url = f"{normalized_origin}/v1"
+
+    try:
+        probe = requests.get(f"{v1_base_url}/models", timeout=timeout_seconds)
+        if int(probe.status_code) >= 500:
+            return {
+                "status": "skip",
+                "reason": (
+                    f"LM Studio probe failed at {v1_base_url}/models "
+                    f"with status {int(probe.status_code)}"
+                ),
+                "origin": normalized_origin,
+                "base_url": v1_base_url,
+            }
+    except Exception as exc:
+        return {
+            "status": "skip",
+            "reason": f"LM Studio is not reachable at {v1_base_url}: {exc}",
+            "origin": normalized_origin,
+            "base_url": v1_base_url,
+        }
+
+    try:
+        response = requests.get(f"{normalized_origin}/api/v1/models", timeout=max(float(timeout_seconds), 8.0))
+    except Exception as exc:
+        return {
+            "status": "skip",
+            "reason": f"LM Studio model enumeration failed at {normalized_origin}/api/v1/models: {exc}",
+            "origin": normalized_origin,
+            "base_url": v1_base_url,
+        }
+
+    if int(response.status_code) != 200:
+        return {
+            "status": "skip",
+            "reason": (
+                f"LM Studio model enumeration failed at {normalized_origin}/api/v1/models "
+                f"with status {int(response.status_code)}"
+            ),
+            "origin": normalized_origin,
+            "base_url": v1_base_url,
+        }
+
+    payload = response.json()
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return {
+            "status": "skip",
+            "reason": "LM Studio returned an unexpected /api/v1/models payload.",
+            "origin": normalized_origin,
+            "base_url": v1_base_url,
+        }
+
+    tool_models: list[dict] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        capabilities = item.get("capabilities") or {}
+        if capabilities.get("trained_for_tool_use") is not True:
+            continue
+        candidates = _lmstudio_model_candidates(item)
+        if not candidates:
+            continue
+        tool_models.append(
+            {
+                "model_name": candidates[0],
+                "candidates": candidates,
+            }
+        )
+
+    if not tool_models:
+        return {
+            "status": "skip",
+            "reason": "LM Studio is reachable but no tool-capable model is available.",
+            "origin": normalized_origin,
+            "base_url": v1_base_url,
+            "available_tool_models": [],
+            "ordered_candidates": [],
+        }
+
+    available_tool_models: list[str] = []
+    for item in tool_models:
+        name = str(item["model_name"]).strip()
+        if name and name not in available_tool_models:
+            available_tool_models.append(name)
+
+    ordered_candidates: list[str] = []
+    for preferred in LMSTUDIO_TOOL_MODEL_PREFERENCES:
+        for model in tool_models:
+            if any(_model_matches_preference(name, preferred) for name in model["candidates"]):
+                name = str(model["model_name"]).strip()
+                if name and name not in ordered_candidates:
+                    ordered_candidates.append(name)
+                break
+    for name in available_tool_models:
+        if name not in ordered_candidates:
+            ordered_candidates.append(name)
+
+    if not ordered_candidates:
+        return {
+            "status": "skip",
+            "reason": "LM Studio is reachable but no selectable tool-capable model is available.",
+            "origin": normalized_origin,
+            "base_url": v1_base_url,
+            "available_tool_models": [],
+            "ordered_candidates": [],
+        }
+
+    selected: dict | None = None
+    selected_preference = ""
+    for preferred in LMSTUDIO_TOOL_MODEL_PREFERENCES:
+        for model in tool_models:
+            if any(_model_matches_preference(name, preferred) for name in model["candidates"]):
+                selected = model
+                selected_preference = preferred
+                break
+        if selected is not None:
+            break
+    if selected is None:
+        selected = tool_models[0]
+        selected_preference = "first-tool-capable"
+
+    selected_name = str(selected["model_name"]).strip() if selected is not None else str(ordered_candidates[0]).strip()
+    if not selected_preference:
+        selected_preference = "first-tool-capable"
+
+    return {
+        "status": "ok",
+        "origin": normalized_origin,
+        "base_url": v1_base_url,
+        "model_name": selected_name,
+        "selected_preference": selected_preference,
+        "available_tool_models": available_tool_models,
+        "ordered_candidates": ordered_candidates,
+    }
 
 
 def _run_command(command: list[str], *, cwd: str, env: dict | None = None, timeout: float = 600.0) -> subprocess.CompletedProcess[str]:
@@ -462,6 +645,8 @@ class _FreshCloneServer:
         source_ref: str | None = None,
         include_worktree_changes: bool | None = None,
         reuse_source_env: bool = False,
+        existing_repo_root: str | None = None,
+        preserve_clone_root: bool = False,
     ):
         self._temp_root = ""
         self._proc: subprocess.Popen[str] | None = None
@@ -487,19 +672,40 @@ class _FreshCloneServer:
         else:
             self._include_worktree_changes = bool(include_worktree_changes)
         self._reuse_source_env = bool(reuse_source_env)
+        self._existing_repo_root = str(existing_repo_root or "").strip()
+        self._preserve_clone_root = bool(preserve_clone_root)
 
     def _prepare_clone_root(self) -> None:
         if self.repo_root and os.path.isdir(self.repo_root):
             return
-        self._temp_root = tempfile.mkdtemp(prefix="threadspeak_e2e_fresh_clone_")
-        self.repo_root = self._temp_root
-        _copy_repo_git_metadata_and_tracked_files(SOURCE_REPO_DIR, self.repo_root)
-        self.checked_out_commit = _reset_repo_copy_to_ref(
-            self.repo_root,
-            source_ref=self._source_ref,
-        )
-        if self._include_worktree_changes:
-            _overlay_worktree_changes(SOURCE_REPO_DIR, self.repo_root)
+        if self._existing_repo_root:
+            candidate_root = os.path.abspath(os.path.expanduser(self._existing_repo_root))
+            if not os.path.isdir(candidate_root):
+                raise AssertionError(f"Requested existing fresh-clone root does not exist: {candidate_root}")
+            if not os.path.isdir(os.path.join(candidate_root, ".git")):
+                raise AssertionError(
+                    f"Requested existing fresh-clone root is missing .git metadata: {candidate_root}"
+                )
+            if not os.path.isdir(os.path.join(candidate_root, "app")):
+                raise AssertionError(
+                    f"Requested existing fresh-clone root is missing app directory: {candidate_root}"
+                )
+            self.repo_root = candidate_root
+            self.checked_out_commit = _run_command(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.repo_root,
+                timeout=20.0,
+            ).stdout.strip()
+        else:
+            self._temp_root = tempfile.mkdtemp(prefix="threadspeak_e2e_fresh_clone_")
+            self.repo_root = self._temp_root
+            _copy_repo_git_metadata_and_tracked_files(SOURCE_REPO_DIR, self.repo_root)
+            self.checked_out_commit = _reset_repo_copy_to_ref(
+                self.repo_root,
+                source_ref=self._source_ref,
+            )
+            if self._include_worktree_changes:
+                _overlay_worktree_changes(SOURCE_REPO_DIR, self.repo_root)
         self.app_dir = os.path.join(self.repo_root, "app")
         _seed_clone_config_values(self.app_dir, self._bootstrap_config_values)
         if self._reuse_source_env:
@@ -508,10 +714,15 @@ class _FreshCloneServer:
             else:
                 self.python_path = os.path.join(SOURCE_APP_DIR, "env", "bin", "python")
         else:
-            self.python_path = _bootstrap_clone_app_env(
-                self.repo_root,
-                timeout_seconds=self._bootstrap_timeout_seconds,
-            )
+            clone_python = os.path.join(self.app_dir, "env", "Scripts" if os.name == "nt" else "bin")
+            clone_python = os.path.join(clone_python, "python.exe" if os.name == "nt" else "python")
+            if os.path.exists(clone_python):
+                self.python_path = clone_python
+            else:
+                self.python_path = _bootstrap_clone_app_env(
+                    self.repo_root,
+                    timeout_seconds=self._bootstrap_timeout_seconds,
+                )
         self.log_path = os.path.join(self.repo_root, "fresh-clone-server.log")
 
     def start(self):
@@ -591,6 +802,9 @@ class _FreshCloneServer:
 
     def __exit__(self, exc_type, exc, tb):
         self.stop()
+        if self._preserve_clone_root:
+            print(f"[e2e-debug] keeping fresh clone root: {self.repo_root}", flush=True)
+            return
         if self._temp_root and os.path.isdir(self._temp_root) and not _env_true("THREADSPEAK_E2E_KEEP_ISOLATED_ROOT"):
             shutil.rmtree(self._temp_root, ignore_errors=True)
 
@@ -816,6 +1030,12 @@ def _fetch_task_status(base_url: str, task_name: str) -> dict:
     return payload
 
 
+def _count_task_llm_mode_events(base_url: str, task_name: str) -> int:
+    payload = _fetch_task_status(base_url, task_name)
+    logs = _extract_logs(payload)
+    return sum(1 for line in logs if "llm_mode=" in str(line))
+
+
 def _wait_for_bootstrap_ready(page) -> None:
     def probe():
         return page.evaluate(
@@ -967,7 +1187,14 @@ def _maybe_reset_project_from_script_tab(page) -> bool:
     return True
 
 
-def _wait_for_new_mode_script_completion(base_url: str, expected_log: str) -> dict:
+def _wait_for_new_mode_script_completion(
+    base_url: str,
+    expected_log: str,
+    *,
+    inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+    fail_on_logged_errors: bool = True,
+) -> dict:
     def probe():
         payload = _fetch_task_status(base_url, "new_mode_workflow")
         logs = _extract_logs(payload)
@@ -986,7 +1213,7 @@ def _wait_for_new_mode_script_completion(base_url: str, expected_log: str) -> di
         }
 
     def done(snapshot):
-        if snapshot.get("errors"):
+        if fail_on_logged_errors and snapshot.get("errors"):
             raise AssertionError(f"Script workflow emitted errors: {snapshot['errors']}")
         if snapshot.get("last_error"):
             raise AssertionError(f"Script workflow failed: {snapshot['last_error']}")
@@ -998,7 +1225,14 @@ def _wait_for_new_mode_script_completion(base_url: str, expected_log: str) -> di
             and bool(snapshot.get("has_expected_log"))
         )
 
-    return _wait_for_activity("Waiting for script workflow output", probe, done, poll_seconds=0.8)
+    return _wait_for_activity(
+        "Waiting for script workflow output",
+        probe,
+        done,
+        poll_seconds=0.8,
+        inactivity_seconds=float(inactivity_seconds),
+        max_total_seconds=float(max_total_seconds),
+    )
 
 
 def _wait_for_nav_unlocked(page, nav_selector: str, label: str) -> None:
@@ -1287,7 +1521,13 @@ def _projects_tab_snapshot(page, layout: RuntimeLayout | None = None, *, expecte
     return result
 
 
-def _export_merged_audiobook_via_ui(page, *, app_base_url: str, layout: RuntimeLayout) -> dict[str, Any]:
+def _export_merged_audiobook_via_ui(
+    page,
+    *,
+    app_base_url: str,
+    layout: RuntimeLayout,
+    min_duration_seconds: float = 240.0,
+) -> dict[str, Any]:
     _wait_for_nav_unlocked(page, '.nav-link[data-tab="audio"]', "Export tab")
     page.locator('.nav-link[data-tab="audio"]').click()
     _wait_for_activity(
@@ -1360,8 +1600,9 @@ def _export_merged_audiobook_via_ui(page, *, app_base_url: str, layout: RuntimeL
     assert isolated_size > 1024, f"Merged output is too small: {isolated_size} bytes"
     assert _looks_like_mp3(isolated_mp3), f"Merged output is not recognized as MP3: {isolated_mp3}"
     duration_seconds = _audio_duration_seconds(isolated_mp3)
-    assert duration_seconds > 240.0, (
-        f"Merged audiobook duration must be > 4 minutes, got {duration_seconds:.2f}s"
+    assert duration_seconds >= float(min_duration_seconds), (
+        "Merged audiobook duration is below required minimum.\n"
+        f"required={float(min_duration_seconds):.2f}s actual={duration_seconds:.2f}s"
     )
     return {
         "path": isolated_mp3,
@@ -1980,7 +2221,13 @@ def _apply_setup_settings_snapshot(page, values: dict) -> None:
     page.locator("#parallel-workers").blur()
 
 
-def _wait_for_voice_generation_completion(page, expected_speakers: set[str]) -> dict:
+def _wait_for_voice_generation_completion(
+    page,
+    expected_speakers: set[str],
+    *,
+    inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+) -> dict:
     sorted_speakers = sorted(expected_speakers)
 
     def probe():
@@ -2031,7 +2278,13 @@ def _wait_for_voice_generation_completion(page, expected_speakers: set[str]) -> 
         ready = set(str(item) for item in (snapshot.get("ready_speakers") or []))
         return ready == expected_speakers and not bool(snapshot.get("bulk_disabled"))
 
-    return _wait_for_activity("Waiting for voice generation output", probe, done)
+    return _wait_for_activity(
+        "Waiting for voice generation output",
+        probe,
+        done,
+        inactivity_seconds=float(inactivity_seconds),
+        max_total_seconds=float(max_total_seconds),
+    )
 
 
 def _set_narrator_threshold_and_wait(page, *, value: int, expected_speakers: set[str]) -> None:
@@ -2151,7 +2404,13 @@ def _wait_for_preview_playback(page, *, speaker: str, ref_audio: str) -> None:
     _wait_for_activity(f"Waiting for preview playback for {speaker}", probe, done)
 
 
-def _wait_for_editor_audio_completion(base_url: str, *, baseline_job_id: int = 0) -> dict:
+def _wait_for_editor_audio_completion(
+    base_url: str,
+    *,
+    baseline_job_id: int = 0,
+    inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+) -> dict:
     def probe():
         payload = _fetch_task_status(base_url, "audio")
         metrics = payload.get("metrics") or {}
@@ -2190,10 +2449,22 @@ def _wait_for_editor_audio_completion(base_url: str, *, baseline_job_id: int = 0
             and bool(snapshot.get("latest_generation_finished"))
         )
 
-    return _wait_for_activity("Waiting for editor audio render output", probe, done, poll_seconds=0.8)
+    return _wait_for_activity(
+        "Waiting for editor audio render output",
+        probe,
+        done,
+        poll_seconds=0.8,
+        inactivity_seconds=float(inactivity_seconds),
+        max_total_seconds=float(max_total_seconds),
+    )
 
 
-def _wait_for_proofread_completion(base_url: str) -> dict:
+def _wait_for_proofread_completion(
+    base_url: str,
+    *,
+    inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+) -> dict:
     def probe():
         payload = _fetch_task_status(base_url, "proofread")
         logs = _extract_logs(payload)
@@ -2224,7 +2495,14 @@ def _wait_for_proofread_completion(base_url: str) -> dict:
             and str(snapshot.get("phase") or "") == "complete"
         )
 
-    return _wait_for_activity("Waiting for proofread output", probe, done, poll_seconds=0.8)
+    return _wait_for_activity(
+        "Waiting for proofread output",
+        probe,
+        done,
+        poll_seconds=0.8,
+        inactivity_seconds=float(inactivity_seconds),
+        max_total_seconds=float(max_total_seconds),
+    )
 
 
 def _wait_for_audio_merge_completion(base_url: str) -> dict:
@@ -2421,10 +2699,12 @@ def _exclusive_run_lock(lock_name: str):
             owner_pid = _read_lock_owner_pid(lock_path)
             if owner_pid and _pid_is_alive(owner_pid):
                 raise AssertionError(
-                    "Stage-3 editor e2e is already running.\n"
+                    "Another instance of this test is already running.\n"
+                    f"Lock name: {lock_name}\n"
                     f"Existing PID: {owner_pid}\n"
                     f"Lock file: {lock_path}\n"
-                    f"Cancel existing run first (example: `kill {owner_pid}`), then retry."
+                    "Exit the old test run first (example: "
+                    f"`kill {owner_pid}`), then retry."
                 )
             try:
                 os.remove(lock_path)
@@ -2432,7 +2712,9 @@ def _exclusive_run_lock(lock_name: str):
                 continue
 
     if not created:
-        raise AssertionError(f"Could not acquire stage-3 run lock at {lock_path}")
+        raise AssertionError(
+            f"Could not acquire exclusive test lock '{lock_name}' at {lock_path}"
+        )
 
     try:
         yield
@@ -2454,6 +2736,9 @@ def _run_stage1_to_voices_tab(
     script_llm_model_name: str | None = None,
     tts_mode: str | None = None,
     tts_parallel_workers: int | None = None,
+    script_workflow_inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    script_workflow_max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+    fail_on_script_logged_errors: bool = True,
 ) -> None:
     _install_error_toast_guard(page)
     page.goto(app_base_url, wait_until="domcontentloaded", timeout=10000)
@@ -2510,7 +2795,13 @@ def _run_stage1_to_voices_tab(
 
     page.locator("#btn-process-script-v2").click()
     expected_log = "All steps complete. Script is ready in the Editor tab."
-    _wait_for_new_mode_script_completion(app_base_url, expected_log)
+    _wait_for_new_mode_script_completion(
+        app_base_url,
+        expected_log,
+        inactivity_seconds=script_workflow_inactivity_seconds,
+        max_total_seconds=script_workflow_max_total_seconds,
+        fail_on_logged_errors=fail_on_script_logged_errors,
+    )
 
     _wait_for_nav_unlocked(page, '.nav-link[data-tab="voices"]', "Voices tab")
     page.locator('.nav-link[data-tab="voices"]').click()
@@ -2611,7 +2902,190 @@ def _run_stage2_voices_flow(
         _wait_for_preview_playback(page, speaker=speaker, ref_audio=ref_audio)
 
 
-def _run_stage3_to_stage4_flow_from_editor(*, page, app_base_url: str) -> None:
+def _run_stage2_voices_flow_relaxed_live(
+    *,
+    page,
+    voice_server_base_url: str,
+    voice_model_name: str,
+    required_speakers: set[str] | None = None,
+    min_total_speakers: int = 4,
+    retry_partial_failures_once: bool = False,
+    retry_failure_limit: int = 2,
+    voice_generation_inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    voice_generation_max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+) -> dict:
+    required = {
+        str(item).strip()
+        for item in (required_speakers or {"NARRATOR", "Kisten", "Jemma", "Maddie"})
+        if str(item).strip()
+    }
+    assert required, "required_speakers must include at least one speaker."
+
+    _switch_llm_via_setup_ui(
+        page,
+        llm_base_url=voice_server_base_url,
+        llm_model_name=voice_model_name,
+    )
+
+    page.locator('.nav-link[data-tab="voices"]').click()
+    _wait_for_activity(
+        "Waiting for Voices tab",
+        lambda: {"visible": bool(page.locator("#voices-tab").is_visible())},
+        lambda snapshot: bool(snapshot.get("visible")),
+    )
+
+    pre_generation_states = _read_voice_card_states(page)
+    speaker_rows = set(pre_generation_states.keys())
+    normalized_rows = {str(name).strip().lower() for name in speaker_rows if str(name).strip()}
+    missing = sorted(
+        speaker
+        for speaker in required
+        if str(speaker).strip().lower() not in normalized_rows
+    )
+    assert not missing, (
+        "Voices tab missing required speakers after script generation.\n"
+        f"Missing: {missing}\n"
+        f"Present: {sorted(speaker_rows)}"
+    )
+    minimum_rows = max(int(min_total_speakers), len(required))
+    assert len(speaker_rows) >= minimum_rows, (
+        f"Expected at least {minimum_rows} speakers on Voices tab, got {len(speaker_rows)}.\n"
+        f"Present: {sorted(speaker_rows)}"
+    )
+
+    eligible_speakers = {
+        speaker
+        for speaker, state in pre_generation_states.items()
+        if not bool(state.get("alias_active")) and not bool(state.get("narrator_threshold_active"))
+    }
+    assert eligible_speakers, "No eligible voice cards available for outstanding generation."
+
+    page.locator("#generate-outstanding-voices-btn").click()
+    _wait_for_voice_generation_completion(
+        page,
+        eligible_speakers,
+        inactivity_seconds=float(voice_generation_inactivity_seconds),
+        max_total_seconds=float(voice_generation_max_total_seconds),
+    )
+
+    post_generation_states = _read_voice_card_states(page)
+    post_rows = set(post_generation_states.keys())
+    post_normalized = {str(name).strip().lower() for name in post_rows if str(name).strip()}
+    post_missing = sorted(
+        speaker
+        for speaker in required
+        if str(speaker).strip().lower() not in post_normalized
+    )
+    assert not post_missing, (
+        "Voices tab missing required speakers after outstanding generation.\n"
+        f"Missing: {post_missing}\n"
+        f"Present: {sorted(post_rows)}"
+    )
+    assert len(post_rows) >= minimum_rows, (
+        f"Expected at least {minimum_rows} speakers after outstanding generation, got {len(post_rows)}.\n"
+        f"Present: {sorted(post_rows)}"
+    )
+
+    def _collect_generation_failures(states: dict[str, dict[str, Any]]) -> list[str]:
+        failed: list[str] = []
+        for speaker in sorted(eligible_speakers):
+            state = states.get(speaker) or {}
+            ref_audio = str(state.get("ref_audio") or "").strip()
+            if not ref_audio or not bool(state.get("retry")):
+                failed.append(speaker)
+        return failed
+
+    generation_failures = _collect_generation_failures(post_generation_states)
+    retried_failures_once = False
+    if (
+        generation_failures
+        and bool(retry_partial_failures_once)
+        and len(generation_failures) <= max(1, int(retry_failure_limit))
+    ):
+        retried_failures_once = True
+        page.locator("#generate-outstanding-voices-btn").click()
+        _wait_for_voice_generation_completion(
+            page,
+            set(generation_failures),
+            inactivity_seconds=float(voice_generation_inactivity_seconds),
+            max_total_seconds=float(voice_generation_max_total_seconds),
+        )
+        post_generation_states = _read_voice_card_states(page)
+        generation_failures = _collect_generation_failures(post_generation_states)
+    assert not generation_failures, (
+        "Some eligible speakers still failed voice generation.\n"
+        f"Failed speakers: {generation_failures}\n"
+        f"States: {json.dumps(post_generation_states, ensure_ascii=False, indent=2)}"
+    )
+
+    playable_speakers = [
+        speaker
+        for speaker, state in sorted(post_generation_states.items())
+        if str(state.get("ref_audio") or "").strip()
+    ]
+    assert playable_speakers, "No playable voice previews available after outstanding generation."
+    for speaker in playable_speakers:
+        card_selector = f'.voice-card[data-voice="{speaker}"]'
+        ref_audio = page.locator(f"{card_selector} .design-ref-audio").input_value().strip()
+        page.locator(f"{card_selector} .design-play-btn").click()
+        _wait_for_preview_playback(page, speaker=speaker, ref_audio=ref_audio)
+
+    return {
+        "total_speakers": len(post_rows),
+        "required_speakers": sorted(required),
+        "eligible_speakers": sorted(eligible_speakers),
+        "generated_count": len(eligible_speakers),
+        "retry_performed_for_partial_failures": bool(retried_failures_once),
+    }
+
+
+def _run_stage3_to_stage4_flow_from_editor(
+    *,
+    page,
+    app_base_url: str,
+    retry_partial_render_failures_once: bool = False,
+    retry_failure_limit: int = 2,
+    render_inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    render_max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+    proofread_inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    proofread_max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+) -> None:
+    def _read_editor_render_pending_state() -> dict:
+        words_text_local = page.locator("#editor-estimate-words").inner_text().strip()
+        words_value_local = int("".join(ch for ch in words_text_local if ch.isdigit()) or "0")
+        errors_text_local = page.locator("#editor-estimate-errors").inner_text().strip().lower()
+        errors_value_local = int("".join(ch for ch in errors_text_local if ch.isdigit()) or "0")
+        audio_check_local = page.evaluate(
+            """() => {
+                const rows = Array.from(document.querySelectorAll('#chunks-table-body tr'));
+                const details = [];
+                let textRows = 0;
+                for (const row of rows) {
+                    const text = String(row.querySelector('textarea.chunk-text')?.value || '').trim();
+                    if (!text) continue;
+                    textRows += 1;
+                    const audio = row.querySelector('audio.chunk-audio');
+                    const audioPath = String(audio?.getAttribute('data-audio-path') || '').trim();
+                    const done = row.classList.contains('status-done');
+                    if (!audioPath || !done) {
+                        details.push({
+                            id: String(row.getAttribute('data-id') || ''),
+                            has_audio: Boolean(audioPath),
+                            status_done: done,
+                        });
+                    }
+                }
+                return { text_rows: textRows, missing: details };
+            }"""
+        )
+        return {
+            "words_text": words_text_local,
+            "words_value": words_value_local,
+            "errors_text": errors_text_local,
+            "errors_value": errors_value_local,
+            "audio_check": audio_check_local,
+        }
+
     _wait_for_nav_unlocked(page, '.nav-link[data-tab="editor"]', "Editor tab")
     page.locator('.nav-link[data-tab="editor"]').click()
     _wait_for_activity(
@@ -2641,19 +3115,33 @@ def _run_stage3_to_stage4_flow_from_editor(*, page, app_base_url: str) -> None:
     pre_recent_jobs = list((pre_render_audio or {}).get("recent_jobs") or [])
     baseline_job_id = int(((pre_recent_jobs[0] or {}).get("id") or 0)) if pre_recent_jobs else 0
 
-    render_pending_button = page.locator("#btn-batch-fast")
-    assert render_pending_button.is_enabled(), "Render Pending button should be enabled before stage-3 run."
-    with page.expect_response(
-        lambda response: (
-            response.url.endswith("/api/generate_batch_fast")
-            and response.request.method == "POST"
-            and response.status == 200
-        ),
-        timeout=10000,
-    ):
-        render_pending_button.click()
+    pre_render_snapshot = _read_editor_render_pending_state()
+    pre_render_missing = list((pre_render_snapshot.get("audio_check") or {}).get("missing") or [])
+    needs_render = bool(
+        int(pre_render_snapshot.get("words_value") or 0) > 0
+        or int(pre_render_snapshot.get("errors_value") or 0) > 0
+        or len(pre_render_missing) > 0
+    )
 
-    _wait_for_editor_audio_completion(app_base_url, baseline_job_id=baseline_job_id)
+    if needs_render:
+        render_pending_button = page.locator("#btn-batch-fast")
+        assert render_pending_button.is_enabled(), "Render Pending button should be enabled before stage-3 run."
+        with page.expect_response(
+            lambda response: (
+                response.url.endswith("/api/generate_batch_fast")
+                and response.request.method == "POST"
+                and response.status == 200
+            ),
+            timeout=10000,
+        ):
+            render_pending_button.click()
+
+        _wait_for_editor_audio_completion(
+            app_base_url,
+            baseline_job_id=baseline_job_id,
+            inactivity_seconds=float(render_inactivity_seconds),
+            max_total_seconds=float(render_max_total_seconds),
+        )
 
     _wait_for_nav_unlocked(page, '.nav-link[data-tab="voices"]', "Voices tab")
     page.locator('.nav-link[data-tab="voices"]').click()
@@ -2696,51 +3184,70 @@ def _run_stage3_to_stage4_flow_from_editor(*, page, app_base_url: str) -> None:
         lambda snapshot: int(snapshot.get("text_rows") or 0) > 0,
     )
 
-    words_text = page.locator("#editor-estimate-words").inner_text().strip()
-    words_value = int("".join(ch for ch in words_text if ch.isdigit()) or "0")
-    assert words_value == 0, f"Expected remaining words to be 0, got: {words_text}"
-    errors_text = page.locator("#editor-estimate-errors").inner_text().strip().lower()
-    assert errors_text.startswith("0 clip"), f"Expected 0 errors, got: {errors_text}"
-
-    page.locator("#editor-chapter-select").select_option("__whole_project__")
-    _wait_for_activity(
-        "Waiting for Whole Project rows",
-        lambda: {
-            "rows": int(
-                page.evaluate(
-                    "() => document.querySelectorAll('#chunks-table-body tr').length"
+    def _collect_editor_render_snapshot() -> dict:
+        page.locator("#editor-chapter-select").select_option("__whole_project__")
+        _wait_for_activity(
+            "Waiting for Whole Project rows",
+            lambda: {
+                "rows": int(
+                    page.evaluate(
+                        "() => document.querySelectorAll('#chunks-table-body tr').length"
+                    )
                 )
-            )
-        },
-        lambda snapshot: int(snapshot.get("rows") or 0) > 0,
-    )
+            },
+            lambda snapshot: int(snapshot.get("rows") or 0) > 0,
+        )
 
-    audio_check = page.evaluate(
-        """() => {
-            const rows = Array.from(document.querySelectorAll('#chunks-table-body tr'));
-            const details = [];
-            let textRows = 0;
-            for (const row of rows) {
-                const text = String(row.querySelector('textarea.chunk-text')?.value || '').trim();
-                if (!text) continue;
-                textRows += 1;
-                const audio = row.querySelector('audio.chunk-audio');
-                const audioPath = String(audio?.getAttribute('data-audio-path') || '').trim();
-                const done = row.classList.contains('status-done');
-                if (!audioPath || !done) {
-                    details.push({
-                        id: String(row.getAttribute('data-id') || ''),
-                        has_audio: Boolean(audioPath),
-                        status_done: done,
-                    });
-                }
-            }
-            return { text_rows: textRows, missing: details };
-        }"""
+        pending_state_local = _read_editor_render_pending_state()
+        playback_check_local = _assert_editor_compact_player_playback(page)
+        return {
+            "words_text": pending_state_local.get("words_text"),
+            "words_value": pending_state_local.get("words_value"),
+            "errors_text": pending_state_local.get("errors_text"),
+            "errors_value": pending_state_local.get("errors_value"),
+            "audio_check": pending_state_local.get("audio_check"),
+            "playback_check": playback_check_local,
+        }
+
+    editor_snapshot = _collect_editor_render_snapshot()
+    missing_rows = list((editor_snapshot.get("audio_check") or {}).get("missing") or [])
+    needs_retry = bool(
+        (int(editor_snapshot.get("errors_value") or 0) > 0 and int(editor_snapshot.get("errors_value") or 0) <= max(1, int(retry_failure_limit)))
+        or (len(missing_rows) > 0 and len(missing_rows) <= max(1, int(retry_failure_limit)))
     )
+    if bool(retry_partial_render_failures_once) and needs_retry:
+        pre_retry_audio = _fetch_task_status(app_base_url, "audio")
+        pre_retry_jobs = list((pre_retry_audio or {}).get("recent_jobs") or [])
+        pre_retry_job_id = int(((pre_retry_jobs[0] or {}).get("id") or 0)) if pre_retry_jobs else 0
+        render_pending_button = page.locator("#btn-batch-fast")
+        assert render_pending_button.is_enabled(), "Render Pending button should be enabled for retry."
+        with page.expect_response(
+            lambda response: (
+                response.url.endswith("/api/generate_batch_fast")
+                and response.request.method == "POST"
+                and response.status == 200
+            ),
+            timeout=10000,
+        ):
+            render_pending_button.click()
+        _wait_for_editor_audio_completion(
+            app_base_url,
+            baseline_job_id=pre_retry_job_id,
+            inactivity_seconds=float(render_inactivity_seconds),
+            max_total_seconds=float(render_max_total_seconds),
+        )
+        editor_snapshot = _collect_editor_render_snapshot()
+
+    assert int(editor_snapshot.get("words_value") or 0) == 0, (
+        f"Expected remaining words to be 0, got: {editor_snapshot.get('words_text')}"
+    )
+    assert str(editor_snapshot.get("errors_text") or "").startswith("0 clip"), (
+        f"Expected 0 errors, got: {editor_snapshot.get('errors_text')}"
+    )
+    audio_check = dict(editor_snapshot.get("audio_check") or {})
     assert int(audio_check.get("text_rows") or 0) > 0, "Expected at least one text clip row in Whole Project view."
     assert not audio_check.get("missing"), f"Rows missing audio or done status: {audio_check.get('missing')}"
-    playback_check = _assert_editor_compact_player_playback(page)
+    playback_check = dict(editor_snapshot.get("playback_check") or {})
     assert not bool(playback_check.get("has_error")), (
         f"Compact player playback produced an error: {json.dumps(playback_check, ensure_ascii=False, indent=2)}"
     )
@@ -2799,10 +3306,21 @@ def _run_stage3_to_stage4_flow_from_editor(*, page, app_base_url: str) -> None:
     ):
         page.locator("#btn-proofread-book").click()
 
-    _wait_for_proofread_completion(app_base_url)
+    _wait_for_proofread_completion(
+        app_base_url,
+        inactivity_seconds=float(proofread_inactivity_seconds),
+        max_total_seconds=float(proofread_max_total_seconds),
+    )
 
 
-def _wait_for_stage4_strict_pass(*, page, app_base_url: str) -> dict:
+def _wait_for_stage4_strict_pass(
+    *,
+    page,
+    app_base_url: str,
+    inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
+    max_total_seconds: float = WATCHDOG_MAX_SECONDS,
+    allow_failures: bool = False,
+) -> dict:
     proofread_select = page.locator("#proofread-chapter-select")
     try:
         proofread_select.select_option("__whole_project__")
@@ -2836,11 +3354,25 @@ def _wait_for_stage4_strict_pass(*, page, app_base_url: str) -> dict:
         lambda snapshot: (
             not bool((snapshot.get("status") or {}).get("running"))
             and int(((snapshot.get("ui") or {}).get("row_count") or 0)) > 0
-            and int(((snapshot.get("ui") or {}).get("failed") or 0)) == 0
-            and int(((snapshot.get("ui") or {}).get("auto_failed") or 0)) == 0
-            and int(((snapshot.get("ui") or {}).get("passed") or 0))
-            == int(((snapshot.get("ui") or {}).get("row_count") or 0))
+            and (
+                (
+                    int(((snapshot.get("ui") or {}).get("failed") or 0)) == 0
+                    and int(((snapshot.get("ui") or {}).get("auto_failed") or 0)) == 0
+                    and int(((snapshot.get("ui") or {}).get("passed") or 0))
+                    == int(((snapshot.get("ui") or {}).get("row_count") or 0))
+                )
+                if not bool(allow_failures)
+                else (
+                    int(((snapshot.get("ui") or {}).get("passed") or 0))
+                    + int(((snapshot.get("ui") or {}).get("failed") or 0))
+                    + int(((snapshot.get("ui") or {}).get("auto_failed") or 0))
+                    >= int(((snapshot.get("ui") or {}).get("row_count") or 0))
+                    and str(((snapshot.get("ui") or {}).get("phase_text") or "")).strip().lower() == "complete"
+                )
+            )
         ),
+        inactivity_seconds=float(inactivity_seconds),
+        max_total_seconds=float(max_total_seconds),
     )
 
 
