@@ -254,6 +254,7 @@ EXPECTED_PROJECT_MANAGER_METHODS = {
     "_legacy_audio_index_from_path",
     "_stable_audio_uid_from_path",
     "invalidate_stale_audio_references",
+    "_detect_export_worker_count",
     "decompose_long_segments",
     "merge_orphan_segments",
     "update_chunk",

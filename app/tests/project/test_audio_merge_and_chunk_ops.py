@@ -358,17 +358,12 @@ class MergeAudioTests(unittest.TestCase):
 
         self.manager._export_concat_mp3 = flaky_export
         self.manager._normalize_audio_file = lambda path, export_config=None: (True, path)
-        previous_workers = os.environ.get("THREADSPEAK_EXPORT_CHAPTER_WORKERS")
-        os.environ["THREADSPEAK_EXPORT_CHAPTER_WORKERS"] = "4"
         try:
-            success, output_filename = self.manager.export_optimized_mp3_zip(max_part_seconds=1.4)
+            with patch.object(self.manager, "_detect_export_worker_count", return_value=4):
+                success, output_filename = self.manager.export_optimized_mp3_zip(max_part_seconds=1.4)
         finally:
             self.manager._export_concat_mp3 = original_export
             self.manager._normalize_audio_file = original_normalize
-            if previous_workers is None:
-                os.environ.pop("THREADSPEAK_EXPORT_CHAPTER_WORKERS", None)
-            else:
-                os.environ["THREADSPEAK_EXPORT_CHAPTER_WORKERS"] = previous_workers
 
         self.assertTrue(success)
         self.assertEqual(output_filename, "optimized_audiobook.zip")
@@ -395,17 +390,12 @@ class MergeAudioTests(unittest.TestCase):
 
         self.manager._export_concat_mp3 = always_fail_chapter
         self.manager._normalize_audio_file = lambda path, export_config=None: (True, path)
-        previous_workers = os.environ.get("THREADSPEAK_EXPORT_CHAPTER_WORKERS")
-        os.environ["THREADSPEAK_EXPORT_CHAPTER_WORKERS"] = "4"
         try:
-            success, message = self.manager.export_optimized_mp3_zip(max_part_seconds=1.4)
+            with patch.object(self.manager, "_detect_export_worker_count", return_value=4):
+                success, message = self.manager.export_optimized_mp3_zip(max_part_seconds=1.4)
         finally:
             self.manager._export_concat_mp3 = original_export
             self.manager._normalize_audio_file = original_normalize
-            if previous_workers is None:
-                os.environ.pop("THREADSPEAK_EXPORT_CHAPTER_WORKERS", None)
-            else:
-                os.environ["THREADSPEAK_EXPORT_CHAPTER_WORKERS"] = previous_workers
 
         self.assertFalse(success)
         self.assertIn("parallel + serial retries", message)
@@ -665,6 +655,52 @@ class MergeAudioTests(unittest.TestCase):
         timeline = self.manager._collect_merge_timeline(export_config=export_config)
         self.assertEqual(len(timeline), 1)
         self.assertEqual(timeline[0]["full_path"], original_path)
+
+    def test_detect_export_worker_count_uses_logical_cpu_total(self):
+        with patch.object(project_module.os, "cpu_count", return_value=12):
+            self.assertEqual(self.manager._detect_export_worker_count(), 12)
+
+    def test_detect_export_worker_count_falls_back_to_four_when_unavailable(self):
+        with patch.object(project_module.os, "cpu_count", return_value=None):
+            self.assertEqual(self.manager._detect_export_worker_count(), 4)
+
+        with patch.object(project_module.os, "cpu_count", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.manager._detect_export_worker_count(), 4)
+
+    def test_collect_merge_timeline_parallelizes_trim_prep_and_preserves_order(self):
+        self._write_wav("voicelines/parallel_a.wav", duration_seconds=0.1)
+        self._write_wav("voicelines/parallel_b.wav", duration_seconds=0.1)
+        self._write_wav("voicelines/parallel_c.wav", duration_seconds=0.1)
+        self.manager.save_chunks([
+            {"id": 0, "speaker": "Narrator", "text": "One.", "instruct": "", "chapter": "Chapter 1", "status": "done", "audio_path": "voicelines/parallel_a.wav"},
+            {"id": 1, "speaker": "Narrator", "text": "Two.", "instruct": "", "chapter": "Chapter 1", "status": "done", "audio_path": "voicelines/parallel_b.wav"},
+            {"id": 2, "speaker": "Narrator", "text": "Three.", "instruct": "", "chapter": "Chapter 1", "status": "done", "audio_path": "voicelines/parallel_c.wav"},
+        ])
+
+        export_config = SimpleNamespace(trim_clip_silence_enabled=True)
+        barrier = threading.Barrier(2)
+        thread_ids = set()
+        call_sequence = []
+
+        def fake_resolve(full_path, trim_cfg):
+            basename = os.path.basename(full_path)
+            call_sequence.append(basename)
+            if basename != "parallel_c.wav":
+                barrier.wait(timeout=1.0)
+            thread_ids.add(threading.get_ident())
+            return full_path + ".trimmed", {"cache_hit": False, "trimmed": True, "lead_ms": 5, "tail_ms": 7}
+
+        with patch.object(self.manager, "_detect_export_worker_count", return_value=2):
+            with patch.object(self.manager, "_resolve_export_audio_path", side_effect=fake_resolve):
+                with patch.object(project_module.os.path, "getsize", return_value=1000):
+                    timeline = self.manager._collect_merge_timeline(export_config=export_config)
+
+        self.assertEqual(
+            [os.path.basename(item["full_path"]) for item in timeline],
+            ["parallel_a.wav.trimmed", "parallel_b.wav.trimmed", "parallel_c.wav.trimmed"],
+        )
+        self.assertGreaterEqual(len(thread_ids), 2, "Expected trim prep to run on multiple worker threads")
+        self.assertCountEqual(call_sequence, ["parallel_a.wav", "parallel_b.wav", "parallel_c.wav"])
 
     def test_trim_disabled_via_config_ignores_existing_trim_cache(self):
         original_path = self._write_tone_with_silence("voicelines/no_trim_from_config.wav")

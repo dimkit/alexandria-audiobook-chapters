@@ -2495,19 +2495,6 @@
             }
         };
 
-        async function repairLegacyProjectBeforeExport() {
-            const chunks = Array.isArray(cachedChunks) && cachedChunks.length > 0
-                ? cachedChunks
-                : await API.get('/api/chunks/view');
-
-            if (!chunks.length) {
-                throw new Error('No chunks are loaded to export.');
-            }
-
-            await API.post('/api/chunks/repair_legacy', { chunks });
-            cachedChunks = chunks;
-        }
-
         async function autoPrepareSegmentsBeforeRender() {
             if (renderPrepComplete) {
                 return;
@@ -3154,7 +3141,6 @@
                  if (window.persistExportConfigFromUI) {
                      exportConfig = await window.persistExportConfigFromUI();
                  }
-                 await repairLegacyProjectBeforeExport();
                  await API.post('/api/merge', { export: exportConfig || undefined, chapter: chapter || undefined });
                  markTaskActionRequested('audio', 'merge');
                  // Switch to Export tab and poll
@@ -3177,7 +3163,6 @@
                      if (window.persistExportConfigFromUI) {
                          exportConfig = await window.persistExportConfigFromUI();
                      }
-                     await repairLegacyProjectBeforeExport();
                      await API.post('/api/merge', { export: exportConfig || undefined, chapter });
                      markTaskActionRequested('audio', 'merge');
                      document.querySelector('[data-tab="audio"]').click();
@@ -3195,7 +3180,6 @@
                  if (window.persistExportConfigFromUI) {
                      exportConfig = await window.persistExportConfigFromUI();
                  }
-                 await repairLegacyProjectBeforeExport();
                  await API.post('/api/merge_optimized', { export: exportConfig || undefined });
                  markTaskActionRequested('audio', 'optimized');
                  document.querySelector('[data-tab="audio"]').click();

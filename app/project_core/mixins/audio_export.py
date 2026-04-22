@@ -522,6 +522,14 @@ class ProjectAudioExportMixin:
                 "keep_padding_ms": max(0, int(getattr(cfg, "trim_keep_padding_ms", TRIM_KEEP_PADDING_MS))),
             }
 
+        @staticmethod
+        def _detect_export_worker_count():
+            try:
+                cpu_total = int(os.cpu_count() or 0)
+            except Exception:
+                cpu_total = 0
+            return cpu_total if cpu_total > 0 else 4
+
         def _trim_cache_dir(self):
             return os.path.join(self.root_dir, "voicelines", ".trim_cache")
 
@@ -703,8 +711,18 @@ class ProjectAudioExportMixin:
                     if not os.path.exists(full_path):
                         continue
                     ordered_items.append(("audio", chunk, full_path))
-            eligible_chunks = [(c, p) for kind, c, p in (x for x in ordered_items if x[0] == "audio")]
-            total_candidates = len(eligible_chunks)
+            prepare_payloads = []
+            payload_uids = defaultdict(list)
+            seen_prepare_paths = set()
+            for kind, chunk, full_path in (entry for entry in ordered_items if entry[0] == "audio"):
+                payload_uids[full_path].append(str(chunk.get("uid") or ""))
+                if full_path in seen_prepare_paths:
+                    continue
+                seen_prepare_paths.add(full_path)
+                prepare_payloads.append({
+                    "full_path": full_path,
+                })
+            total_candidates = len(prepare_payloads)
 
             if progress_callback:
                 progress_callback({
@@ -730,24 +748,44 @@ class ProjectAudioExportMixin:
             clip_times = []
             # Map uid -> resolved_path for audio chunks after trim processing
             resolved_audio_paths = {}
-            for processed_index, (chunk, full_path) in enumerate(eligible_chunks, start=1):
+            def _prepare_one(payload):
+                full_path = payload["full_path"]
                 clip_start = time.time()
                 resolved_path = full_path
+                trim_info = {"cache_hit": False, "trimmed": False, "lead_ms": 0, "tail_ms": 0}
+                fallback_original = False
                 if trim_cfg["enabled"]:
                     try:
                         resolved_path, trim_info = self._resolve_export_audio_path(full_path, trim_cfg)
-                        trim_stats["processed"] += 1
-                        if trim_info["cache_hit"]:
-                            trim_stats["cache_hits"] += 1
-                        if trim_info["trimmed"]:
-                            trim_stats["trimmed_clips"] += 1
-                            trim_stats["lead_ms_removed"] += int(trim_info["lead_ms"])
-                            trim_stats["tail_ms_removed"] += int(trim_info["tail_ms"])
                     except Exception:
-                        trim_stats["fallback_originals"] += 1
+                        fallback_original = True
                         resolved_path = full_path
-                clip_times.append(time.time() - clip_start)
-                resolved_audio_paths[chunk["uid"]] = resolved_path
+                return {
+                    "full_path": full_path,
+                    "resolved_path": resolved_path,
+                    "trim_info": trim_info,
+                    "fallback_original": fallback_original,
+                    "elapsed_seconds": max(0.0, time.time() - clip_start),
+                }
+
+            def _record_prepare_result(processed_index, result):
+                trim_info = result["trim_info"]
+                if trim_cfg["enabled"]:
+                    trim_stats["processed"] += 1
+                    if trim_info["cache_hit"]:
+                        trim_stats["cache_hits"] += 1
+                    if trim_info["trimmed"]:
+                        trim_stats["trimmed_clips"] += 1
+                        trim_stats["lead_ms_removed"] += int(trim_info["lead_ms"])
+                        trim_stats["tail_ms_removed"] += int(trim_info["tail_ms"])
+                    if result["fallback_original"]:
+                        trim_stats["fallback_originals"] += 1
+
+                clip_times.append(result["elapsed_seconds"])
+                for uid in payload_uids.get(result["full_path"], []):
+                    if uid:
+                        resolved_audio_paths[uid] = result["resolved_path"]
+
                 if progress_callback and total_candidates > 0:
                     percent_complete = (processed_index / total_candidates) * 100.0
                     progress_bucket = int(percent_complete // 5)
@@ -798,7 +836,22 @@ class ProjectAudioExportMixin:
                                 f" — ETA {eta_str}",
                                 flush=True,
                             )
-                        last_prepare_bucket = progress_bucket
+                        return progress_bucket
+                return last_prepare_bucket
+
+            if total_candidates > 0:
+                max_workers = max(1, min(self._detect_export_worker_count(), total_candidates))
+                if max_workers <= 1 or total_candidates <= 1:
+                    for processed_index, payload in enumerate(prepare_payloads, start=1):
+                        last_prepare_bucket = _record_prepare_result(processed_index, _prepare_one(payload))
+                else:
+                    future_map = {}
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        for payload in prepare_payloads:
+                            future = executor.submit(_prepare_one, payload)
+                            future_map[future] = payload
+                        for processed_index, future in enumerate(concurrent.futures.as_completed(future_map), start=1):
+                            last_prepare_bucket = _record_prepare_result(processed_index, future.result())
 
             # Build final timeline in chunk order, interleaving silence blocks
             for entry in ordered_items:
@@ -1921,7 +1974,7 @@ class ProjectAudioExportMixin:
                                 "chapter_output_path": os.path.join(chapters_dir, f"chapter_{chapter_index:03d}.mp3"),
                             })
 
-                        max_workers = max(1, min(4, int(os.getenv("THREADSPEAK_EXPORT_CHAPTER_WORKERS", "4") or "4")))
+                        max_workers = max(1, min(self._detect_export_worker_count(), len(payloads)))
                         results = []
                         parallel_failures = []
                         if max_workers <= 1 or len(payloads) <= 1:
