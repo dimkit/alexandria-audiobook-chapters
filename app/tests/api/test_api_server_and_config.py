@@ -552,7 +552,7 @@ def test_save_setup_config_roundtrip_tts_provider():
 
     payload = {
         "tts": {
-            "provider": "qwen3",
+            "provider": "voxcpm2",
             "mode": original.get("tts", {}).get("mode", "local"),
             "url": original.get("tts", {}).get("url", "http://127.0.0.1:7860"),
             "language": original.get("tts", {}).get("language", "English"),
@@ -566,8 +566,148 @@ def test_save_setup_config_roundtrip_tts_provider():
         r = get("/api/config")
         assert_status(r, 200)
         readback = r.json()
-        if readback.get("tts", {}).get("provider") != "qwen3":
+        if readback.get("tts", {}).get("provider") != "voxcpm2":
             raise TestFailure("POST /api/config/setup did not persist tts.provider")
+    finally:
+        post("/api/config", json=original)
+
+def test_save_setup_config_roundtrip_visible_voxcpm2_settings():
+    r = get("/api/config")
+    assert_status(r, 200)
+    original = r.json()
+
+    payload = {
+        "tts": {
+            "provider": "voxcpm2",
+            "mode": "local",
+            "url": original.get("tts", {}).get("url", "http://127.0.0.1:7860"),
+            "language": original.get("tts", {}).get("language", "English"),
+            "parallel_workers": 1,
+            "voxcpm_model_id": "openbmb/VoxCPM2",
+            "voxcpm_cfg_value": 1.35,
+            "voxcpm_inference_timesteps": 14,
+            "voxcpm_normalize": True,
+            "voxcpm_load_denoiser": True,
+            "voxcpm_denoise_reference": True,
+            "voxcpm_optimize": False,
+        }
+    }
+    r = post("/api/config/setup", json=payload)
+    assert_status(r, 200)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        tts = r.json().get("tts", {})
+        for key, expected in payload["tts"].items():
+            actual = tts.get(key)
+            if actual != expected:
+                raise TestFailure(f"POST /api/config/setup did not persist tts.{key}: expected {expected!r}, got {actual!r}")
+    finally:
+        post("/api/config", json=original)
+
+def test_save_setup_config_clamps_voxcpm2_generation_settings_on_mac():
+    r = get("/api/config")
+    assert_status(r, 200)
+    original = r.json()
+
+    payload = {
+        "tts": {
+            "provider": "voxcpm2",
+            "mode": "local",
+            "url": original.get("tts", {}).get("url", "http://127.0.0.1:7860"),
+            "language": original.get("tts", {}).get("language", "English"),
+            "parallel_workers": 1,
+            "voxcpm_cfg_value": 9.0,
+            "voxcpm_inference_timesteps": 100,
+            "voxcpm_optimize": True,
+        }
+    }
+    r = post("/api/config/setup", json=payload)
+    assert_status(r, 200)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        tts = r.json().get("tts", {})
+        if float(tts.get("voxcpm_cfg_value") or 0) != 3.0:
+            raise TestFailure("POST /api/config/setup did not clamp tts.voxcpm_cfg_value to 3.0")
+        if int(tts.get("voxcpm_inference_timesteps") or 0) != 30:
+            raise TestFailure("POST /api/config/setup did not clamp tts.voxcpm_inference_timesteps to 30")
+        if sys.platform == "darwin" and tts.get("voxcpm_optimize") is not False:
+            raise TestFailure("POST /api/config/setup did not disable tts.voxcpm_optimize on macOS")
+    finally:
+        post("/api/config", json=original)
+
+def test_get_config_uses_voxcpm2_script_max_length_default_when_missing():
+    config_path = os.path.join(common.ACTIVE_APP_DIR, "config.json")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        original_config_raw = f.read()
+
+    modified = json.loads(original_config_raw)
+    modified.setdefault("tts", {})
+    modified["tts"]["provider"] = "voxcpm2"
+    modified["tts"]["script_max_length"] = None
+    modified["tts"]["voxcpm_cfg_value"] = None
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(modified, f, indent=2, ensure_ascii=False)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        tts = r.json().get("tts", {})
+        if int(tts.get("script_max_length") or 0) != 240:
+            raise TestFailure(f"GET /api/config did not backfill VoxCPM2 script_max_length=240, got {tts.get('script_max_length')!r}")
+        if float(tts.get("voxcpm_cfg_value") or 0) != 1.6:
+            raise TestFailure("GET /api/config did not backfill VoxCPM2 cfg default to 1.6")
+    finally:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(original_config_raw)
+
+def test_save_setup_config_preserves_hidden_voxcpm2_settings():
+    r = get("/api/config")
+    assert_status(r, 200)
+    original = r.json()
+
+    seeded = {
+        "llm": original.get("llm"),
+        "tts": {
+            **(original.get("tts") or {}),
+            "provider": "voxcpm2",
+            "voxcpm_cfg_value": 1.6,
+            "voxcpm_inference_timesteps": 18,
+        },
+        "prompts": original.get("prompts"),
+        "generation": original.get("generation"),
+        "proofread": original.get("proofread"),
+        "export": original.get("export"),
+        "ui": original.get("ui"),
+    }
+    r = post("/api/config", json=seeded)
+    assert_status(r, 200)
+
+    payload = {
+        "tts": {
+            "provider": "voxcpm2",
+            "mode": "local",
+            "url": seeded["tts"].get("url", "http://127.0.0.1:7860"),
+            "language": seeded["tts"].get("language", "English"),
+            "parallel_workers": 1,
+        }
+    }
+    r = post("/api/config/setup", json=payload)
+    assert_status(r, 200)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        readback = r.json()
+        tts = readback.get("tts", {})
+        if float(tts.get("voxcpm_cfg_value") or 0) != 1.6:
+            raise TestFailure("POST /api/config/setup overwrote hidden tts.voxcpm_cfg_value")
+        if int(tts.get("voxcpm_inference_timesteps") or 0) != 18:
+            raise TestFailure("POST /api/config/setup overwrote hidden tts.voxcpm_inference_timesteps")
     finally:
         post("/api/config", json=original)
 

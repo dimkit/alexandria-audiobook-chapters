@@ -12,11 +12,13 @@ import pytest
 import requests
 
 from llm import LMStudioModelLoadService
+from tts import TTSEngine
 
 from ._stage_ui_helpers import *  # noqa: F401,F403
 
 
 REQUIRED_LIVE_SPEAKERS = {"NARRATOR", "Kisten"}
+VOXCPM2_MODEL_ID = "openbmb/VoxCPM2"
 LMSTUDIO_API_KEY = "local"
 LMSTUDIO_MODEL_CONTEXT_LENGTH = 16384
 LMSTUDIO_MODEL_WAIT_TIMEOUT_SECONDS = 300
@@ -43,6 +45,34 @@ try:
     import fcntl
 except ModuleNotFoundError:  # pragma: no cover - platform guard
     fcntl = None
+
+
+def _tts_provider_slug(tts_provider: str) -> str:
+    provider = str(tts_provider or "qwen3").strip().lower()
+    if provider not in {"qwen3", "voxcpm2"}:
+        raise ValueError(f"Unsupported live fresh-clone TTS provider: {tts_provider}")
+    return provider
+
+
+def _live_lock_path(tts_provider: str) -> str:
+    provider = _tts_provider_slug(tts_provider)
+    if provider == "qwen3":
+        return LIVE_FRESH_CLONE_LOCK_PATH
+    return os.path.join(tempfile.gettempdir(), f"threadspeak_fresh_clone_live_full_project_{provider}.lock")
+
+
+def _live_partial_pointer_path(tts_provider: str) -> str:
+    provider = _tts_provider_slug(tts_provider)
+    if provider == "qwen3":
+        return LIVE_PARTIAL_POINTER_PATH
+    return os.path.join(tempfile.gettempdir(), f"threadspeak_fresh_clone_live_partial_state_{provider}.json")
+
+
+def _live_output_dir(tts_provider: str) -> str:
+    provider = _tts_provider_slug(tts_provider)
+    if provider == "qwen3":
+        return LIVE_OUTPUT_DIR
+    return os.path.join(tempfile.gettempdir(), f"threadspeak_fresh_clone_live_outputs_{provider}")
 
 
 def _seconds_per_request(duration_seconds: float, request_count: int) -> float | None:
@@ -98,12 +128,14 @@ def _format_live_benchmark_block(
 
 
 @contextmanager
-def _single_live_fresh_clone_guard():
+def _single_live_fresh_clone_guard(tts_provider: str = "qwen3"):
+    lock_path = _live_lock_path(tts_provider)
+    lock_name = f"fresh_clone_live_full_project_flow_real_local_backends_{_tts_provider_slug(tts_provider)}"
     if fcntl is None:
-        with _exclusive_run_lock("fresh_clone_live_full_project_flow_real_local_backends"):
+        with _exclusive_run_lock(lock_name):
             yield
         return
-    handle = open(LIVE_FRESH_CLONE_LOCK_PATH, "a+", encoding="utf-8")
+    handle = open(lock_path, "a+", encoding="utf-8")
     try:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -116,7 +148,7 @@ def _single_live_fresh_clone_guard():
             raise AssertionError(
                 "Refusing to run fresh-clone live full-project test concurrently. "
                 "Another instance is already running. Exit the old run first and retry. "
-                f"Lock file: {LIVE_FRESH_CLONE_LOCK_PATH}.{owner_hint}"
+                f"Lock file: {lock_path}.{owner_hint}"
             ) from exc
 
         handle.seek(0)
@@ -373,15 +405,23 @@ def _partial_checkpoint_path(clone_root: str) -> str:
     return os.path.join(clone_root, LIVE_PARTIAL_CHECKPOINT_BASENAME)
 
 
-def _save_partial_pointer(*, clone_root: str, last_status: str, failed_stage: str = "", failure_reason: str = "") -> None:
+def _save_partial_pointer(
+    *,
+    clone_root: str,
+    last_status: str,
+    failed_stage: str = "",
+    failure_reason: str = "",
+    tts_provider: str = "qwen3",
+) -> None:
     _write_json(
-        LIVE_PARTIAL_POINTER_PATH,
+        _live_partial_pointer_path(tts_provider),
         {
             "clone_root": str(clone_root),
             "checkpoint_path": _partial_checkpoint_path(str(clone_root)),
             "last_status": str(last_status),
             "failed_stage": str(failed_stage),
             "failure_reason": str(failure_reason),
+            "tts_provider": _tts_provider_slug(tts_provider),
             "updated_at": int(time.time()),
         },
     )
@@ -437,21 +477,23 @@ def _slugify(text: str) -> str:
     return cleaned or "model"
 
 
-def _persist_final_mp3_artifact(*, final_audio: dict, selected_model: str) -> dict:
+def _persist_final_mp3_artifact(*, final_audio: dict, selected_model: str, tts_provider: str = "qwen3") -> dict:
     source_path = str((final_audio or {}).get("path") or "").strip()
     if not source_path or not os.path.isfile(source_path):
         raise AssertionError(f"Missing final MP3 to preserve before cleanup: {source_path or '(empty path)'}")
-    os.makedirs(LIVE_OUTPUT_DIR, exist_ok=True)
+    output_dir = _live_output_dir(tts_provider)
+    os.makedirs(output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     model_slug = _slugify(selected_model)
+    provider_slug = _tts_provider_slug(tts_provider)
     destination_path = os.path.join(
-        LIVE_OUTPUT_DIR,
-        f"fresh_clone_live_{timestamp}_{model_slug}.mp3",
+        output_dir,
+        f"fresh_clone_live_{provider_slug}_{timestamp}_{model_slug}.mp3",
     )
     if os.path.exists(destination_path):
         destination_path = os.path.join(
-            LIVE_OUTPUT_DIR,
-            f"fresh_clone_live_{timestamp}_{model_slug}_{os.getpid()}_{time.time_ns()}.mp3",
+            output_dir,
+            f"fresh_clone_live_{provider_slug}_{timestamp}_{model_slug}_{os.getpid()}_{time.time_ns()}.mp3",
         )
     shutil.copy2(source_path, destination_path)
     preserved = dict(final_audio or {})
@@ -460,9 +502,14 @@ def _persist_final_mp3_artifact(*, final_audio: dict, selected_model: str) -> di
     return preserved
 
 
-def _cleanup_live_run_artifacts_after_success(*, clone_root: str, checkpoint_path: str = "") -> None:
+def _cleanup_live_run_artifacts_after_success(
+    *,
+    clone_root: str,
+    checkpoint_path: str = "",
+    tts_provider: str = "qwen3",
+) -> None:
     try:
-        os.remove(LIVE_PARTIAL_POINTER_PATH)
+        os.remove(_live_partial_pointer_path(tts_provider))
     except FileNotFoundError:
         pass
 
@@ -488,7 +535,7 @@ def _cleanup_live_run_artifacts_after_success(*, clone_root: str, checkpoint_pat
         )
 
 
-def _clear_non_partial_clone_residue(partial_pointer: dict) -> None:
+def _clear_non_partial_clone_residue(partial_pointer: dict, *, tts_provider: str = "qwen3") -> None:
     clone_root = str(partial_pointer.get("clone_root") or "").strip()
     if clone_root:
         candidate = os.path.abspath(os.path.expanduser(clone_root))
@@ -506,7 +553,7 @@ def _clear_non_partial_clone_residue(partial_pointer: dict) -> None:
                 f"{candidate}"
             )
     try:
-        os.remove(LIVE_PARTIAL_POINTER_PATH)
+        os.remove(_live_partial_pointer_path(tts_provider))
     except FileNotFoundError:
         pass
 
@@ -523,10 +570,15 @@ def _open_app_tab(page, *, base_url: str, tab_selector: str, panel_selector: str
     )
 
 
-@pytest.mark.fresh_clone_live_e2e
-def test_fresh_clone_live_full_project_flow_real_local_backends(request):
+def _run_fresh_clone_live_full_project_flow_real_local_backends(
+    request,
+    *,
+    tts_provider: str,
+    env_overrides: dict | None = None,
+):
+    provider_slug = _tts_provider_slug(tts_provider)
     partial_mode = bool(request.config.getoption("--real-generation-backend-e2e-partial"))
-    partial_pointer = _read_json_if_exists(LIVE_PARTIAL_POINTER_PATH)
+    partial_pointer = _read_json_if_exists(_live_partial_pointer_path(provider_slug))
     resume_clone_root = ""
     successful_run = False
     successful_clone_root = ""
@@ -534,13 +586,14 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
     retained_mp3_path = ""
     if partial_mode:
         candidate = str(partial_pointer.get("clone_root") or "").strip()
-        if candidate and os.path.isdir(candidate):
+        pointer_provider = str(partial_pointer.get("tts_provider") or provider_slug).strip().lower()
+        if pointer_provider == provider_slug and candidate and os.path.isdir(candidate):
             resume_clone_root = candidate
     else:
-        _clear_non_partial_clone_residue(partial_pointer)
+        _clear_non_partial_clone_residue(partial_pointer, tts_provider=provider_slug)
 
-    with _hard_test_timeout(3600, label="fresh-clone live full-project real-backend E2E"):
-        with _single_live_fresh_clone_guard():
+    with _hard_test_timeout(3600, label=f"fresh-clone live full-project {provider_slug} real-backend E2E"):
+        with _single_live_fresh_clone_guard(provider_slug):
             discovery = _discover_lmstudio_tool_model(origin=LMSTUDIO_DEFAULT_ORIGIN)
             if str(discovery.get("status") or "") != "ok":
                 reason = str(discovery.get("reason") or "LM Studio backend cannot be reached")
@@ -566,7 +619,7 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
                 model_name=selected_model,
             )
 
-            with _exclusive_run_lock("fresh_clone_live_full_project_flow_real_local_backends"):
+            with _exclusive_run_lock(f"fresh_clone_live_full_project_flow_real_local_backends_{provider_slug}"):
                 book_path = os.path.join(SOURCE_APP_DIR, "test_fixtures", "files", "test_book.epub")
                 assert os.path.exists(book_path), f"Missing book fixture: {book_path}"
 
@@ -587,10 +640,9 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
                                 "parallel_workers": 1,
                                 "cpu_threads": 1,
                             },
-                            "tts": {
-                                "local_backend": "auto",
-                            }
+                            "tts": _fresh_clone_live_tts_bootstrap_config(provider_slug),
                         },
+                        env_overrides=env_overrides,
                         existing_repo_root=resume_clone_root or None,
                         preserve_clone_root=partial_mode,
                     ) as app_server:
@@ -602,6 +654,7 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
                                 last_status="running",
                                 failed_stage="",
                                 failure_reason="",
+                                tts_provider=provider_slug,
                             )
                         checkpoint = _load_partial_checkpoint(app_server.repo_root) if partial_mode else {}
                         completed_stages = set(str(item) for item in (checkpoint.get("completed_stages") or []))
@@ -656,6 +709,7 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
                                         book_path=book_path,
                                         script_llm_base_url=lm_base_url,
                                         script_llm_model_name=selected_model,
+                                        tts_provider=provider_slug,
                                         tts_mode="local",
                                         tts_parallel_workers=1,
                                         script_workflow_inactivity_seconds=180.0,
@@ -696,6 +750,7 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
                                         page=page,
                                         voice_server_base_url=lm_base_url,
                                         voice_model_name=selected_model,
+                                        tts_provider=provider_slug,
                                         required_speakers=REQUIRED_LIVE_SPEAKERS,
                                         min_total_speakers=3,
                                         retry_partial_failures_once=True,
@@ -794,6 +849,7 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
                                 final_audio = _persist_final_mp3_artifact(
                                     final_audio=dict(final_audio or {}),
                                     selected_model=selected_model,
+                                    tts_provider=provider_slug,
                                 )
                                 retained_mp3_path = str(final_audio.get("path") or "").strip()
                                 successful_run = True
@@ -824,6 +880,7 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
                                         last_status="fail",
                                         failed_stage=current_stage,
                                         failure_reason=str(exc),
+                                        tts_provider=provider_slug,
                                     )
 
                                 script_logs = ""
@@ -879,6 +936,33 @@ def test_fresh_clone_live_full_project_flow_real_local_backends(request):
         _cleanup_live_run_artifacts_after_success(
             clone_root=successful_clone_root,
             checkpoint_path=successful_checkpoint_path,
+            tts_provider=provider_slug,
         )
         if retained_mp3_path:
             print(f"[e2e-cleanup] retained final MP3: {retained_mp3_path}", flush=True)
+
+
+@pytest.mark.fresh_clone_live_e2e
+def test_fresh_clone_live_full_project_flow_real_qwen3_local_backend(request):
+    _run_fresh_clone_live_full_project_flow_real_local_backends(request, tts_provider="qwen3")
+
+
+@pytest.mark.fresh_clone_live_e2e
+def test_fresh_clone_live_full_project_flow_real_voxcpm2_local_backend(request):
+    pytest.importorskip("voxcpm")
+    local_model_path = TTSEngine._resolve_local_model_path(
+        VOXCPM2_MODEL_ID,
+        required_files=(
+            "model.safetensors",
+            ("audiovae.safetensors", "audiovae.pth"),
+        ),
+    )
+    if not local_model_path:
+        pytest.skip(
+            f"VoxCPM2 weights are not present in the local Hugging Face cache for {VOXCPM2_MODEL_ID}."
+        )
+    _run_fresh_clone_live_full_project_flow_real_local_backends(
+        request,
+        tts_provider="voxcpm2",
+        env_overrides={"THREADSPEAK_DISABLE_MODEL_DOWNLOADS": "1"},
+    )

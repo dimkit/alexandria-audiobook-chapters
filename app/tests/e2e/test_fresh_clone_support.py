@@ -8,6 +8,7 @@ from ._stage_ui_helpers import (
     SOURCE_REPO_DIR,
     _copy_repo_git_metadata_and_tracked_files,
     _fresh_clone_install_commands,
+    _fresh_clone_live_tts_bootstrap_config,
     _pid_is_alive,
     _reset_repo_copy_to_ref,
 )
@@ -48,6 +49,12 @@ class FreshCloneSupportTests(unittest.TestCase):
     def test_fresh_clone_install_commands_match_platform_family(self):
         linux_commands = _fresh_clone_install_commands("python", host_platform="linux", host_arch="x86_64")
         darwin_commands = _fresh_clone_install_commands("python", host_platform="darwin", host_arch="arm64")
+        voxcpm2_commands = _fresh_clone_install_commands(
+            "python",
+            host_platform="darwin",
+            host_arch="arm64",
+            tts_provider="voxcpm2",
+        )
 
         self.assertIn(["python", "-m", "pip", "install", "qwen-tts==0.1.1"], linux_commands)
         self.assertNotIn(["python", "-m", "pip", "install", "qwen-tts==0.1.1"], darwin_commands)
@@ -55,6 +62,33 @@ class FreshCloneSupportTests(unittest.TestCase):
             ["python", "-m", "pip", "install", "mlx-audio==0.4.2", "sentencepiece", "tiktoken"],
             darwin_commands,
         )
+        windows_qwen_commands = _fresh_clone_install_commands("python", host_platform="win32", host_arch="x64")
+        windows_voxcpm2_commands = _fresh_clone_install_commands(
+            "python",
+            host_platform="win32",
+            host_arch="x64",
+            tts_provider="voxcpm2",
+        )
+        self.assertIn(["python", "-m", "pip", "install", "qwen-tts==0.1.1"], windows_qwen_commands)
+        self.assertIn(["python", "-m", "pip", "install", "voxcpm"], windows_voxcpm2_commands)
+        self.assertIn(["python", "-m", "pip", "install", "voxcpm"], voxcpm2_commands)
+        self.assertNotIn(
+            ["python", "-m", "pip", "install", "mlx-audio==0.4.2", "sentencepiece", "tiktoken"],
+            voxcpm2_commands,
+        )
+
+    def test_live_tts_bootstrap_config_hardcodes_requested_provider(self):
+        qwen_config = _fresh_clone_live_tts_bootstrap_config("qwen3")
+        voxcpm_config = _fresh_clone_live_tts_bootstrap_config("voxcpm2")
+
+        self.assertEqual(qwen_config["provider"], "qwen3")
+        self.assertEqual(qwen_config["mode"], "local")
+        self.assertEqual(qwen_config["local_backend"], "auto")
+        self.assertEqual(voxcpm_config["provider"], "voxcpm2")
+        self.assertEqual(voxcpm_config["mode"], "local")
+        self.assertEqual(voxcpm_config["parallel_workers"], 1)
+        self.assertEqual(voxcpm_config["voxcpm_model_id"], "openbmb/VoxCPM2")
+        self.assertFalse(voxcpm_config["voxcpm_optimize"])
 
     def test_pid_is_alive_treats_windows_invalid_parameter_as_dead(self):
         error = OSError(87, "The parameter is incorrect")

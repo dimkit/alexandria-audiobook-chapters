@@ -152,6 +152,7 @@ def test_simulator_resources_cover_llm_and_local_qwen_paths():
                         "llm_workers": 1,
                     },
                     "tts": {
+                        "provider": "qwen3",
                         "mode": "local",
                         "local_backend": "qwen",
                         "url": "http://127.0.0.1:7860",

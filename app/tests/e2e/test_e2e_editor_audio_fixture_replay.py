@@ -280,6 +280,7 @@ def test_editor_audio_fixture_replay():
                         "llm_workers": 1,
                     },
                     "tts": {
+                        "provider": "qwen3",
                         "mode": "local",
                         "local_backend": "qwen",
                         "device": "cpu",
@@ -331,6 +332,7 @@ def test_editor_audio_fixture_replay():
                         "llm_workers": 1,
                     },
                     "tts": {
+                        "provider": "qwen3",
                         "mode": "local",
                         "local_backend": "qwen",
                         "device": "cpu",

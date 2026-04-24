@@ -434,9 +434,11 @@ def _fresh_clone_install_commands(
             "python-multipart",
         ],
     ]
-    if tts_provider != "qwen3":
+    if tts_provider not in {"qwen3", "voxcpm2"}:
         raise ValueError(f"Unsupported fresh-clone TTS provider: {tts_provider}")
-    if current_platform == "darwin" and current_arch == "arm64":
+    if tts_provider == "voxcpm2":
+        commands.append([python_executable, "-m", "pip", "install", "voxcpm"])
+    elif current_platform == "darwin" and current_arch == "arm64":
         commands.extend([
             [python_executable, "-m", "pip", "uninstall", "-y", "qwen-tts"],
             [python_executable, "-m", "pip", "install", "mlx-audio==0.4.2", "sentencepiece", "tiktoken"],
@@ -449,6 +451,33 @@ def _fresh_clone_install_commands(
         "import fastapi, openai, pytest, uvicorn, pydantic, docx, numpy, pydub, soundfile, librosa; print('Dependency check OK')",
     ])
     return commands
+
+
+def _fresh_clone_live_tts_bootstrap_config(tts_provider: str = "qwen3") -> dict:
+    provider = str(tts_provider or "qwen3").strip().lower()
+    if provider not in {"qwen3", "voxcpm2"}:
+        raise ValueError(f"Unsupported live fresh-clone TTS provider: {tts_provider}")
+    config = {
+        "provider": provider,
+        "mode": "local",
+        "local_backend": "auto",
+        "device": "auto",
+        "parallel_workers": 1,
+    }
+    if provider == "voxcpm2":
+        config.update(
+            {
+                "voxcpm_model_id": "openbmb/VoxCPM2",
+                "voxcpm_cfg_value": 1.6,
+                "voxcpm_inference_timesteps": 4,
+                "voxcpm_normalize": False,
+                "voxcpm_load_denoiser": False,
+                "voxcpm_denoise_reference": False,
+                "voxcpm_optimize": False,
+                "script_max_length": 240,
+            }
+        )
+    return config
 
 
 def _bootstrap_clone_app_env(
@@ -501,10 +530,23 @@ def _write_json(path: str, payload: dict) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
+def _normalize_qwen_tts_provider(payload: dict | None) -> None:
+    if not isinstance(payload, dict):
+        return
+    tts = payload.get("tts")
+    if not isinstance(tts, dict):
+        return
+    provider = str(tts.get("provider") or "").strip()
+    local_backend = str(tts.get("local_backend") or "").strip().lower()
+    if not provider and local_backend == "qwen":
+        tts["provider"] = "qwen3"
+
+
 def _seed_clone_config_values(app_dir: str, values_patch: dict | None) -> None:
     if not values_patch:
         return
 
+    _normalize_qwen_tts_provider(values_patch)
     config_path = os.path.join(app_dir, "config.json")
     config_payload = _read_json(config_path) if os.path.exists(config_path) else {}
     _deep_update(config_payload, values_patch)
@@ -612,6 +654,7 @@ class _IsolatedServer:
         # Always start isolated runs from an unlocked/no-file baseline.
         config_payload["current_file"] = None
         config_payload["generation_mode_locked"] = False
+        _normalize_qwen_tts_provider(self._config_patch)
         _deep_update(config_payload, self._config_patch)
         _write_json(config_path, config_payload)
 
@@ -2069,6 +2112,7 @@ def _switch_llm_via_setup_ui(
     *,
     llm_base_url: str,
     llm_model_name: str,
+    tts_provider: str | None = None,
     tts_mode: str | None = None,
     tts_parallel_workers: int | None = None,
 ) -> None:
@@ -2081,6 +2125,7 @@ def _switch_llm_via_setup_ui(
                 const llmUrl = document.querySelector('#llm-url');
                 const llmModel = document.querySelector('#llm-model');
                 const llmWorkers = document.querySelector('#llm-workers');
+                const ttsProvider = document.querySelector('#tts-provider');
                 const ttsMode = document.querySelector('#tts-mode');
                 const parallelWorkers = document.querySelector('#parallel-workers');
                 return {
@@ -2089,6 +2134,7 @@ def _switch_llm_via_setup_ui(
                     has_llm_url: !!llmUrl,
                     has_llm_model: !!llmModel,
                     has_llm_workers: !!llmWorkers,
+                    has_tts_provider: !!ttsProvider,
                     has_tts_mode: !!ttsMode,
                     has_parallel_workers: !!parallelWorkers,
                 };
@@ -2100,6 +2146,7 @@ def _switch_llm_via_setup_ui(
             snapshot.get("has_toggle")
             and snapshot.get("has_llm_url")
             and snapshot.get("has_llm_model")
+            and snapshot.get("has_tts_provider")
             and snapshot.get("has_tts_mode")
             and snapshot.get("has_parallel_workers")
         )
@@ -2110,6 +2157,7 @@ def _switch_llm_via_setup_ui(
     llm_url = page.locator("#llm-url")
     llm_model = page.locator("#llm-model")
     llm_workers = page.locator("#llm-workers")
+    tts_provider_locator = page.locator("#tts-provider")
     tts_mode_locator = page.locator("#tts-mode")
     parallel_workers_locator = page.locator("#parallel-workers")
 
@@ -2127,6 +2175,8 @@ def _switch_llm_via_setup_ui(
         llm_model.blur()
         llm_workers.fill("1")
         llm_workers.blur()
+        if tts_provider is not None:
+            tts_provider_locator.select_option(tts_provider)
         if tts_mode is not None:
             tts_mode_locator.select_option(tts_mode)
         if tts_parallel_workers is not None:
@@ -2744,6 +2794,7 @@ def _run_stage1_to_voices_tab(
     book_path: str,
     script_llm_base_url: str | None = None,
     script_llm_model_name: str | None = None,
+    tts_provider: str | None = None,
     tts_mode: str | None = None,
     tts_parallel_workers: int | None = None,
     script_workflow_inactivity_seconds: float = WATCHDOG_IDLE_SECONDS,
@@ -2764,6 +2815,7 @@ def _run_stage1_to_voices_tab(
             page,
             llm_base_url=script_llm_base_url,
             llm_model_name=script_llm_model_name,
+            tts_provider=tts_provider,
             tts_mode=tts_mode,
             tts_parallel_workers=tts_parallel_workers,
         )
@@ -2932,6 +2984,7 @@ def _run_stage2_voices_flow_relaxed_live(
     page,
     voice_server_base_url: str,
     voice_model_name: str,
+    tts_provider: str | None = None,
     required_speakers: set[str] | None = None,
     min_total_speakers: int = 4,
     retry_partial_failures_once: bool = False,
@@ -2950,6 +3003,7 @@ def _run_stage2_voices_flow_relaxed_live(
         page,
         llm_base_url=voice_server_base_url,
         llm_model_name=voice_model_name,
+        tts_provider=tts_provider,
     )
 
     page.locator('.nav-link[data-tab="voices"]').click()

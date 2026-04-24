@@ -10,6 +10,7 @@ import wave
 import numpy as np
 
 from tts import TTSEngine
+from tts_providers.voxcpm2 import VoxCPM2AudioProvider
 
 
 class NormalizeExternalUrlTests(unittest.TestCase):
@@ -86,6 +87,44 @@ class NormalizeExternalUrlTests(unittest.TestCase):
 
         self.assertIn("THREADSPEAK_DISABLE_MODEL_DOWNLOADS", str(raised.exception))
         fake_model_cls.from_pretrained.assert_not_called()
+
+    def test_resolve_local_model_path_skips_incomplete_required_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            cache_root = os.path.join(temp_root, "hub")
+            incomplete = os.path.join(
+                cache_root,
+                "models--openbmb--VoxCPM2",
+                "snapshots",
+                "zzz-incomplete",
+            )
+            complete = os.path.join(
+                cache_root,
+                "models--openbmb--VoxCPM2",
+                "snapshots",
+                "aaa-complete",
+            )
+            os.makedirs(incomplete, exist_ok=True)
+            os.makedirs(complete, exist_ok=True)
+            for path in (
+                os.path.join(incomplete, "config.json"),
+                os.path.join(complete, "config.json"),
+                os.path.join(complete, "model.safetensors"),
+                os.path.join(complete, "audiovae.pth"),
+            ):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("{}")
+
+            with mock.patch("huggingface_hub.try_to_load_from_cache", return_value=os.path.join(incomplete, "config.json")), \
+                 mock.patch.dict(os.environ, {"HUGGINGFACE_HUB_CACHE": cache_root}, clear=False):
+                resolved = TTSEngine._resolve_local_model_path(
+                    "openbmb/VoxCPM2",
+                    required_files=(
+                        "model.safetensors",
+                        ("audiovae.safetensors", "audiovae.pth"),
+                    ),
+                )
+
+        self.assertEqual(resolved, complete)
 
     def test_write_base64_audio(self):
         payload = base64.b64encode(b"RIFFfakewav").decode("ascii")
@@ -210,6 +249,248 @@ class ProviderDelegationTests(unittest.TestCase):
         self.assertEqual(engine.provider_name, "qwen3")
         self.assertEqual(engine.mode, "local")
         self.assertEqual(engine.local_backend, "qwen")
+
+    @mock.patch("tts_providers.voxcpm2.VoxCPM2AudioProvider")
+    def test_engine_delegates_generation_calls_to_voxcpm2_provider(self, mock_provider_cls):
+        provider = mock.Mock()
+        provider.generate_voice.return_value = True
+        provider.generate_batch.return_value = {"completed": ["uid-1"], "failed": []}
+        provider.generate_voice_design.return_value = ("/tmp/sample.wav", 48000)
+        provider.mode = "local"
+        provider.local_backend = "voxcpm2"
+        mock_provider_cls.return_value = provider
+
+        engine = TTSEngine({"tts": {"mode": "local", "provider": "voxcpm2"}})
+
+        self.assertTrue(engine.generate_voice("Hello", "calm", "Aerial", {"Aerial": {"type": "custom"}}, "/tmp/out.wav"))
+        self.assertEqual(
+            engine.generate_batch([{"index": "uid-1"}], {"Aerial": {"type": "custom"}}, "/tmp", batch_seed=7),
+            {"completed": ["uid-1"], "failed": []},
+        )
+        self.assertEqual(
+            engine.generate_voice_design("calm voice", "Hello there"),
+            ("/tmp/sample.wav", 48000),
+        )
+        provider.generate_voice.assert_called_once()
+        provider.generate_batch.assert_called_once()
+        provider.generate_voice_design.assert_called_once()
+        self.assertEqual(engine.provider_name, "voxcpm2")
+        self.assertEqual(engine.mode, "local")
+        self.assertEqual(engine.local_backend, "voxcpm2")
+
+    def test_engine_rejects_unknown_tts_provider(self):
+        with self.assertRaises(ValueError):
+            TTSEngine({"tts": {"mode": "local", "provider": "not-a-provider"}})
+
+    @mock.patch("tts.py_platform.system", return_value="Darwin")
+    def test_engine_clamps_voxcpm2_runtime_settings_and_disables_mac_optimize(self, _mock_system):
+        engine = TTSEngine(
+            {
+                "tts": {
+                    "mode": "local",
+                    "provider": "voxcpm2",
+                    "voxcpm_cfg_value": 9.0,
+                    "voxcpm_inference_timesteps": 100,
+                    "voxcpm_optimize": True,
+                }
+            }
+        )
+
+        self.assertEqual(engine._voxcpm_cfg_value, 3.0)
+        self.assertEqual(engine._voxcpm_inference_timesteps, 30)
+        self.assertFalse(engine._voxcpm_optimize)
+
+    @mock.patch("tts.py_platform.system", return_value="Windows")
+    def test_engine_allows_voxcpm2_optimize_setting_on_windows(self, _mock_system):
+        engine = TTSEngine(
+            {
+                "tts": {
+                    "mode": "local",
+                    "provider": "voxcpm2",
+                    "voxcpm_optimize": True,
+                }
+            }
+        )
+
+        self.assertTrue(engine._voxcpm_optimize)
+
+
+class VoxCPM2ProviderTests(unittest.TestCase):
+    def test_format_control_text_prefixes_style(self):
+        self.assertEqual(
+            VoxCPM2AudioProvider.format_control_text("Hello.", "warm, calm"),
+            "(warm, calm)Hello.",
+        )
+        self.assertEqual(
+            VoxCPM2AudioProvider.format_control_text("Hello.", ""),
+            "Hello.",
+        )
+
+    def test_voxcpm2_model_loading_prefers_local_cache(self):
+        fake_model = mock.Mock()
+        fake_model.tts_model.sample_rate = 48000
+        fake_voxcpm_cls = mock.Mock()
+        fake_voxcpm_cls.from_pretrained.return_value = fake_model
+        fake_module = types.ModuleType("voxcpm")
+        fake_module.VoxCPM = fake_voxcpm_cls
+
+        engine = TTSEngine({"tts": {"mode": "local", "provider": "voxcpm2"}})
+        provider = engine._provider
+
+        with mock.patch.dict(sys.modules, {"voxcpm": fake_module}), \
+             mock.patch.object(engine, "_resolve_local_model_path", return_value="/cache/openbmb/VoxCPM2"), \
+             mock.patch.object(provider, "_resolve_device", return_value="mps"):
+            loaded = provider._init_model()
+
+        self.assertIs(loaded, fake_model)
+        fake_voxcpm_cls.from_pretrained.assert_called_once_with(
+            "/cache/openbmb/VoxCPM2",
+            load_denoiser=False,
+            optimize=False,
+        )
+
+    def test_voxcpm2_model_loading_respects_disabled_downloads(self):
+        fake_module = types.ModuleType("voxcpm")
+        fake_module.VoxCPM = mock.Mock()
+        engine = TTSEngine({"tts": {"mode": "local", "provider": "voxcpm2"}})
+        provider = engine._provider
+
+        with mock.patch.dict(sys.modules, {"voxcpm": fake_module}), \
+             mock.patch.object(engine, "_resolve_local_model_path", return_value=None), \
+             mock.patch.dict(os.environ, {"THREADSPEAK_DISABLE_MODEL_DOWNLOADS": "1"}, clear=False):
+            with self.assertRaises(RuntimeError) as raised:
+                provider._init_model()
+
+        self.assertIn("THREADSPEAK_DISABLE_MODEL_DOWNLOADS", str(raised.exception))
+        fake_module.VoxCPM.from_pretrained.assert_not_called()
+
+    @mock.patch.object(TTSEngine, "_host_platform", return_value=("windows", "amd64"))
+    def test_voxcpm2_windows_device_auto_prefers_cuda_when_available(self, _mock_platform):
+        engine = TTSEngine({"tts": {"mode": "local", "provider": "voxcpm2"}})
+        provider = engine._provider
+        fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True))
+
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            self.assertEqual(provider._resolve_device(), "cuda")
+
+    @mock.patch.object(TTSEngine, "_host_platform", return_value=("windows", "amd64"))
+    def test_voxcpm2_windows_device_auto_falls_back_to_cpu_without_cuda(self, _mock_platform):
+        engine = TTSEngine({"tts": {"mode": "local", "provider": "voxcpm2"}})
+        provider = engine._provider
+        fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
+
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            self.assertEqual(provider._resolve_device(), "cpu")
+
+    def test_voxcpm2_clone_generation_passes_reference_and_style_without_prompt_text(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            clone_dir = os.path.join(temp_root, "clone_voices")
+            os.makedirs(clone_dir, exist_ok=True)
+            ref_path = os.path.join(clone_dir, "sample.wav")
+            with wave.open(ref_path, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(24000)
+                wav_file.writeframes(b"\x00\x00" * 240)
+
+            output_path = os.path.join(temp_root, "out.wav")
+            fake_model = mock.Mock()
+            fake_model.tts_model.sample_rate = 48000
+            fake_model.generate.return_value = np.zeros(480, dtype=np.float32)
+
+            engine = TTSEngine(
+                {
+                    "tts": {
+                        "mode": "local",
+                        "provider": "voxcpm2",
+                        "voxcpm_cfg_value": 2.25,
+                        "voxcpm_inference_timesteps": 12,
+                    }
+                },
+                project_root=temp_root,
+            )
+            provider = engine._provider
+            provider._model = fake_model
+
+            ok = provider.generate_voice(
+                "Hello from the book.",
+                "urgent and afraid",
+                "Aerial",
+                {
+                    "Aerial": {
+                        "type": "clone",
+                        "ref_audio": "clone_voices/sample.wav",
+                        "description": "young woman",
+                        "default_style": "warm",
+                    }
+                },
+                output_path,
+            )
+
+            self.assertTrue(ok)
+            self.assertTrue(os.path.exists(output_path))
+            fake_model.generate.assert_called_once()
+            kwargs = fake_model.generate.call_args.kwargs
+            self.assertEqual(kwargs["text"], "(young woman, warm, urgent and afraid)Hello from the book.")
+            self.assertEqual(kwargs["reference_wav_path"], ref_path)
+            self.assertEqual(kwargs["cfg_value"], 2.25)
+            self.assertEqual(kwargs["inference_timesteps"], 12)
+            self.assertNotIn("prompt_text", kwargs)
+            self.assertNotIn("prompt_wav_path", kwargs)
+
+    def test_voxcpm2_design_audio_can_be_reused_for_style_guided_clone(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            fake_model = mock.Mock()
+            fake_model.tts_model.sample_rate = 48000
+            fake_model.generate.return_value = np.zeros(480, dtype=np.float32)
+
+            engine = TTSEngine(
+                {"tts": {"mode": "local", "provider": "voxcpm2"}},
+                project_root=temp_root,
+            )
+            provider = engine._provider
+            provider._model = fake_model
+
+            preview_path = os.path.join(temp_root, "designed-preview.wav")
+            with mock.patch.object(engine, "_new_voice_design_preview_path", return_value=preview_path):
+                generated_path, sample_rate = provider.generate_voice_design(
+                    "warm narrator voice",
+                    "This is the reusable reference line.",
+                )
+
+            clone_output = os.path.join(temp_root, "clone-output.wav")
+            ok = provider.generate_voice(
+                "Now read this with more urgency.",
+                "urgent, voice tight",
+                "NARRATOR",
+                {
+                    "NARRATOR": {
+                        "type": "clone",
+                        "ref_audio": preview_path,
+                        "description": "warm narrator voice",
+                    }
+                },
+                clone_output,
+            )
+
+            self.assertEqual(generated_path, preview_path)
+            self.assertEqual(sample_rate, 48000)
+            self.assertTrue(os.path.exists(preview_path))
+            self.assertTrue(ok)
+            self.assertTrue(os.path.exists(clone_output))
+            self.assertEqual(fake_model.generate.call_count, 2)
+            design_kwargs = fake_model.generate.call_args_list[0].kwargs
+            clone_kwargs = fake_model.generate.call_args_list[1].kwargs
+            self.assertEqual(
+                design_kwargs["text"],
+                "(warm narrator voice)This is the reusable reference line.",
+            )
+            self.assertNotIn("reference_wav_path", design_kwargs)
+            self.assertEqual(
+                clone_kwargs["text"],
+                "(warm narrator voice, urgent, voice tight)Now read this with more urgency.",
+            )
+            self.assertEqual(clone_kwargs["reference_wav_path"], preview_path)
 
 
 class LocalBackendResolutionTests(unittest.TestCase):

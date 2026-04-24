@@ -128,6 +128,11 @@ def _start_isolated_test_server():
             os.makedirs(prompt_dir, exist_ok=True)
             shutil.copy2(source, os.path.join(prompt_dir, filename))
 
+    default_config_path = os.path.join(temp_app_dir, "config.default.json")
+    local_config_path = os.path.join(temp_app_dir, "config.json")
+    if os.path.exists(default_config_path):
+        shutil.copy2(default_config_path, local_config_path)
+
     port = _find_free_port()
     env = os.environ.copy()
     env["PINOKIO_SHARE_LOCAL"] = "false"

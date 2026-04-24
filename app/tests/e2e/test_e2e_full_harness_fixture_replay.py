@@ -230,6 +230,7 @@ def test_full_harness_fixtures_replay():
                             "llm_workers": 1,
                         },
                         "tts": {
+                            "provider": "qwen3",
                             "mode": "local",
                             "local_backend": "qwen",
                             "device": "cpu",
@@ -269,6 +270,7 @@ def test_full_harness_fixtures_replay():
                             "llm_workers": 1,
                         },
                         "tts": {
+                            "provider": "qwen3",
                             "mode": "local",
                             "local_backend": "qwen",
                             "device": "cpu",

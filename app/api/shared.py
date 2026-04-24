@@ -13,7 +13,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from typing import List, Optional, Dict, Union, Literal
 import re
 import time
@@ -63,6 +63,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ThreadspeakUI")
 _LLM_CLIENT_FACTORY = LLMClientFactory()
 _LMSTUDIO_UNLOAD_TIMEOUT_SECONDS = 15
+QWEN3_SCRIPT_MAX_LENGTH_DEFAULT = 250
+VOXCPM2_SCRIPT_MAX_LENGTH_DEFAULT = 240
+VOXCPM2_CFG_VALUE_DEFAULT = 1.6
+VOXCPM2_CFG_VALUE_MIN = 1.0
+VOXCPM2_CFG_VALUE_MAX = 3.0
+VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT = 10
+VOXCPM2_INFERENCE_TIMESTEPS_MIN = 4
+VOXCPM2_INFERENCE_TIMESTEPS_MAX = 30
 
 app = FastAPI(title="Threadspeak Audiobook")
 
@@ -124,6 +132,26 @@ PROJECT_ARCHIVE_ALLOWED_DIRS = {
 }
 
 LAYOUT.ensure_base_dirs()
+
+
+def tts_script_max_length_default(provider: str | None) -> int:
+    return VOXCPM2_SCRIPT_MAX_LENGTH_DEFAULT if str(provider or "").strip().lower() == "voxcpm2" else QWEN3_SCRIPT_MAX_LENGTH_DEFAULT
+
+
+def clamp_voxcpm_cfg_value(value) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = VOXCPM2_CFG_VALUE_DEFAULT
+    return min(VOXCPM2_CFG_VALUE_MAX, max(VOXCPM2_CFG_VALUE_MIN, parsed))
+
+
+def clamp_voxcpm_inference_timesteps(value) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT
+    return min(VOXCPM2_INFERENCE_TIMESTEPS_MAX, max(VOXCPM2_INFERENCE_TIMESTEPS_MIN, parsed))
 
 _media_static_server_lock = threading.Lock()
 _media_static_server_process = None
@@ -939,7 +967,7 @@ class LLMConfig(BaseModel):
         return str(v or "").strip()
 
 class TTSConfig(BaseModel):
-    provider: Literal["qwen3"] = "qwen3"
+    provider: Literal["qwen3", "voxcpm2"] = "qwen3"
     mode: str = "local"  # "local" or "external"
     local_backend: str = "auto"  # local mode only: "auto", "qwen", "mlx"
     url: str = "http://127.0.0.1:7860"  # external mode only
@@ -956,7 +984,45 @@ class TTSConfig(BaseModel):
     sub_batch_max_chars: int = 3000  # max total chars per sub-batch (lower for less VRAM)
     sub_batch_max_items: int = 0  # hard cap on sequences per sub-batch (0 = auto from VRAM estimate)
     batch_group_by_type: bool = False  # group chunks by voice type for efficient batching
-    script_max_length: int = 250  # Max chars per chunk in Create Script (-1 = one chunk per sentence)
+    script_max_length: int = QWEN3_SCRIPT_MAX_LENGTH_DEFAULT  # Max chars per chunk in Create Script (-1 = one chunk per sentence)
+    voxcpm_model_id: str = "openbmb/VoxCPM2"
+    voxcpm_cfg_value: float = VOXCPM2_CFG_VALUE_DEFAULT
+    voxcpm_inference_timesteps: int = VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT
+    voxcpm_normalize: bool = False
+    voxcpm_load_denoiser: bool = False
+    voxcpm_denoise_reference: bool = False
+    voxcpm_optimize: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_provider_defaults(cls, values):
+        if not isinstance(values, dict):
+            return values
+        data = dict(values)
+        provider = data.get("provider", "qwen3")
+        if "script_max_length" in data and data.get("script_max_length") in (None, ""):
+            data["script_max_length"] = tts_script_max_length_default(provider)
+        if "voxcpm_cfg_value" in data and data.get("voxcpm_cfg_value") in (None, ""):
+            data["voxcpm_cfg_value"] = VOXCPM2_CFG_VALUE_DEFAULT
+        if "voxcpm_inference_timesteps" in data and data.get("voxcpm_inference_timesteps") in (None, ""):
+            data["voxcpm_inference_timesteps"] = VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT
+        return data
+
+    @model_validator(mode="after")
+    def apply_provider_script_max_length_default(self):
+        if "script_max_length" not in self.model_fields_set and self.provider == "voxcpm2":
+            object.__setattr__(self, "script_max_length", VOXCPM2_SCRIPT_MAX_LENGTH_DEFAULT)
+        return self
+
+    @field_validator("voxcpm_cfg_value", mode="before")
+    @classmethod
+    def clamp_voxcpm_cfg(cls, value):
+        return clamp_voxcpm_cfg_value(value)
+
+    @field_validator("voxcpm_inference_timesteps", mode="before")
+    @classmethod
+    def clamp_voxcpm_steps(cls, value):
+        return clamp_voxcpm_inference_timesteps(value)
 
 class GenerationConfig(BaseModel):
     chunk_size: int = 3000

@@ -1,5 +1,13 @@
         // --- Setup Tab ---
 
+        const TTS_PROVIDER_SCRIPT_MAX_LENGTH_DEFAULTS = {
+            qwen3: 250,
+            voxcpm2: 240
+        };
+        const VOXCPM2_CFG_VALUE_DEFAULT = 1.6;
+        const VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT = 10;
+        let _lastTTSProvider = 'qwen3';
+
         window.resetProject = async () => {
             const confirmed = await showConfirm('Reset the current project? This will delete the loaded source, generated script, detected characters, chunk audio, final audiobook files, and sanity/repair state. Global settings and prompt configuration will be kept.');
             if (!confirmed) return;
@@ -17,7 +25,25 @@
             const mode = document.getElementById('tts-mode').value;
             document.getElementById('tts-url-group').style.display = mode === 'external' ? '' : 'none';
             document.getElementById('tts-local-options').style.display = mode === 'local' ? '' : 'none';
+            toggleVoxCPM2Options();
             applyBatchSettingsVisibility();
+        }
+
+        function toggleVoxCPM2Options() {
+            const provider = document.getElementById('tts-provider')?.value || 'qwen3';
+            const options = document.getElementById('voxcpm2-options');
+            if (options) {
+                options.style.display = provider === 'voxcpm2' ? '' : 'none';
+            }
+            const optimizeGroup = document.getElementById('voxcpm-optimize-group');
+            const optimizeToggle = document.getElementById('voxcpm-optimize');
+            if (optimizeGroup) {
+                const hideOptimize = provider === 'voxcpm2' && isMacHostUI();
+                optimizeGroup.style.display = hideOptimize ? 'none' : '';
+                if (hideOptimize && optimizeToggle) {
+                    optimizeToggle.checked = false;
+                }
+            }
         }
 
         function isMacHostUI() {
@@ -65,6 +91,36 @@
         function parseFloatOrDefault(inputId, fallback) {
             const value = parseFloat(document.getElementById(inputId).value);
             return Number.isNaN(value) ? fallback : value;
+        }
+
+        function clampNumber(value, min, max, fallback) {
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed)) return fallback;
+            return Math.min(max, Math.max(min, parsed));
+        }
+
+        function getTTSScriptMaxLengthDefault(provider) {
+            const normalized = String(provider || 'qwen3').trim().toLowerCase();
+            return TTS_PROVIDER_SCRIPT_MAX_LENGTH_DEFAULTS[normalized] || TTS_PROVIDER_SCRIPT_MAX_LENGTH_DEFAULTS.qwen3;
+        }
+
+        function applyProviderScriptMaxLengthDefault(provider) {
+            const input = document.getElementById('script-max-length');
+            if (!input) return;
+            const nextProvider = String(provider || 'qwen3').trim().toLowerCase() || 'qwen3';
+            const previousDefault = getTTSScriptMaxLengthDefault(_lastTTSProvider);
+            const nextDefault = getTTSScriptMaxLengthDefault(nextProvider);
+            const current = parseInt(input.value, 10);
+            if (!Number.isInteger(current) || current === previousDefault) {
+                input.value = nextDefault;
+            }
+            _lastTTSProvider = nextProvider;
+        }
+
+        function handleTTSProviderChange() {
+            const provider = document.getElementById('tts-provider')?.value || 'qwen3';
+            applyProviderScriptMaxLengthDefault(provider);
+            toggleVoxCPM2Options();
         }
 
         let _llmToolCapabilityCache = null;
@@ -379,7 +435,9 @@
                     : 3;
                 document.getElementById('llm-model').value = config.llm.model_name;
                 document.getElementById('llm-workers').value = config.llm.llm_workers ?? 1;
-                document.getElementById('tts-provider').value = config.tts.provider || 'qwen3';
+                const ttsProvider = config.tts.provider || 'qwen3';
+                document.getElementById('tts-provider').value = ttsProvider;
+                _lastTTSProvider = ttsProvider;
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
                 document.getElementById('tts-language').value = config.tts.language || 'English';
@@ -404,7 +462,24 @@
                 if (config.tts.sub_batch_max_items != null) {
                     document.getElementById('sub-batch-max-items').value = config.tts.sub_batch_max_items;
                 }
-                document.getElementById('script-max-length').value = config.tts.script_max_length ?? 250;
+                document.getElementById('script-max-length').value = config.tts.script_max_length ?? getTTSScriptMaxLengthDefault(ttsProvider);
+                document.getElementById('voxcpm-model-id').value = config.tts.voxcpm_model_id || 'openbmb/VoxCPM2';
+                document.getElementById('voxcpm-cfg-value').value = clampNumber(
+                    config.tts.voxcpm_cfg_value,
+                    1,
+                    3,
+                    VOXCPM2_CFG_VALUE_DEFAULT
+                );
+                document.getElementById('voxcpm-inference-timesteps').value = clampNumber(
+                    config.tts.voxcpm_inference_timesteps,
+                    4,
+                    30,
+                    VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT
+                );
+                document.getElementById('voxcpm-normalize').checked = coerceConfigBool(config.tts.voxcpm_normalize, false);
+                document.getElementById('voxcpm-load-denoiser').checked = coerceConfigBool(config.tts.voxcpm_load_denoiser, false);
+                document.getElementById('voxcpm-denoise-reference').checked = coerceConfigBool(config.tts.voxcpm_denoise_reference, false);
+                document.getElementById('voxcpm-optimize').checked = coerceConfigBool(config.tts.voxcpm_optimize, false);
                 toggleTTSMode();
                 applyBatchSettingsVisibility();
 
@@ -674,8 +749,10 @@
             parallelWorkers = Math.max(1, parallelWorkers);
             const rawRetryAttempts = parseInt(document.getElementById('auto-regenerate-bad-clip-attempts').value, 10);
             const retryAttempts = Number.isInteger(rawRetryAttempts) && rawRetryAttempts > 0 ? rawRetryAttempts : 0;
+            const provider = document.getElementById('tts-provider').value || 'qwen3';
+            const scriptMaxLength = parseInt(document.getElementById('script-max-length').value, 10);
             return {
-                provider: document.getElementById('tts-provider').value || 'qwen3',
+                provider,
                 mode: document.getElementById('tts-mode').value,
                 local_backend: 'auto',
                 url: document.getElementById('tts-url').value,
@@ -692,7 +769,24 @@
                 sub_batch_ratio: parseFloat(document.getElementById('sub-batch-ratio').value) || 5,
                 sub_batch_max_chars: parseInt(document.getElementById('sub-batch-max-chars').value) || 3000,
                 sub_batch_max_items: parseInt(document.getElementById('sub-batch-max-items').value) || 0,
-                script_max_length: parseInt(document.getElementById('script-max-length').value) || 250
+                script_max_length: Number.isInteger(scriptMaxLength) ? scriptMaxLength : getTTSScriptMaxLengthDefault(provider),
+                voxcpm_model_id: document.getElementById('voxcpm-model-id').value || 'openbmb/VoxCPM2',
+                voxcpm_cfg_value: clampNumber(
+                    parseFloatOrDefault('voxcpm-cfg-value', VOXCPM2_CFG_VALUE_DEFAULT),
+                    1,
+                    3,
+                    VOXCPM2_CFG_VALUE_DEFAULT
+                ),
+                voxcpm_inference_timesteps: clampNumber(
+                    parseIntOrDefault('voxcpm-inference-timesteps', VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT),
+                    4,
+                    30,
+                    VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT
+                ),
+                voxcpm_normalize: document.getElementById('voxcpm-normalize').checked,
+                voxcpm_load_denoiser: document.getElementById('voxcpm-load-denoiser').checked,
+                voxcpm_denoise_reference: document.getElementById('voxcpm-denoise-reference').checked,
+                voxcpm_optimize: !isMacHostUI() && document.getElementById('voxcpm-optimize').checked
             };
         }
 
@@ -797,6 +891,10 @@
                 'sub-batch-ratio': 'tts', 'sub-batch-max-chars': 'tts',
                 'sub-batch-max-items': 'tts', 'auto-regenerate-bad-clips': 'tts',
                 'auto-regenerate-bad-clip-attempts': 'tts', 'script-max-length': 'tts',
+                'voxcpm-model-id': 'tts', 'voxcpm-cfg-value': 'tts',
+                'voxcpm-inference-timesteps': 'tts', 'voxcpm-normalize': 'tts',
+                'voxcpm-load-denoiser': 'tts', 'voxcpm-denoise-reference': 'tts',
+                'voxcpm-optimize': 'tts',
                 // Generation
                 'script-error-retry-attempts': 'generation', 'chunk-size': 'generation', 'max-tokens': 'generation',
                 'temperature': 'generation', 'top-p': 'generation', 'top-k': 'generation',
@@ -821,6 +919,9 @@
                 const isTextarea = el.tagName === 'TEXTAREA';
                 const isCheckbox = el.type === 'checkbox';
                 const isSelect = el.tagName === 'SELECT';
+                if (id === 'tts-provider') {
+                    el.addEventListener('change', handleTTSProviderChange);
+                }
                 if (isCheckbox || isSelect) {
                     el.addEventListener('change', () => _scheduleSetupSave(section, 0));
                 } else if (isTextarea) {

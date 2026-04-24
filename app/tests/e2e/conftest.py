@@ -43,6 +43,10 @@ def pytest_configure(config):
         "markers",
         f"fresh_clone_live_narrated_e2e: requires {REAL_GENERATION_BACKEND_E2E_FLAG} because it runs a heavy fresh-clone narrated full-project flow against live local LLM/TTS backends",
     )
+    config.addinivalue_line(
+        "markers",
+        f"voxcpm2_live_e2e: requires {REAL_GENERATION_BACKEND_E2E_FLAG} because it loads the real local VoxCPM2 TTS backend and generates audio",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -52,6 +56,7 @@ def pytest_collection_modifyitems(config, items):
     fresh_clone_live_skip = pytest.mark.skip(reason=f"requires {REAL_GENERATION_BACKEND_E2E_FLAG}")
     lmstudio_live_skip = pytest.mark.skip(reason=f"requires {REAL_GENERATION_BACKEND_E2E_FLAG}")
     fresh_clone_live_narrated_skip = pytest.mark.skip(reason=f"requires {REAL_GENERATION_BACKEND_E2E_FLAG}")
+    voxcpm2_live_skip = pytest.mark.skip(reason=f"requires {REAL_GENERATION_BACKEND_E2E_FLAG}")
     for item in items:
         if "fresh_clone_e2e" in item.keywords and not run_fresh_clone:
             item.add_marker(fresh_clone_skip)
@@ -61,3 +66,5 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(lmstudio_live_skip)
         if "fresh_clone_live_narrated_e2e" in item.keywords and not run_real_generation_backend:
             item.add_marker(fresh_clone_live_narrated_skip)
+        if "voxcpm2_live_e2e" in item.keywords and not run_real_generation_backend:
+            item.add_marker(voxcpm2_live_skip)

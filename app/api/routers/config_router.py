@@ -378,7 +378,14 @@ async def get_config():
             "sub_batch_ratio": 5.0,
             "sub_batch_max_chars": 3000,
             "sub_batch_max_items": 0,
-            "script_max_length": 250,
+            "script_max_length": QWEN3_SCRIPT_MAX_LENGTH_DEFAULT,
+            "voxcpm_model_id": "openbmb/VoxCPM2",
+            "voxcpm_cfg_value": VOXCPM2_CFG_VALUE_DEFAULT,
+            "voxcpm_inference_timesteps": VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT,
+            "voxcpm_normalize": False,
+            "voxcpm_load_denoiser": False,
+            "voxcpm_denoise_reference": False,
+            "voxcpm_optimize": False,
             "auto_regenerate_bad_clips": True,
             "auto_regenerate_bad_clip_attempts": 3
         },
@@ -536,12 +543,28 @@ async def get_config():
         config["tts"] = dict(default_config["tts"])
         config_changed = True
     else:
+        script_max_length_was_missing = config["tts"].get("script_max_length") in (None, "")
         for key, value in default_config["tts"].items():
             if config["tts"].get(key) is None:
                 config["tts"][key] = value
                 config_changed = True
         if not config["tts"].get("local_backend"):
             config["tts"]["local_backend"] = "auto"
+            config_changed = True
+        provider = str(config["tts"].get("provider") or "qwen3").strip().lower()
+        if script_max_length_was_missing:
+            config["tts"]["script_max_length"] = tts_script_max_length_default(provider)
+            config_changed = True
+        clamped_cfg = clamp_voxcpm_cfg_value(config["tts"].get("voxcpm_cfg_value"))
+        if config["tts"].get("voxcpm_cfg_value") != clamped_cfg:
+            config["tts"]["voxcpm_cfg_value"] = clamped_cfg
+            config_changed = True
+        clamped_steps = clamp_voxcpm_inference_timesteps(config["tts"].get("voxcpm_inference_timesteps"))
+        if config["tts"].get("voxcpm_inference_timesteps") != clamped_steps:
+            config["tts"]["voxcpm_inference_timesteps"] = clamped_steps
+            config_changed = True
+        if sys.platform == "darwin" and config["tts"].get("voxcpm_optimize") is not False:
+            config["tts"]["voxcpm_optimize"] = False
             config_changed = True
 
     if "llm" not in config or not isinstance(config.get("llm"), dict):
@@ -702,7 +725,9 @@ async def save_setup_config(update: SetupConfigUpdate):
         }
 
     if update.tts is not None:
-        new_tts = update.tts.model_dump()
+        new_tts = update.tts.model_dump(exclude_unset=True)
+        if sys.platform == "darwin":
+            new_tts["voxcpm_optimize"] = False
         old_tts = existing_config.get("tts") or {}
         hidden_local_backend = str(old_tts.get("local_backend") or "").strip()
         # The Setup tab does not expose local_backend yet, so keep the stored value

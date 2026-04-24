@@ -14,17 +14,46 @@ const verifyTestEnv = [
 ]
 
 function providerRuntimePackages(platform, arch, provider = DEFAULT_TTS_PROVIDER) {
-  if (provider !== "qwen3") {
+  if (!["qwen3", "voxcpm2"].includes(provider)) {
     throw new Error(`Unsupported TTS provider during install: ${provider}`)
   }
-  if (platform === "darwin" && arch === "arm64") {
+  if (platform === "win32") {
+    if (provider === "voxcpm2") {
+      return ["uv pip install voxcpm"]
+    }
     return [
+      "uv pip install qwen-tts==0.1.1",
+      "uv pip install voxcpm",
+    ]
+  }
+  if (platform === "darwin" && arch === "arm64") {
+    const packages = [
       "uv pip uninstall qwen-tts",
       "uv pip install mlx-audio==0.4.2",
       "uv pip install sentencepiece tiktoken",
     ]
+    if (provider === "voxcpm2" || provider === DEFAULT_TTS_PROVIDER) {
+      packages.push("uv pip install voxcpm")
+    }
+    return packages
+  }
+  if (provider === "voxcpm2") {
+    return ["uv pip install voxcpm"]
   }
   return ["uv pip install qwen-tts==0.1.1"]
+}
+
+function providerVerifyCommands(platform, arch, provider = DEFAULT_TTS_PROVIDER) {
+  if (platform === "win32" && (provider === "voxcpm2" || provider === DEFAULT_TTS_PROVIDER)) {
+    return ["python -c \"from voxcpm import VoxCPM; print('VoxCPM dependency check OK')\""]
+  }
+  if (platform === "darwin" && arch === "arm64" && (provider === "voxcpm2" || provider === DEFAULT_TTS_PROVIDER)) {
+    return ["python -c \"from voxcpm import VoxCPM; print('VoxCPM dependency check OK')\""]
+  }
+  if (provider === "voxcpm2") {
+    return ["python -c \"from voxcpm import VoxCPM; print('VoxCPM dependency check OK')\""]
+  }
+  return []
 }
 
 module.exports = {
@@ -74,11 +103,26 @@ module.exports = {
         ...basePackages,
         ...coreRuntimePackages,
         ...providerRuntimePackages("darwin", "arm64"),
+        ...providerVerifyCommands("darwin", "arm64"),
         ...verifyTestEnv,
       ]
     }
   }, {
-    when: "{{!(platform === 'darwin' && arch === 'arm64')}}",
+    when: "{{platform === 'win32'}}",
+    method: "shell.run",
+    params: {
+      venv: "env",
+      path: "app",
+      message: [
+        ...basePackages,
+        ...coreRuntimePackages,
+        ...providerRuntimePackages("win32", "x64"),
+        ...providerVerifyCommands("win32", "x64"),
+        ...verifyTestEnv,
+      ]
+    }
+  }, {
+    when: "{{platform === 'linux' || (platform === 'darwin' && arch !== 'arm64')}}",
     method: "shell.run",
     params: {
       venv: "env",
@@ -87,6 +131,7 @@ module.exports = {
         ...basePackages,
         ...coreRuntimePackages,
         ...providerRuntimePackages("linux", "x64"),
+        ...providerVerifyCommands("linux", "x64"),
         ...verifyTestEnv,
       ]
     }

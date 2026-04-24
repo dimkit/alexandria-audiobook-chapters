@@ -169,8 +169,9 @@
                         <div class="row mb-3">
                             <div class="col-md-2">
                                 <label class="form-label" title="Audio generation backend">Audio Provider</label>
-                                <select class="form-select" id="tts-provider" title="Audio generation backend">
+                                <select class="form-select" id="tts-provider" onchange="handleTTSProviderChange()" title="Audio generation backend">
                                     <option value="qwen3">QWEN3</option>
+                                    <option value="voxcpm2">VoxCPM2</option>
                                 </select>
                             </div>
                             <div class="col-md-2">
@@ -252,6 +253,44 @@
                             <div class="col-md-2" id="sub-batch-max-chars-group">
                                 <label class="form-label" title="VRAM safety limit per sub-batch. Reduce if you encounter HIP OOM errors or crashes (especially with long reference audio)">Max Chars/Batch</label>
                                 <input type="number" class="form-control" id="sub-batch-max-chars" value="3000" min="500" step="500" title="VRAM safety limit per sub-batch. Reduce if you encounter HIP OOM errors or crashes (especially with long reference audio)">
+                            </div>
+                        </div>
+                        <div class="row mb-3" id="voxcpm2-options" style="display:none;">
+                            <div class="col-md-4">
+                                <label class="form-label" title="Hugging Face model id or local model path for VoxCPM2">VoxCPM2 Model</label>
+                                <input type="text" class="form-control" id="voxcpm-model-id" value="openbmb/VoxCPM2" title="Hugging Face model id or local model path for VoxCPM2">
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label" title="Classifier-free guidance strength. Higher values follow style text more strongly.">CFG Value</label>
+                                <input type="number" class="form-control" id="voxcpm-cfg-value" value="1.6" min="1" max="3" step="0.1" title="Classifier-free guidance strength. Higher values follow style text more strongly.">
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label" title="VoxCPM2 diffusion inference steps. Higher can improve quality at slower speed.">Inference Steps</label>
+                                <input type="number" class="form-control" id="voxcpm-inference-timesteps" value="10" min="4" max="30" step="1" title="VoxCPM2 diffusion inference steps. Higher can improve quality at slower speed.">
+                            </div>
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="voxcpm-normalize" title="Normalize generated VoxCPM2 audio output">
+                                    <label class="form-check-label" for="voxcpm-normalize" title="Normalize generated VoxCPM2 audio output">Normalize</label>
+                                </div>
+                            </div>
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="voxcpm-load-denoiser" title="Load VoxCPM2's optional denoiser model at startup">
+                                    <label class="form-check-label" for="voxcpm-load-denoiser" title="Load VoxCPM2's optional denoiser model at startup">Load Denoiser</label>
+                                </div>
+                            </div>
+                            <div class="col-md-2">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="voxcpm-denoise-reference" title="Apply VoxCPM2 denoising to reference audio during clone generation">
+                                    <label class="form-check-label" for="voxcpm-denoise-reference" title="Apply VoxCPM2 denoising to reference audio during clone generation">Denoise Reference</label>
+                                </div>
+                            </div>
+                            <div class="col-md-2" id="voxcpm-optimize-group">
+                                <div class="form-check form-switch mt-4">
+                                    <input class="form-check-input" type="checkbox" id="voxcpm-optimize" title="Enable VoxCPM2 optimization. This is intended for CUDA and remains off by default on macOS.">
+                                    <label class="form-check-label" for="voxcpm-optimize" title="Enable VoxCPM2 optimization. This is intended for CUDA and remains off by default on macOS.">Optimize</label>
+                                </div>
                             </div>
                         </div>
 

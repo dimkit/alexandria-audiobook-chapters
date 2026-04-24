@@ -32,6 +32,54 @@ def test_emotions_fragment_contains_expected_controls():
     assert "emotionsRender(true)" in fragment
 
 
+def test_setup_fragment_exposes_voxcpm2_provider_option():
+    fragment = (ROOT / "app/static/fragments/setup.html").read_text(encoding="utf-8")
+
+    assert '<option value="qwen3">QWEN3</option>' in fragment
+    assert '<option value="voxcpm2">VoxCPM2</option>' in fragment
+
+
+def test_setup_fragment_exposes_voxcpm2_backend_controls():
+    fragment = (ROOT / "app/static/fragments/setup.html").read_text(encoding="utf-8")
+
+    assert 'id="voxcpm2-options"' in fragment
+    assert 'id="voxcpm-optimize-group"' in fragment
+    for field_id in (
+        "voxcpm-model-id",
+        "voxcpm-cfg-value",
+        "voxcpm-inference-timesteps",
+        "voxcpm-normalize",
+        "voxcpm-load-denoiser",
+        "voxcpm-denoise-reference",
+        "voxcpm-optimize",
+    ):
+        assert f'id="{field_id}"' in fragment
+    assert 'id="voxcpm-cfg-value" value="1.6" min="1" max="3"' in fragment
+    assert 'id="voxcpm-inference-timesteps" value="10" min="4" max="30"' in fragment
+
+
+def test_setup_script_loads_saves_and_toggles_voxcpm2_controls():
+    script = (ROOT / "app/static/js/legacy/03_setup_tab.js").read_text(encoding="utf-8")
+
+    assert "function toggleVoxCPM2Options()" in script
+    assert "function getTTSScriptMaxLengthDefault" in script
+    assert "function clampNumber" in script
+    assert "voxcpm2-options" in script
+    assert "voxcpm-optimize-group" in script
+    assert "isMacHostUI()" in script
+    for config_key, field_id in (
+        ("voxcpm_model_id", "voxcpm-model-id"),
+        ("voxcpm_cfg_value", "voxcpm-cfg-value"),
+        ("voxcpm_inference_timesteps", "voxcpm-inference-timesteps"),
+        ("voxcpm_normalize", "voxcpm-normalize"),
+        ("voxcpm_load_denoiser", "voxcpm-load-denoiser"),
+        ("voxcpm_denoise_reference", "voxcpm-denoise-reference"),
+        ("voxcpm_optimize", "voxcpm-optimize"),
+    ):
+        assert config_key in script
+        assert field_id in script
+
+
 def test_emotions_script_loads_and_renders_standalone_rows():
     script = (ROOT / "app/static/js/legacy/17_emotions_tab.js").read_text(encoding="utf-8")
 

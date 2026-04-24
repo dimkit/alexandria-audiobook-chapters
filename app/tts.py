@@ -29,12 +29,34 @@ QWEN_GENERATION_SECONDS_MARGIN = 0.0
 QWEN_GENERATION_TOKEN_BUFFER_FACTOR = 1.0
 QWEN_MIN_MAX_NEW_TOKENS = 24
 QWEN_MAX_MAX_NEW_TOKENS = 768
+VOXCPM2_CFG_VALUE_DEFAULT = 1.6
+VOXCPM2_CFG_VALUE_MIN = 1.0
+VOXCPM2_CFG_VALUE_MAX = 3.0
+VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT = 10
+VOXCPM2_INFERENCE_TIMESTEPS_MIN = 4
+VOXCPM2_INFERENCE_TIMESTEPS_MAX = 30
 
 
 def sanitize_filename(name):
     """Make a string safe for use in filenames"""
     name = re.sub(r'[^\w\-]', '_', name)
     return name.lower()
+
+
+def _clamp_float(value, minimum, maximum, fallback):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = fallback
+    return min(maximum, max(minimum, parsed))
+
+
+def _clamp_int(value, minimum, maximum, fallback):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = fallback
+    return min(maximum, max(minimum, parsed))
 
 
 def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_MS, same_speaker_pause_ms=SAME_SPEAKER_PAUSE_MS):
@@ -165,6 +187,23 @@ class TTSEngine:
         self._api_key = tts_config.get("api_key") or config.get("llm", {}).get("api_key", "")
         self._device = tts_config.get("device", "auto")
         self._compile_codec_enabled = tts_config.get("compile_codec", False)
+        self._voxcpm_model_id = str(tts_config.get("voxcpm_model_id") or "openbmb/VoxCPM2").strip()
+        self._voxcpm_cfg_value = _clamp_float(
+            tts_config.get("voxcpm_cfg_value", VOXCPM2_CFG_VALUE_DEFAULT),
+            VOXCPM2_CFG_VALUE_MIN,
+            VOXCPM2_CFG_VALUE_MAX,
+            VOXCPM2_CFG_VALUE_DEFAULT,
+        )
+        self._voxcpm_inference_timesteps = _clamp_int(
+            tts_config.get("voxcpm_inference_timesteps", VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT),
+            VOXCPM2_INFERENCE_TIMESTEPS_MIN,
+            VOXCPM2_INFERENCE_TIMESTEPS_MAX,
+            VOXCPM2_INFERENCE_TIMESTEPS_DEFAULT,
+        )
+        self._voxcpm_normalize = bool(tts_config.get("voxcpm_normalize", False))
+        self._voxcpm_load_denoiser = bool(tts_config.get("voxcpm_load_denoiser", False))
+        self._voxcpm_denoise_reference = bool(tts_config.get("voxcpm_denoise_reference", False))
+        self._voxcpm_optimize = bool(tts_config.get("voxcpm_optimize", False)) and py_platform.system().lower() != "darwin"
 
         # Language setting (passed to Qwen3-TTS)
         self._language = tts_config.get("language", "English")
@@ -231,6 +270,10 @@ class TTSEngine:
     def _create_provider(self):
         if self._provider_name == "qwen3":
             return QwenAudioProvider(self)
+        if self._provider_name == "voxcpm2":
+            from tts_providers.voxcpm2 import VoxCPM2AudioProvider
+
+            return VoxCPM2AudioProvider(self)
         raise ValueError(f"Unsupported TTS provider: {self._provider_name}")
 
     @staticmethod
@@ -769,17 +812,53 @@ class TTSEngine:
             print(f"Codec compilation skipped (non-fatal): {e}")
 
     @staticmethod
-    def _resolve_local_model_path(model_id):
+    def _resolve_local_model_path(model_id, required_files=None):
         """Check if a HuggingFace model is cached locally and return its snapshot path.
 
         Uses try_to_load_from_cache to find the local snapshot directory.
         Returns the local path string if cached, or None if not cached.
         """
         from huggingface_hub import try_to_load_from_cache
+
+        def _has_required_files(snapshot_path):
+            if not os.path.exists(os.path.join(snapshot_path, "config.json")):
+                return False
+            for requirement in required_files or ():
+                if isinstance(requirement, (list, tuple, set)):
+                    if not any(os.path.exists(os.path.join(snapshot_path, str(item))) for item in requirement):
+                        return False
+                elif not os.path.exists(os.path.join(snapshot_path, str(requirement))):
+                    return False
+            return True
+
         result = try_to_load_from_cache(model_id, "config.json")
         if isinstance(result, str):
             # result is the full path to config.json inside the snapshot dir
-            return os.path.dirname(result)
+            candidate = os.path.dirname(result)
+            if _has_required_files(candidate):
+                return candidate
+        repo_cache_name = f"models--{str(model_id).replace('/', '--')}"
+        cache_roots = []
+        hub_cache = str(os.getenv("HUGGINGFACE_HUB_CACHE") or "").strip()
+        if hub_cache:
+            cache_roots.append(hub_cache)
+        hf_home = str(os.getenv("HF_HOME") or "").strip()
+        if hf_home:
+            cache_roots.append(os.path.join(hf_home, "hub"))
+        cache_roots.append(os.path.join(LAYOUT.repo_root, "cache", "HF_HOME", "hub"))
+
+        for cache_root in cache_roots:
+            snapshots_dir = os.path.join(cache_root, repo_cache_name, "snapshots")
+            if not os.path.isdir(snapshots_dir):
+                continue
+            try:
+                snapshots = sorted(os.listdir(snapshots_dir), reverse=True)
+            except OSError:
+                continue
+            for snapshot in snapshots:
+                candidate = os.path.join(snapshots_dir, snapshot)
+                if _has_required_files(candidate):
+                    return candidate
         return None
 
     @staticmethod
