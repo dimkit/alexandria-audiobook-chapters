@@ -91,6 +91,27 @@ def _lmstudio_model_load_service() -> LMStudioModelLoadService:
     )
 
 
+def _reset_tts_engine_if_idle() -> bool:
+    has_active_work_fn = getattr(project_manager, "has_active_tts_work", None)
+    if callable(has_active_work_fn):
+        try:
+            if bool(has_active_work_fn()):
+                return False
+        except Exception:
+            pass
+
+    unload_fn = getattr(project_manager, "unload_tts_engine", None)
+    if callable(unload_fn):
+        try:
+            return bool(unload_fn())
+        except Exception:
+            project_manager.engine = None
+            return True
+
+    project_manager.engine = None
+    return True
+
+
 def _verify_openrouter_tool_capability(base_url: str, api_key: str, model_name: str):
     return _tool_capability_service().verify_openrouter_tool_capability(
         base_url,
@@ -342,6 +363,7 @@ async def get_config():
             "llm_workers": 1
         },
         "tts": {
+            "provider": "qwen3",
             "mode": "local",
             "local_backend": "auto",
             "url": "http://127.0.0.1:7860",
@@ -656,7 +678,7 @@ async def save_config(config: AppConfig):
         clear_llm_gateway_cache()
         llm_cache_cleared = True
     # Reset engine so it picks up new TTS settings on next use
-    project_manager.engine = None
+    _reset_tts_engine_if_idle()
     return {"status": "saved", "llm_cache_cleared": llm_cache_cleared}
 
 
@@ -690,8 +712,7 @@ async def save_setup_config(update: SetupConfigUpdate):
         tts_changed = any(new_tts.get(k) != old_tts.get(k) for k in new_tts)
         existing_config["tts"] = {**old_tts, **new_tts}
         if tts_changed:
-            project_manager.engine = None
-            engine_reset = True
+            engine_reset = _reset_tts_engine_if_idle()
 
     if update.prompts is not None:
         prompts = update.prompts.model_dump()

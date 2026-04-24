@@ -525,7 +525,7 @@ def _open_app_tab(page, *, base_url: str, tab_selector: str, panel_selector: str
 
 @pytest.mark.fresh_clone_live_e2e
 def test_fresh_clone_live_full_project_flow_real_local_backends(request):
-    partial_mode = bool(request.config.getoption("--fresh-clone-live-partial"))
+    partial_mode = bool(request.config.getoption("--real-generation-backend-e2e-partial"))
     partial_pointer = _read_json_if_exists(LIVE_PARTIAL_POINTER_PATH)
     resume_clone_root = ""
     successful_run = False

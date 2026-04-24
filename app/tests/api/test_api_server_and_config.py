@@ -27,6 +27,9 @@ def test_get_config_exposes_expected_defaults():
     assert_status(r, 200)
     data = r.json()
 
+    if (data.get("tts") or {}).get("provider") != "qwen3":
+        raise TestFailure(f"Expected default tts.provider='qwen3', got {(data.get('tts') or {}).get('provider')!r}")
+
     if int((data.get("tts") or {}).get("script_max_length") or 0) != 250:
         raise TestFailure(f"Expected default script_max_length=250, got {(data.get('tts') or {}).get('script_max_length')!r}")
 
@@ -42,6 +45,7 @@ def test_get_config_backfills_missing_defaults_with_expected_values():
 
     modified = json.loads(original_config_raw)
     modified.setdefault("tts", {})
+    modified["tts"]["provider"] = None
     modified["tts"]["script_max_length"] = None
     modified["proofread"] = {"certainty_threshold": None}
     with open(config_path, "w", encoding="utf-8") as f:
@@ -51,6 +55,8 @@ def test_get_config_backfills_missing_defaults_with_expected_values():
         r = get("/api/config")
         assert_status(r, 200)
         data = r.json()
+        if (data.get("tts") or {}).get("provider") != "qwen3":
+            raise TestFailure("GET /api/config did not backfill tts.provider='qwen3'")
         if int((data.get("tts") or {}).get("script_max_length") or 0) != 250:
             raise TestFailure("GET /api/config did not backfill tts.script_max_length=250")
         if float(((data.get("proofread") or {}).get("certainty_threshold") or 0.0)) != 0.75:
@@ -58,6 +64,8 @@ def test_get_config_backfills_missing_defaults_with_expected_values():
 
         with open(config_path, "r", encoding="utf-8") as f:
             persisted = json.load(f)
+        if (persisted.get("tts") or {}).get("provider") != "qwen3":
+            raise TestFailure("Backfilled tts.provider was not persisted")
         if int((persisted.get("tts") or {}).get("script_max_length") or 0) != 250:
             raise TestFailure("Backfilled script_max_length was not persisted")
         if float(((persisted.get("proofread") or {}).get("certainty_threshold") or 0.0)) != 0.75:
@@ -97,6 +105,8 @@ def test_get_config_bootstraps_local_config_from_default_template():
             raise TestFailure("Bootstrapped config did not preserve default llm.llm_workers")
         if data.get("tts", {}).get("script_max_length") != default_config.get("tts", {}).get("script_max_length"):
             raise TestFailure("Bootstrapped config did not preserve default template values")
+        if data.get("tts", {}).get("provider") != default_config.get("tts", {}).get("provider"):
+            raise TestFailure("Bootstrapped config did not preserve default tts.provider")
         if data.get("tts", {}).get("parallel_workers") != default_config.get("tts", {}).get("parallel_workers"):
             raise TestFailure("Bootstrapped config did not preserve default tts.parallel_workers")
         if data.get("tts", {}).get("auto_regenerate_bad_clips") != default_config.get("tts", {}).get("auto_regenerate_bad_clips"):
@@ -532,6 +542,32 @@ def test_save_setup_config_preserves_hidden_local_backend():
         readback = r.json()
         if readback.get("tts", {}).get("local_backend") != "qwen":
             raise TestFailure("POST /api/config/setup overwrote hidden tts.local_backend")
+    finally:
+        post("/api/config", json=original)
+
+def test_save_setup_config_roundtrip_tts_provider():
+    r = get("/api/config")
+    assert_status(r, 200)
+    original = r.json()
+
+    payload = {
+        "tts": {
+            "provider": "qwen3",
+            "mode": original.get("tts", {}).get("mode", "local"),
+            "url": original.get("tts", {}).get("url", "http://127.0.0.1:7860"),
+            "language": original.get("tts", {}).get("language", "English"),
+            "parallel_workers": original.get("tts", {}).get("parallel_workers", 4),
+        }
+    }
+    r = post("/api/config/setup", json=payload)
+    assert_status(r, 200)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        readback = r.json()
+        if readback.get("tts", {}).get("provider") != "qwen3":
+            raise TestFailure("POST /api/config/setup did not persist tts.provider")
     finally:
         post("/api/config", json=original)
 

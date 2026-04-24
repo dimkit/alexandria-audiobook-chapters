@@ -152,6 +152,10 @@
                     loadDictionary();
                 } else if (nextTab === 'saved-scripts') {
                     loadSavedScripts();
+                } else if (nextTab === 'emotions') {
+                    if (window.loadEmotions) {
+                        window.loadEmotions().catch(err => console.error('Emotions load error', err));
+                    }
                 } else if (nextTab === 'designer') {
                     loadDesignedVoices();
                 } else if (nextTab === 'training') {

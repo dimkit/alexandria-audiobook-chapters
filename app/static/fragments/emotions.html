@@ -1,0 +1,57 @@
+        <div id="emotions-tab" class="tab-content" style="display:none;">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h4 class="m-0">Emotions</h4>
+                    <table class="mb-0" style="border-collapse:separate; border-spacing:8px 0;">
+                        <tr>
+                            <td class="text-center align-top" style="min-width:110px;"><button class="btn btn-primary btn-sm w-100" id="emotions-btn-play-seq" onclick="emotionsPlaySequence()"><i class="fas fa-play me-1"></i>Play Sequence</button></td>
+                            <td class="align-middle text-muted px-1">|</td>
+                            <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-success btn-sm w-100" id="emotions-btn-render" onclick="emotionsRender(false)"><i class="fas fa-bolt me-1"></i>Render Pending</button></td>
+                            <td class="align-middle text-muted px-1">|</td>
+                            <td class="text-center align-top" style="min-width:120px;"><button class="btn btn-outline-success btn-sm w-100" id="emotions-btn-regen" onclick="emotionsRender(true)"><i class="fas fa-redo me-1"></i>Regenerate All</button></td>
+                            <td class="text-center align-top"><button class="btn btn-danger btn-sm w-100" id="emotions-btn-cancel" onclick="emotionsCancel()" style="display:none;"><i class="fas fa-stop me-1"></i>Cancel</button></td>
+                        </tr>
+                        <tr>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Preview completed clips in order</td>
+                            <td></td>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Generate missing or stale emotions</td>
+                            <td></td>
+                            <td class="text-center text-muted" style="font-size:0.7rem;">Replace every emotion clip</td>
+                            <td></td>
+                        </tr>
+                    </table>
+                </div>
+                <div class="card-body">
+                    <div class="progress mb-3" style="height: 25px;">
+                        <div id="emotions-progress-bar" class="progress-bar progress-bar-striped bg-success" role="progressbar" style="width: 0%">0%</div>
+                    </div>
+
+                    <div class="row g-3 mb-3">
+                        <div class="col-lg-7">
+                            <label for="emotions-text" class="form-label fw-semibold">Test Line</label>
+                            <input type="text" class="form-control" id="emotions-text" placeholder="Enter the line to render with every emotion">
+                        </div>
+                        <div class="col-lg-5">
+                            <div class="small text-muted mb-1">Voice</div>
+                            <div id="emotions-voice-card"></div>
+                        </div>
+                    </div>
+
+                    <div class="table-responsive">
+                        <table class="table table-bordered table-hover">
+                            <thead>
+                                <tr>
+                                    <th width="7%"></th>
+                                    <th width="57%">Instruct</th>
+                                    <th width="12%">Status</th>
+                                    <th width="24%">Audio</th>
+                                </tr>
+                            </thead>
+                            <tbody id="emotions-table-body">
+                            </tbody>
+                        </table>
+                    </div>
+                    <pre id="emotions-logs" class="bg-dark text-light p-2 rounded mt-3" style="max-height: 140px; overflow-y: auto; font-size: 0.8rem; display:none;"></pre>
+                </div>
+            </div>
+        </div>

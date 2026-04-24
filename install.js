@@ -3,6 +3,8 @@ const basePackages = [
   "uv pip install -r requirements.txt",
 ]
 
+const DEFAULT_TTS_PROVIDER = "qwen3"
+
 const coreRuntimePackages = [
   "uv pip install fastapi uvicorn pydantic openai python-docx pytest numpy pydub soundfile librosa requests aiofiles python-multipart",
 ]
@@ -10,6 +12,20 @@ const coreRuntimePackages = [
 const verifyTestEnv = [
   "python -c \"import fastapi, openai, pytest, uvicorn, pydantic, docx, numpy, pydub, soundfile, librosa; print('Dependency check OK')\"",
 ]
+
+function providerRuntimePackages(platform, arch, provider = DEFAULT_TTS_PROVIDER) {
+  if (provider !== "qwen3") {
+    throw new Error(`Unsupported TTS provider during install: ${provider}`)
+  }
+  if (platform === "darwin" && arch === "arm64") {
+    return [
+      "uv pip uninstall qwen-tts",
+      "uv pip install mlx-audio==0.4.2",
+      "uv pip install sentencepiece tiktoken",
+    ]
+  }
+  return ["uv pip install qwen-tts==0.1.1"]
+}
 
 module.exports = {
   run: [{
@@ -57,9 +73,7 @@ module.exports = {
       message: [
         ...basePackages,
         ...coreRuntimePackages,
-        "uv pip uninstall qwen-tts",
-        "uv pip install mlx-audio==0.4.2",
-        "uv pip install sentencepiece tiktoken",
+        ...providerRuntimePackages("darwin", "arm64"),
         ...verifyTestEnv,
       ]
     }
@@ -72,7 +86,7 @@ module.exports = {
       message: [
         ...basePackages,
         ...coreRuntimePackages,
-        "uv pip install qwen-tts==0.1.1",
+        ...providerRuntimePackages("linux", "x64"),
         ...verifyTestEnv,
       ]
     }

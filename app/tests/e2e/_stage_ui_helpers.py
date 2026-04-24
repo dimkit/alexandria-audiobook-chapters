@@ -401,7 +401,13 @@ def _overlay_worktree_changes(source_repo_dir: str, clone_root: str) -> None:
             pass
 
 
-def _fresh_clone_install_commands(python_executable: str, *, host_platform: str | None = None, host_arch: str | None = None) -> list[list[str]]:
+def _fresh_clone_install_commands(
+    python_executable: str,
+    *,
+    host_platform: str | None = None,
+    host_arch: str | None = None,
+    tts_provider: str = "qwen3",
+) -> list[list[str]]:
     current_platform = str(host_platform or sys.platform).lower()
     current_arch = str(host_arch or platform.machine()).lower()
     commands: list[list[str]] = [
@@ -428,6 +434,8 @@ def _fresh_clone_install_commands(python_executable: str, *, host_platform: str 
             "python-multipart",
         ],
     ]
+    if tts_provider != "qwen3":
+        raise ValueError(f"Unsupported fresh-clone TTS provider: {tts_provider}")
     if current_platform == "darwin" and current_arch == "arm64":
         commands.extend([
             [python_executable, "-m", "pip", "uninstall", "-y", "qwen-tts"],
@@ -2188,6 +2196,7 @@ def _read_setup_settings_snapshot(page) -> dict:
             llm_api_key: String(document.querySelector('#llm-key')?.value || ''),
             llm_model_name: String(document.querySelector('#llm-model')?.value || ''),
             llm_workers: Number.parseInt(document.querySelector('#llm-workers')?.value || '0', 10) || 0,
+            tts_provider: String(document.querySelector('#tts-provider')?.value || ''),
             script_max_length: Number.parseInt(document.querySelector('#script-max-length')?.value || '0', 10) || 0,
             bad_clip_retries_enabled: !!document.querySelector('#auto-regenerate-bad-clips')?.checked,
             bad_clip_retries_attempts: Number.parseInt(document.querySelector('#auto-regenerate-bad-clip-attempts')?.value || '0', 10) || 0,
@@ -2206,6 +2215,7 @@ def _apply_setup_settings_snapshot(page, values: dict) -> None:
     page.locator("#llm-model").blur()
     page.locator("#llm-workers").fill(str(int(values["llm_workers"])))
     page.locator("#llm-workers").blur()
+    page.locator("#tts-provider").select_option(str(values["tts_provider"]))
     page.locator("#script-max-length").fill(str(int(values["script_max_length"])))
     page.locator("#script-max-length").blur()
 

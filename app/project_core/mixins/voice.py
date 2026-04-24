@@ -1201,11 +1201,20 @@ class ProjectVoiceMixin:
             try:
                 self.engine = TTSEngine(self._load_app_config(), project_root=self.root_dir)
                 backend = self.engine.local_backend if self.engine.mode == "local" else "external"
-                print(f"TTS engine initialized (mode={self.engine.mode}, backend={backend})")
+                print(
+                    f"TTS engine initialized (provider={self.engine.provider_name}, "
+                    f"mode={self.engine.mode}, backend={backend})"
+                )
                 return self.engine
             except Exception as e:
                 print(f"Failed to initialize TTS engine: {e}")
                 return None
+
+        def has_active_tts_work(self):
+            runtime_chunks = self._copy_chunk_runtime()
+            if any((chunk or {}).get("status") == "generating" for chunk in (runtime_chunks or {}).values()):
+                return True
+            return bool(self.has_pending_audio_finalize_tasks())
 
         def unload_tts_engine(self):
             engine = self.engine
@@ -1214,6 +1223,9 @@ class ProjectVoiceMixin:
                 return False
 
             try:
+                unload = getattr(engine, "unload", None)
+                if callable(unload):
+                    return bool(unload())
                 clear_cache = getattr(engine, "_clear_gpu_cache", None)
                 if callable(clear_cache):
                     clear_cache()

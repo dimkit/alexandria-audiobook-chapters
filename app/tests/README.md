@@ -17,10 +17,9 @@ Use `test_<domain>_<behavior>.py` for new files and keep each file focused on on
 - Project domain: `rtk app/env/bin/python -m pytest -q app/tests/project`
 - Editor UI domain: `rtk app/env/bin/python -m pytest -q app/tests/editor_ui`
 - E2E domain: `rtk app/env/bin/python -m pytest -q app/tests/e2e`
-- LM Studio live E2E lane: `rtk app/env/bin/python -m pytest -q app/tests/e2e --run-lmstudio-live-e2e -k lmstudio_live`
-- Fresh-clone E2E lane: `rtk app/env/bin/python -m pytest -q app/tests/e2e --run-fresh-clone-e2e -k fresh_clone`
-- Fresh-clone live real-backend E2E lane: `rtk app/env/bin/python -m pytest -q app/tests/e2e --run-fresh-clone-live-e2e -k fresh_clone_live`
-- Fresh-clone live resumable partial mode: `rtk app/env/bin/python -m pytest -q app/tests/e2e --run-fresh-clone-live-e2e --fresh-clone-live-partial -k fresh_clone_live`
+- Critical-path E2E lane: `rtk app/env/bin/python -m pytest -q app/tests/e2e --critical-path-e2e -k fresh_clone`
+- Real-generation-backend E2E lane: `rtk app/env/bin/python -m pytest -q app/tests/e2e --real-generation-backend-e2e -k 'fresh_clone_live or lmstudio_live'`
+- Real-generation-backend resumable partial mode: `rtk app/env/bin/python -m pytest -q app/tests/e2e --real-generation-backend-e2e --real-generation-backend-e2e-partial -k fresh_clone_live`
 - Cross-platform sanity pass (warn-only): `rtk app/env/bin/python app/scripts/cross_platform_sanity_check.py`
 - Cross-platform sanity pass (strict/non-zero on warnings): `rtk app/env/bin/python app/scripts/cross_platform_sanity_check.py --strict`
 
@@ -28,13 +27,11 @@ Use `test_<domain>_<behavior>.py` for new files and keep each file focused on on
 
 - Prefer extracting shared harness/setup into `_helpers.py` modules.
 - Keep files scoped; avoid re-growing monoliths.
-- The fresh-clone E2E lane is intentionally off by default because it clones `origin/main`
+- The critical-path E2E lane is intentionally off by default because it clones `origin/main`
   and bootstraps a fresh `app/env` before driving the real UI.
-- The LM Studio live E2E lane is intentionally off by default because it hits a real reachable
-  local LM Studio backend and will run whenever that backend is available unless explicitly gated.
-- The fresh-clone live lane is intentionally off by default because it also requires a reachable
-  local LM Studio backend with at least one tool-capable model.
-- The `--fresh-clone-live-partial` flag reuses the prior clone root and stage checkpoint after failures
+- The real-generation-backend E2E lane is intentionally off by default because it hits real reachable
+  local generation backends, including LM Studio-backed flows, and should only run when explicitly gated.
+- The `--real-generation-backend-e2e-partial` flag reuses the prior clone root and stage checkpoint after failures
   so reruns resume from the first incomplete stage.
 - On successful completion of the live lane (partial or non-partial), test artifacts are cleaned up:
   clone root, checkpoint, and pointer state are removed, and only the finished MP3 is retained.

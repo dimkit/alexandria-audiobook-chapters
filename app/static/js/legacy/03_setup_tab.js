@@ -379,6 +379,7 @@
                     : 3;
                 document.getElementById('llm-model').value = config.llm.model_name;
                 document.getElementById('llm-workers').value = config.llm.llm_workers ?? 1;
+                document.getElementById('tts-provider').value = config.tts.provider || 'qwen3';
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
                 document.getElementById('tts-language').value = config.tts.language || 'English';
@@ -674,6 +675,7 @@
             const rawRetryAttempts = parseInt(document.getElementById('auto-regenerate-bad-clip-attempts').value, 10);
             const retryAttempts = Number.isInteger(rawRetryAttempts) && rawRetryAttempts > 0 ? rawRetryAttempts : 0;
             return {
+                provider: document.getElementById('tts-provider').value || 'qwen3',
                 mode: document.getElementById('tts-mode').value,
                 local_backend: 'auto',
                 url: document.getElementById('tts-url').value,
@@ -788,7 +790,7 @@
                 // LLM
                 'llm-url': 'llm', 'llm-key': 'llm', 'llm-model': 'llm', 'llm-workers': 'llm',
                 // TTS
-                'tts-mode': 'tts', 'tts-url': 'tts', 'tts-language': 'tts',
+                'tts-provider': 'tts', 'tts-mode': 'tts', 'tts-url': 'tts', 'tts-language': 'tts',
                 'parallel-workers': 'tts', 'batch-seed': 'tts',
                 'compile-codec': 'tts', 'batch-group-by-type': 'tts',
                 'sub-batch-enabled': 'tts', 'sub-batch-min-size': 'tts',

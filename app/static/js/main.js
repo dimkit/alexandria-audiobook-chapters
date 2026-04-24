@@ -6,6 +6,7 @@ const TAB_FRAGMENTS = [
   '/static/fragments/voices.html',
   '/static/fragments/dictionary.html',
   '/static/fragments/saved-scripts.html',
+  '/static/fragments/emotions.html',
   '/static/fragments/designer.html',
   '/static/fragments/training.html',
   '/static/fragments/dataset-builder.html',
@@ -31,6 +32,7 @@ const LEGACY_SCRIPTS = [
   '/static/js/legacy/14_voice_designer.js',
   '/static/js/legacy/15_clone_voice_handlers.js',
   '/static/js/legacy/16_lora_training.js',
+  '/static/js/legacy/17_emotions_tab.js',
 ];
 
 async function bootstrap() {

@@ -142,6 +142,7 @@ EXPECTED_PROJECT_MANAGER_METHODS = {
     "invalidate_chunk_audio_indices",
     "save_voice_config_with_invalidation",
     "get_engine",
+    "has_active_tts_work",
     "unload_tts_engine",
     "_load_asr_settings",
     "get_asr_engine",

@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict, Union, Literal
 import re
 import time
 import threading
@@ -89,6 +89,8 @@ LORA_DATASETS_DIR = LAYOUT.lora_datasets_dir
 BUILTIN_LORA_DIR = LAYOUT.builtin_lora_dir
 BUILTIN_LORA_MANIFEST = os.path.join(BUILTIN_LORA_DIR, "manifest.json")
 DATASET_BUILDER_DIR = LAYOUT.dataset_builder_dir
+EMOTIONS_DIR = os.path.join(LAYOUT.workspace_dir, "emotions")
+EMOTIONS_AUDIO_DIR = os.path.join(EMOTIONS_DIR, "audio")
 DESIGNED_VOICES_MANIFEST = os.path.join(DESIGNED_VOICES_DIR, "manifest.json")
 CLONE_VOICES_MANIFEST = os.path.join(CLONE_VOICES_DIR, "manifest.json")
 ALLOWED_AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg"}
@@ -890,6 +892,10 @@ app.mount("/builtin_lora", StaticFiles(directory=BUILTIN_LORA_DIR), name="builti
 # Dataset builder directory for preview audio
 app.mount("/dataset_builder", StaticFiles(directory=DATASET_BUILDER_DIR), name="dataset_builder")
 
+# Emotions page directory for standalone prompt-test audio
+os.makedirs(EMOTIONS_AUDIO_DIR, exist_ok=True)
+app.mount("/emotions_audio", StaticFiles(directory=EMOTIONS_AUDIO_DIR), name="emotions_audio")
+
 # Initialize Project Manager
 project_manager = ProjectManager(ROOT_DIR)
 
@@ -933,6 +939,7 @@ class LLMConfig(BaseModel):
         return str(v or "").strip()
 
 class TTSConfig(BaseModel):
+    provider: Literal["qwen3"] = "qwen3"
     mode: str = "local"  # "local" or "external"
     local_backend: str = "auto"  # local mode only: "auto", "qwen", "mlx"
     url: str = "http://127.0.0.1:7860"  # external mode only

@@ -4,6 +4,8 @@ import tempfile
 import os
 import base64
 import io
+import sys
+import types
 import wave
 import numpy as np
 
@@ -176,6 +178,40 @@ class NormalizeExternalUrlTests(unittest.TestCase):
         )
 
 
+class ProviderDelegationTests(unittest.TestCase):
+    def test_engine_defaults_provider_to_qwen3(self):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
+        self.assertEqual(engine.provider_name, "qwen3")
+
+    @mock.patch("tts.QwenAudioProvider")
+    def test_engine_delegates_generation_calls_to_qwen_provider(self, mock_provider_cls):
+        provider = mock.Mock()
+        provider.generate_voice.return_value = True
+        provider.generate_batch.return_value = {"completed": ["uid-1"], "failed": []}
+        provider.generate_voice_design.return_value = ("/tmp/sample.wav", 24000)
+        provider.mode = "local"
+        provider.local_backend = "qwen"
+        mock_provider_cls.return_value = provider
+
+        engine = TTSEngine({"tts": {"mode": "local", "provider": "qwen3", "local_backend": "qwen"}})
+
+        self.assertTrue(engine.generate_voice("Hello", "calm", "Aerial", {"Aerial": {"type": "custom"}}, "/tmp/out.wav"))
+        self.assertEqual(
+            engine.generate_batch([{"index": "uid-1"}], {"Aerial": {"type": "custom"}}, "/tmp", batch_seed=7),
+            {"completed": ["uid-1"], "failed": []},
+        )
+        self.assertEqual(
+            engine.generate_voice_design("calm voice", "Hello there"),
+            ("/tmp/sample.wav", 24000),
+        )
+        provider.generate_voice.assert_called_once()
+        provider.generate_batch.assert_called_once()
+        provider.generate_voice_design.assert_called_once()
+        self.assertEqual(engine.provider_name, "qwen3")
+        self.assertEqual(engine.mode, "local")
+        self.assertEqual(engine.local_backend, "qwen")
+
+
 class LocalBackendResolutionTests(unittest.TestCase):
     @mock.patch.object(TTSEngine, "_host_platform", return_value=("darwin", "arm64"))
     def test_auto_selects_mlx_on_apple_silicon(self, _mock_platform):
@@ -191,6 +227,37 @@ class LocalBackendResolutionTests(unittest.TestCase):
     def test_explicit_mlx_falls_back_to_qwen_off_apple_silicon(self, _mock_platform):
         engine = TTSEngine({"tts": {"mode": "local", "local_backend": "mlx"}})
         self.assertEqual(engine.local_backend, "qwen")
+
+
+class MlxInstructionRoutingTests(unittest.TestCase):
+    def test_custom_voice_loads_instruction_capable_mlx_model(self):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "mlx"}})
+        load_calls = []
+        fake_model = mock.Mock()
+
+        def fake_load_model(model_path):
+            load_calls.append(model_path)
+            return fake_model
+
+        fake_mlx_audio = types.ModuleType("mlx_audio")
+        fake_tts = types.ModuleType("mlx_audio.tts")
+        fake_utils = types.ModuleType("mlx_audio.tts.utils")
+        fake_utils.load_model = fake_load_model
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "mlx_audio": fake_mlx_audio,
+                "mlx_audio.tts": fake_tts,
+                "mlx_audio.tts.utils": fake_utils,
+            },
+        ), mock.patch.object(TTSEngine, "_resolve_local_model_path", return_value=None):
+            engine._init_local_mlx_model("custom_voice")
+
+        self.assertEqual(
+            load_calls,
+            ["mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"],
+        )
 
 
 class LocalBatchRegressionTests(unittest.TestCase):

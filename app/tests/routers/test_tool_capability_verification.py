@@ -427,6 +427,39 @@ class LLMGatewayCacheInvalidationTests(unittest.TestCase):
             self.assertFalse(result["llm_cache_cleared"])
             clear_mock.assert_not_called()
 
+    def test_save_setup_config_keeps_active_engine_when_tts_changes_mid_generation(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            config_path = os.path.join(temp_root, "config.json")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(self._base_config_payload(), handle, indent=2, ensure_ascii=False)
+
+            active_engine = object()
+            fake_project_manager = mock.Mock()
+            fake_project_manager.engine = active_engine
+            fake_project_manager.has_active_tts_work.return_value = True
+
+            update = config_router.SetupConfigUpdate(
+                tts=config_router.TTSConfig(
+                    provider="qwen3",
+                    mode="local",
+                    url="http://127.0.0.1:7860",
+                    device="auto",
+                    language="English",
+                    parallel_workers=4,
+                    script_max_length=250,
+                )
+            )
+
+            with (
+                mock.patch.object(config_router, "CONFIG_PATH", config_path),
+                mock.patch.object(config_router, "project_manager", fake_project_manager),
+            ):
+                result = asyncio.run(config_router.save_setup_config(update))
+
+            self.assertEqual(result["status"], "saved")
+            self.assertFalse(result["engine_reset"])
+            self.assertIs(fake_project_manager.engine, active_engine)
+
 
 if __name__ == "__main__":
     unittest.main()

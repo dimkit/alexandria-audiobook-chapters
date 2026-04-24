@@ -6,6 +6,7 @@
     "llm_workers": 1
   },
   "tts": {
+    "provider": "qwen3",
     "mode": "local",
     "local_backend": "auto",
     "url": "http://127.0.0.1:7860",

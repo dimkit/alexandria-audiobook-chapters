@@ -58,6 +58,91 @@ def combine_audio_with_pauses(audio_segments, speakers, pause_ms=DEFAULT_PAUSE_M
     return combined
 
 
+class AudioProvider:
+    def __init__(self, engine):
+        self.engine = engine
+
+    @property
+    def mode(self):
+        raise NotImplementedError
+
+    @property
+    def local_backend(self):
+        raise NotImplementedError
+
+    def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        raise NotImplementedError
+
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None, log_callback=None):
+        raise NotImplementedError
+
+    def generate_voice_design(self, description, sample_text, language=None, seed=-1):
+        raise NotImplementedError
+
+    def clear_clone_prompt_cache(self, speaker=None):
+        raise NotImplementedError
+
+    def unload(self):
+        raise NotImplementedError
+
+
+class QwenAudioProvider(AudioProvider):
+    provider_name = "qwen3"
+
+    @property
+    def mode(self):
+        return self.engine._mode
+
+    @property
+    def local_backend(self):
+        if self.mode != "local":
+            return None
+        return self.engine._resolve_local_backend()
+
+    def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        return self.engine._provider_generate_voice(text, instruct_text, speaker, voice_config, output_path)
+
+    def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None, log_callback=None):
+        return self.engine._provider_generate_batch(
+            chunks,
+            voice_config,
+            output_dir,
+            batch_seed=batch_seed,
+            cancel_check=cancel_check,
+            log_callback=log_callback,
+        )
+
+    def generate_voice_design(self, description, sample_text, language=None, seed=-1):
+        return self.engine._provider_generate_voice_design(
+            description=description,
+            sample_text=sample_text,
+            language=language,
+            seed=seed,
+        )
+
+    def clear_clone_prompt_cache(self, speaker=None):
+        return self.engine._provider_clear_clone_prompt_cache(speaker=speaker)
+
+    def unload(self):
+        self.engine._provider_clear_clone_prompt_cache()
+        self.engine._lora_prompt_cache.clear()
+        self.engine._mlx_models.clear()
+        self.engine._local_custom_model = None
+        self.engine._local_clone_model = None
+        self.engine._local_design_model = None
+        self.engine._local_lora_model = None
+        self.engine._lora_adapter_path = None
+        self.engine._gradio_client = None
+        self.engine._external_backend = None
+        self.engine._external_http_base = None
+        self.engine._resolved_local_backend = None
+        self.engine._e2e_qwen_sim_provider = None
+        clear_cache = getattr(self.engine, "_clear_gpu_cache", None)
+        if callable(clear_cache):
+            clear_cache()
+        return True
+
+
 class TTSEngine:
     """TTS engine supporting local (qwen/mlx) and external (Gradio/HTTP) backends.
 
@@ -70,6 +155,7 @@ class TTSEngine:
 
     def __init__(self, config, *, project_root=None):
         tts_config = config.get("tts", {})
+        self._provider_name = self._normalize_provider_name(tts_config.get("provider", "qwen3"))
         self._mode = tts_config.get("mode", "external")
         self._local_backend_preference = (tts_config.get("local_backend", "auto") or "auto").strip().lower()
         if self._local_backend_preference not in {"auto", "qwen", "mlx"}:
@@ -120,16 +206,32 @@ class TTSEngine:
         # LoRA clone prompt cache: adapter_path -> reusable voice_clone_prompt
         self._lora_prompt_cache = {}
         self._e2e_qwen_sim_provider = None
+        self._provider = self._create_provider()
 
     @property
     def mode(self):
-        return self._mode
+        return self._provider.mode
 
     @property
     def local_backend(self):
-        if self._mode != "local":
-            return None
-        return self._resolve_local_backend()
+        return self._provider.local_backend
+
+    @property
+    def provider_name(self):
+        return self._provider_name
+
+    def unload(self):
+        return self._provider.unload()
+
+    @staticmethod
+    def _normalize_provider_name(value):
+        normalized = str(value or "qwen3").strip().lower()
+        return normalized or "qwen3"
+
+    def _create_provider(self):
+        if self._provider_name == "qwen3":
+            return QwenAudioProvider(self)
+        raise ValueError(f"Unsupported TTS provider: {self._provider_name}")
 
     @staticmethod
     def _env_flag(name, default=False):
@@ -896,7 +998,7 @@ class TTSEngine:
     def _init_local_mlx_model(self, model_type):
         """Load MLX model on demand for Apple Silicon local backend."""
         model_ids = {
-            "custom_voice": "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit",
+            "custom_voice": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
             "voice_design": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit",
             "base": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
         }
@@ -1057,6 +1159,9 @@ class TTSEngine:
     # ── Clone prompt cache (local mode) ──────────────────────────
 
     def clear_clone_prompt_cache(self, speaker=None):
+        return self._provider.clear_clone_prompt_cache(speaker=speaker)
+
+    def _provider_clear_clone_prompt_cache(self, speaker=None):
         if speaker is None:
             self._clone_prompt_cache.clear()
             return
@@ -1107,6 +1212,11 @@ class TTSEngine:
     # ── Core generation methods ──────────────────────────────────
 
     def generate_custom_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        if self._provider_name != "qwen3":
+            raise NotImplementedError(f"Provider '{self._provider_name}' does not support custom voice generation")
+        return self._provider_generate_custom_voice(text, instruct_text, speaker, voice_config, output_path)
+
+    def _provider_generate_custom_voice(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate audio using CustomVoice model. Returns True on success."""
         if self._mode == "local":
             if self._resolve_local_backend() == "mlx":
@@ -1116,6 +1226,17 @@ class TTSEngine:
             return self._external_generate_custom(text, instruct_text, speaker, voice_config, output_path)
 
     def generate_clone_voice(self, text, speaker, voice_config, output_path, instruct_text=""):
+        if self._provider_name != "qwen3":
+            raise NotImplementedError(f"Provider '{self._provider_name}' does not support clone voice generation")
+        return self._provider_generate_clone_voice(
+            text,
+            speaker,
+            voice_config,
+            output_path,
+            instruct_text=instruct_text,
+        )
+
+    def _provider_generate_clone_voice(self, text, speaker, voice_config, output_path, instruct_text=""):
         """Generate audio using voice cloning. Returns True on success."""
         if self._mode == "local":
             if self._resolve_local_backend() == "mlx":
@@ -1125,6 +1246,9 @@ class TTSEngine:
             return self._external_generate_clone(text, speaker, voice_config, output_path)
 
     def generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
+        return self._provider.generate_voice(text, instruct_text, speaker, voice_config, output_path)
+
+    def _provider_generate_voice(self, text, instruct_text, speaker, voice_config, output_path):
         """Generate audio using the appropriate method based on voice type config."""
         voice_data = voice_config.get(speaker)
         if not voice_data:
@@ -1145,6 +1269,14 @@ class TTSEngine:
     # ── Voice design generation ──────────────────────────────────
 
     def generate_voice_design(self, description, sample_text, language=None, seed=-1):
+        return self._provider.generate_voice_design(
+            description=description,
+            sample_text=sample_text,
+            language=language,
+            seed=seed,
+        )
+
+    def _provider_generate_voice_design(self, description, sample_text, language=None, seed=-1):
         """Generate a voice from a text description using the VoiceDesign model.
 
         Args:
@@ -1223,6 +1355,11 @@ class TTSEngine:
         return wav_path, sr
 
     def generate_design_voice(self, text, instruct_text, voice_data, output_path):
+        if self._provider_name != "qwen3":
+            raise NotImplementedError(f"Provider '{self._provider_name}' does not support designed voices")
+        return self._provider_generate_design_voice(text, instruct_text, voice_data, output_path)
+
+    def _provider_generate_design_voice(self, text, instruct_text, voice_data, output_path):
         """Generate audio using VoiceDesign model with combined description + instruct.
 
         The voice_data 'description' field provides the base voice identity,
@@ -1253,6 +1390,11 @@ class TTSEngine:
     # ── LoRA voice generation ────────────────────────────────────
 
     def generate_lora_voice(self, text, instruct_text, voice_data, output_path):
+        if self._provider_name != "qwen3":
+            raise NotImplementedError(f"Provider '{self._provider_name}' does not support LoRA voices")
+        return self._provider_generate_lora_voice(text, instruct_text, voice_data, output_path)
+
+    def _provider_generate_lora_voice(self, text, instruct_text, voice_data, output_path):
         """Generate audio using a LoRA-finetuned Base model.
 
         The adapter directory must contain:
@@ -1378,6 +1520,16 @@ class TTSEngine:
     # ── Batch generation ─────────────────────────────────────────
 
     def generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None, log_callback=None):
+        return self._provider.generate_batch(
+            chunks,
+            voice_config,
+            output_dir,
+            batch_seed=batch_seed,
+            cancel_check=cancel_check,
+            log_callback=log_callback,
+        )
+
+    def _provider_generate_batch(self, chunks, voice_config, output_dir, batch_seed=-1, cancel_check=None, log_callback=None):
         """Generate multiple audio files.
 
         Local mode: uses native list-based batch API for custom voices.
@@ -1585,6 +1737,7 @@ class TTSEngine:
                 text=text,
                 voice=voice_name,
                 instruct=instruct,
+                lang_code=self._language,
                 speed=1.0,
             )
             self._save_wav(audio, sr, output_path)
@@ -1623,6 +1776,7 @@ class TTSEngine:
                 "text": text,
                 "ref_audio": ref_audio_path,
                 "ref_text": ref_text,
+                "lang_code": self._language,
             }
             if instruct:
                 kwargs["instruct"] = instruct

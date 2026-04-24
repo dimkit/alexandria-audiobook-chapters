@@ -168,6 +168,12 @@
                 <div class="card-body">
                         <div class="row mb-3">
                             <div class="col-md-2">
+                                <label class="form-label" title="Audio generation backend">Audio Provider</label>
+                                <select class="form-select" id="tts-provider" title="Audio generation backend">
+                                    <option value="qwen3">QWEN3</option>
+                                </select>
+                            </div>
+                            <div class="col-md-2">
                                 <label class="form-label" title="Local loads model in-process; External connects to a Gradio TTS server">TTS Mode</label>
                                 <select class="form-select" id="tts-mode" onchange="toggleTTSMode()" title="Local loads model in-process; External connects to a Gradio TTS server">
                                     <option value="external">External Server</option>
