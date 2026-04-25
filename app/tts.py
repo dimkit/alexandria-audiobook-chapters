@@ -1,4 +1,5 @@
 import contextlib
+import glob
 import io
 import os
 import re
@@ -30,6 +31,35 @@ QWEN_GENERATION_SECONDS_MARGIN = 0.0
 QWEN_GENERATION_TOKEN_BUFFER_FACTOR = 1.0
 QWEN_MIN_MAX_NEW_TOKENS = 24
 QWEN_MAX_MAX_NEW_TOKENS = 768
+QWEN_HF_MODEL_ALLOW_PATTERNS = (
+    "config.json",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "tokenizer_config.json",
+    "merges.txt",
+    "vocab.json",
+    "model*.safetensors",
+    "speech_tokenizer/*",
+)
+QWEN_HF_MODEL_REQUIRED_FILES = (
+    ("model.safetensors", "model-*.safetensors"),
+    ("speech_tokenizer/model.safetensors", "speech_tokenizer/model-*.safetensors"),
+)
+MLX_HF_MODEL_ALLOW_PATTERNS = (
+    "*.json",
+    "*.safetensors",
+    "*.py",
+    "*.model",
+    "*.tiktoken",
+    "*.txt",
+    "*.jsonl",
+    "*.yaml",
+    "*.npz",
+    "*.pth",
+)
+MLX_HF_MODEL_REQUIRED_FILES = (
+    ("*.safetensors", "*.npz"),
+)
 VOXCPM2_CFG_VALUE_DEFAULT = 1.6
 VOXCPM2_CFG_VALUE_MIN = 1.0
 VOXCPM2_CFG_VALUE_MAX = 3.0
@@ -760,6 +790,13 @@ class TTSEngine:
         backend = self._local_backend_preference
         if backend == "auto":
             backend = "mlx" if is_apple_silicon else "qwen"
+        elif backend == "qwen" and is_apple_silicon:
+            if not (
+                self._env_flag("THREADSPEAK_E2E_SIM_ENABLED", default=False)
+                and str(os.getenv("THREADSPEAK_E2E_QWEN_FIXTURE") or "").strip()
+            ):
+                print("Warning: local_backend=qwen requested on Apple Silicon. Falling back to mlx.")
+                backend = "mlx"
         elif backend == "mlx" and not is_apple_silicon:
             print("Warning: local_backend=mlx requested on non-Apple-Silicon host. Falling back to qwen.")
             backend = "qwen"
@@ -866,11 +903,19 @@ class TTSEngine:
         def _has_required_files(snapshot_path):
             if not os.path.exists(os.path.join(snapshot_path, "config.json")):
                 return False
+
+            def _requirement_exists(requirement):
+                requirement_text = str(requirement)
+                if glob.has_magic(requirement_text):
+                    matches = glob.glob(os.path.join(snapshot_path, requirement_text))
+                    return any(os.path.isfile(path) for path in matches)
+                return os.path.exists(os.path.join(snapshot_path, requirement_text))
+
             for requirement in required_files or ():
                 if isinstance(requirement, (list, tuple, set)):
-                    if not any(os.path.exists(os.path.join(snapshot_path, str(item))) for item in requirement):
+                    if not any(_requirement_exists(item) for item in requirement):
                         return False
-                elif not os.path.exists(os.path.join(snapshot_path, str(requirement))):
+                elif not _requirement_exists(requirement):
                     return False
             return True
 
@@ -890,7 +935,12 @@ class TTSEngine:
             cache_roots.append(os.path.join(hf_home, "hub"))
         cache_roots.append(os.path.join(LAYOUT.repo_root, "cache", "HF_HOME", "hub"))
 
+        seen_cache_roots = set()
         for cache_root in cache_roots:
+            cache_root = os.path.abspath(cache_root)
+            if cache_root in seen_cache_roots:
+                continue
+            seen_cache_roots.add(cache_root)
             snapshots_dir = os.path.join(cache_root, repo_cache_name, "snapshots")
             if not os.path.isdir(snapshots_dir):
                 continue
@@ -912,7 +962,7 @@ class TTSEngine:
         the local directory path directly, bypassing all HF Hub network calls.
         Falls back to normal download on first install when cache is empty.
         """
-        local_path = TTSEngine._resolve_local_model_path(model_id)
+        local_path = TTSEngine._resolve_local_model_path(model_id, required_files=QWEN_HF_MODEL_REQUIRED_FILES)
         if local_path:
             print(f"  Loading from local cache: {local_path}")
             return model_cls.from_pretrained(local_path, **load_kwargs)
@@ -923,7 +973,16 @@ class TTSEngine:
                     f"and no local cache exists for {model_id}."
                 )
             print(f"  Model not cached locally, downloading {model_id}...")
-            downloaded_path = ensure_hf_snapshot(model_id, display_name=model_id)
+            downloaded_path = ensure_hf_snapshot(
+                model_id,
+                display_name=model_id,
+                allow_patterns=QWEN_HF_MODEL_ALLOW_PATTERNS,
+                local_path_resolver=lambda repo_id, required_files=None: TTSEngine._resolve_local_model_path(
+                    repo_id,
+                    required_files=required_files,
+                ),
+                required_files=QWEN_HF_MODEL_REQUIRED_FILES,
+            )
             return model_cls.from_pretrained(downloaded_path, **load_kwargs)
 
     @staticmethod
@@ -1143,7 +1202,7 @@ class TTSEngine:
                     "MLX backend is not installed. Run Install on Apple Silicon to install mlx-audio dependencies."
                 ) from e
 
-            local_path = TTSEngine._resolve_local_model_path(model_id)
+            local_path = TTSEngine._resolve_local_model_path(model_id, required_files=MLX_HF_MODEL_REQUIRED_FILES)
             if local_path:
                 load_target = local_path
             else:
@@ -1152,7 +1211,16 @@ class TTSEngine:
                         "Model downloads are disabled by THREADSPEAK_DISABLE_MODEL_DOWNLOADS "
                         f"and no local cache exists for {model_id}."
                     )
-                load_target = ensure_hf_snapshot(model_id, display_name=model_id)
+                load_target = ensure_hf_snapshot(
+                    model_id,
+                    display_name=model_id,
+                    allow_patterns=MLX_HF_MODEL_ALLOW_PATTERNS,
+                    local_path_resolver=lambda repo_id, required_files=None: TTSEngine._resolve_local_model_path(
+                        repo_id,
+                        required_files=required_files,
+                    ),
+                    required_files=MLX_HF_MODEL_REQUIRED_FILES,
+                )
             print(f"Loading MLX TTS model ({model_type}) from {load_target} ...")
             with self._suppress_known_transformers_qwen3_warnings():
                 model = load_model(load_target)

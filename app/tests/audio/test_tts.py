@@ -98,7 +98,18 @@ class NormalizeExternalUrlTests(unittest.TestCase):
         with mock.patch.object(TTSEngine, "_resolve_local_model_path", return_value=None):
             TTSEngine._load_model(fake_model_cls, "Qwen/example", {"dtype": "float32"})
 
-        mock_download.assert_called_once_with("Qwen/example", display_name="Qwen/example")
+        mock_download.assert_called_once()
+        self.assertEqual(mock_download.call_args.args, ("Qwen/example",))
+        self.assertEqual(mock_download.call_args.kwargs["display_name"], "Qwen/example")
+        self.assertIn("model*.safetensors", mock_download.call_args.kwargs["allow_patterns"])
+        self.assertIn("speech_tokenizer/*", mock_download.call_args.kwargs["allow_patterns"])
+        self.assertEqual(
+            mock_download.call_args.kwargs["required_files"],
+            (
+                ("model.safetensors", "model-*.safetensors"),
+                ("speech_tokenizer/model.safetensors", "speech_tokenizer/model-*.safetensors"),
+            ),
+        )
         fake_model_cls.from_pretrained.assert_called_once_with("/cache/qwen-example", dtype="float32")
 
     def test_resolve_local_model_path_skips_incomplete_required_snapshot(self):
@@ -135,6 +146,43 @@ class NormalizeExternalUrlTests(unittest.TestCase):
                         "model.safetensors",
                         ("audiovae.safetensors", "audiovae.pth"),
                     ),
+                )
+
+        self.assertEqual(resolved, complete)
+
+    def test_resolve_local_model_path_supports_glob_required_files(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            cache_root = os.path.join(temp_root, "hub")
+            incomplete = os.path.join(
+                cache_root,
+                "models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-8bit",
+                "snapshots",
+                "zzz-incomplete",
+            )
+            complete = os.path.join(
+                cache_root,
+                "models--mlx-community--Qwen3-TTS-12Hz-1.7B-Base-8bit",
+                "snapshots",
+                "aaa-complete",
+            )
+            os.makedirs(incomplete, exist_ok=True)
+            os.makedirs(complete, exist_ok=True)
+            for path in (
+                os.path.join(incomplete, "config.json"),
+                os.path.join(incomplete, "model.safetensors.index.json"),
+                os.path.join(complete, "config.json"),
+                os.path.join(complete, "model-00001-of-00002.safetensors"),
+            ):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("{}")
+
+            with mock.patch(
+                "huggingface_hub.try_to_load_from_cache",
+                return_value=os.path.join(incomplete, "config.json"),
+            ), mock.patch.dict(os.environ, {"HUGGINGFACE_HUB_CACHE": cache_root}, clear=False):
+                resolved = TTSEngine._resolve_local_model_path(
+                    "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+                    required_files=(("*.safetensors", "*.npz"),),
                 )
 
         self.assertEqual(resolved, complete)
@@ -1013,6 +1061,24 @@ class LocalBackendResolutionTests(unittest.TestCase):
         engine = TTSEngine({"tts": {"mode": "local", "local_backend": "mlx"}})
         self.assertEqual(engine.local_backend, "qwen")
 
+    @mock.patch.object(TTSEngine, "_host_platform", return_value=("darwin", "arm64"))
+    def test_explicit_qwen_falls_back_to_mlx_on_apple_silicon(self, _mock_platform):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
+        self.assertEqual(engine.local_backend, "mlx")
+
+    @mock.patch.object(TTSEngine, "_host_platform", return_value=("darwin", "arm64"))
+    def test_e2e_qwen_sim_can_use_fixture_backend_on_apple_silicon(self, _mock_platform):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "THREADSPEAK_E2E_SIM_ENABLED": "1",
+                "THREADSPEAK_E2E_QWEN_FIXTURE": "/tmp/qwen-fixture.json",
+            },
+            clear=False,
+        ):
+            engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
+            self.assertEqual(engine.local_backend, "qwen")
+
 
 class MlxInstructionRoutingTests(unittest.TestCase):
     def test_custom_voice_loads_instruction_capable_mlx_model(self):
@@ -1044,6 +1110,40 @@ class MlxInstructionRoutingTests(unittest.TestCase):
             load_calls,
             ["/cache/mlx-custom"],
         )
+
+    @mock.patch("tts.ensure_hf_snapshot", return_value="/cache/mlx-base")
+    def test_mlx_model_download_provider_requires_weight_bearing_snapshot(self, mock_download):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "mlx"}})
+        fake_model = mock.Mock()
+
+        fake_mlx_audio = types.ModuleType("mlx_audio")
+        fake_tts = types.ModuleType("mlx_audio.tts")
+        fake_utils = types.ModuleType("mlx_audio.tts.utils")
+        fake_utils.load_model = mock.Mock(return_value=fake_model)
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "mlx_audio": fake_mlx_audio,
+                "mlx_audio.tts": fake_tts,
+                "mlx_audio.tts.utils": fake_utils,
+            },
+        ), mock.patch.object(TTSEngine, "_resolve_local_model_path", return_value=None) as mock_resolver:
+            engine._init_local_mlx_model("base")
+
+        mock_resolver.assert_called_once_with(
+            "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+            required_files=(("*.safetensors", "*.npz"),),
+        )
+        mock_download.assert_called_once()
+        self.assertEqual(mock_download.call_args.args, ("mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",))
+        self.assertEqual(
+            mock_download.call_args.kwargs["required_files"],
+            (("*.safetensors", "*.npz"),),
+        )
+        self.assertIn("*.safetensors", mock_download.call_args.kwargs["allow_patterns"])
+        self.assertIn("*.npz", mock_download.call_args.kwargs["allow_patterns"])
+        fake_utils.load_model.assert_called_once_with("/cache/mlx-base")
 
 
 class LocalBatchRegressionTests(unittest.TestCase):

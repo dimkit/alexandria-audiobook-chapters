@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 import uuid
+import glob
 from typing import Any, Callable, Dict, Optional
 
 
@@ -23,9 +24,11 @@ class ModelDownloadManager:
         self,
         *,
         clear_completed_after_seconds: float = 4.0,
+        publish_interval_seconds: float = 0.5,
         time_fn: Callable[[], float] = time.time,
     ):
         self._clear_completed_after_seconds = max(0.0, float(clear_completed_after_seconds))
+        self._publish_interval_seconds = max(0.05, float(publish_interval_seconds))
         self._time_fn = time_fn
         self._lock = threading.Lock()
         self._downloads: Dict[str, Dict[str, Any]] = {}
@@ -151,6 +154,10 @@ class ModelDownloadManager:
         try:
             fn = operation.get("snapshot_download_fn") or snapshot_download
             result = fn(repo_id=repo, tqdm_class=tqdm_class, **dict(operation.get("kwargs") or {}))
+            if not self._snapshot_has_required_files(result, operation.get("required_files")):
+                raise RuntimeError(
+                    f"Downloaded snapshot for {repo} is missing required model files."
+                )
             self._complete_download(download_id)
             return result
         except Exception as exc:
@@ -205,6 +212,7 @@ class ModelDownloadManager:
                 "error": "",
                 "files": {},
                 "retryable": False,
+                "last_published_at": now,
             }
             self._retry_specs[download_id] = dict(operation)
         self._publish()
@@ -258,27 +266,43 @@ class ModelDownloadManager:
         manager = self
 
         class DownloadProgress:
+            _lock = threading.RLock()
+
+            @classmethod
+            def get_lock(cls):
+                return cls._lock
+
+            @classmethod
+            def set_lock(cls, lock):
+                cls._lock = lock
+
             def __init__(self, *args, **kwargs):
+                self.iterable = args[0] if args else kwargs.get("iterable")
                 self.total = int(kwargs.get("total") or 0)
                 self.n = int(kwargs.get("initial") or 0)
                 desc = kwargs.get("desc") or kwargs.get("filename") or fallback_filename
                 self._row_id = uuid.uuid4().hex
                 self._last_bytes = self.n
                 self._last_time = manager._time_fn()
-                manager._update_file(
-                    download_id,
-                    self._row_id,
-                    filename=str(desc or fallback_filename),
-                    downloaded_bytes=self.n,
-                    total_bytes=self.total,
-                    speed_bps=0.0,
-                    status="active",
-                )
+                unit = str(kwargs.get("unit") or "").strip()
+                self._track_bytes = unit == "B" or bool(kwargs.get("unit_scale") and str(desc or "").startswith("Downloading"))
+                if self._track_bytes:
+                    manager._update_file(
+                        download_id,
+                        self._row_id,
+                        filename=manager._progress_filename(str(desc or ""), fallback_filename),
+                        downloaded_bytes=self.n,
+                        total_bytes=self.total,
+                        speed_bps=0.0,
+                        status="active",
+                    )
 
             def update(self, n=1):
                 now = manager._time_fn()
                 increment = int(n or 0)
                 self.n += increment
+                if not self._track_bytes:
+                    return None
                 elapsed = max(0.001, now - self._last_time)
                 speed = max(0.0, float(self.n - self._last_bytes) / elapsed)
                 self._last_time = now
@@ -294,20 +318,40 @@ class ModelDownloadManager:
                 )
 
             def close(self):
-                manager._complete_file(download_id, self._row_id)
+                if self._track_bytes:
+                    manager._complete_file(download_id, self._row_id)
 
             def refresh(self):
+                if self._track_bytes:
+                    manager._update_file(
+                        download_id,
+                        self._row_id,
+                        filename=fallback_filename,
+                        downloaded_bytes=self.n,
+                        total_bytes=self.total,
+                        speed_bps=0.0,
+                        status="active",
+                    )
                 return None
 
             def reset(self, total=None):
                 if total is not None:
                     self.total = int(total or 0)
+                    self.refresh()
 
             def set_description(self, desc=None, refresh=True):
-                manager._rename_file(download_id, self._row_id, str(desc or fallback_filename))
+                if self._track_bytes:
+                    manager._rename_file(download_id, self._row_id, manager._progress_filename(str(desc or ""), fallback_filename))
 
             def set_postfix(self, *args, **kwargs):
                 return None
+
+            def __iter__(self):
+                if self.iterable is None:
+                    return iter(())
+                for item in self.iterable:
+                    yield item
+                    self.update(1)
 
             def __enter__(self):
                 return self
@@ -317,6 +361,13 @@ class ModelDownloadManager:
                 return False
 
         return DownloadProgress
+
+    @staticmethod
+    def _progress_filename(desc: str, fallback_filename: str) -> str:
+        text = str(desc or "").strip()
+        if not text or text.startswith("Downloading") or text.startswith("Download complete"):
+            return str(fallback_filename or "model weights")
+        return text
 
     def _update_file(
         self,
@@ -353,14 +404,14 @@ class ModelDownloadManager:
             row["status"] = status
             row["updated_at"] = now
             item["updated_at"] = now
-        self._publish()
+        self._publish_progress(download_id)
 
     def _rename_file(self, download_id: str, row_id: str, filename: str):
         with self._lock:
             row = ((self._downloads.get(download_id) or {}).get("files") or {}).get(row_id)
             if row:
                 row["filename"] = filename
-        self._publish()
+        self._publish_progress(download_id)
 
     def _complete_file(self, download_id: str, row_id: str):
         with self._lock:
@@ -371,7 +422,7 @@ class ModelDownloadManager:
                 row["status"] = "completed"
                 row["eta_seconds"] = 0
                 row["updated_at"] = self._time_fn()
-        self._publish()
+        self._publish_progress(download_id)
 
     def _ensure_file_row(self, download_id: str, filename: str):
         with self._lock:
@@ -391,6 +442,30 @@ class ModelDownloadManager:
                 "updated_at": now,
                 "error": "",
             }
+
+    @staticmethod
+    def _snapshot_has_required_files(snapshot_path: str, required_files: Any) -> bool:
+        if not required_files:
+            return True
+        root = str(snapshot_path or "").strip()
+        if not root or not os.path.isdir(root):
+            return False
+
+        def requirement_exists(requirement: Any) -> bool:
+            text = str(requirement or "").strip()
+            if not text:
+                return False
+            if glob.has_magic(text):
+                return any(os.path.isfile(path) for path in glob.glob(os.path.join(root, text)))
+            return os.path.exists(os.path.join(root, text))
+
+        for requirement in required_files:
+            if isinstance(requirement, (list, tuple, set)):
+                if not any(requirement_exists(item) for item in requirement):
+                    return False
+            elif not requirement_exists(requirement):
+                return False
+        return True
 
     def _serialize_download_locked(self, item: Dict[str, Any], *, include_completed: bool) -> Dict[str, Any]:
         files = [dict(row) for row in item.get("files", {}).values()]
@@ -449,6 +524,18 @@ class ModelDownloadManager:
                     subscriber_queue.put_nowait(payload)
                 except queue.Full:
                     self.unsubscribe(subscriber_id)
+
+    def _publish_progress(self, download_id: str):
+        with self._lock:
+            item = self._downloads.get(download_id)
+            if not item:
+                return
+            now = self._time_fn()
+            last = float(item.get("last_published_at") or 0.0)
+            if now - last < self._publish_interval_seconds:
+                return
+            item["last_published_at"] = now
+        self._publish()
 
     @staticmethod
     def _raise_if_disabled(repo_id: str):
