@@ -46,6 +46,14 @@ class VoxCPM2AudioProvider:
             clear_cache()
         return True
 
+    def unload_voice_design_model(self):
+        had_model = self._model is not None
+        self._model = None
+        clear_cache = getattr(self.engine, "_clear_gpu_cache", None)
+        if callable(clear_cache):
+            clear_cache()
+        return bool(had_model)
+
     def clear_clone_prompt_cache(self, speaker=None):
         # VoxCPM2 uses reference_wav_path directly and does not build reusable
         # prompt objects, so there is no provider-side prompt cache to clear.

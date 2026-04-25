@@ -1233,3 +1233,13 @@ class ProjectVoiceMixin:
                 pass
 
             return True
+
+        def unload_voice_design_model(self):
+            engine = self.engine
+            if not engine:
+                return False
+
+            unload = getattr(engine, "unload_voice_design_model", None)
+            if callable(unload):
+                return bool(unload())
+            return False

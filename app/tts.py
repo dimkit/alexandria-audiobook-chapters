@@ -105,6 +105,9 @@ class AudioProvider:
     def clear_clone_prompt_cache(self, speaker=None):
         raise NotImplementedError
 
+    def unload_voice_design_model(self):
+        raise NotImplementedError
+
     def unload(self):
         raise NotImplementedError
 
@@ -145,6 +148,16 @@ class QwenAudioProvider(AudioProvider):
 
     def clear_clone_prompt_cache(self, speaker=None):
         return self.engine._provider_clear_clone_prompt_cache(speaker=speaker)
+
+    def unload_voice_design_model(self):
+        had_design_model = self.engine._local_design_model is not None
+        had_mlx_design_model = "voice_design" in self.engine._mlx_models
+        self.engine._local_design_model = None
+        self.engine._mlx_models.pop("voice_design", None)
+        clear_cache = getattr(self.engine, "_clear_gpu_cache", None)
+        if callable(clear_cache):
+            clear_cache()
+        return bool(had_design_model or had_mlx_design_model)
 
     def unload(self):
         self.engine._provider_clear_clone_prompt_cache()
@@ -262,6 +275,12 @@ class TTSEngine:
 
     def unload(self):
         return self._provider.unload()
+
+    def unload_voice_design_model(self):
+        unload = getattr(self._provider, "unload_voice_design_model", None)
+        if callable(unload):
+            return bool(unload())
+        return False
 
     @staticmethod
     def _normalize_provider_name(value):

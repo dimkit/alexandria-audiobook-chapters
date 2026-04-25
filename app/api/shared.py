@@ -198,7 +198,7 @@ def _media_static_server_command(port):
         sys.executable,
         "-m",
         "uvicorn",
-        "api.media_static_server:app",
+        "media_static_server:app",
         "--host",
         "127.0.0.1",
         "--port",
@@ -4483,6 +4483,18 @@ def _audio_job_runner(job, settings, run_token, result_holder, done_event):
             if not is_active():
                 return True
             return process_state["audio"]["cancel"] or audio_cancel_event.is_set()
+
+    try:
+        unloaded_voice_design = project_manager.unload_voice_design_model()
+        if unloaded_voice_design:
+            _append_audio_log(f"{job_prefix} Unloaded voice-design model state before audio generation.")
+        else:
+            _append_audio_log(f"{job_prefix} No loaded voice-design model state found before audio generation.")
+    except BaseException as e:
+        result_holder["error"] = f"Voice design model unload failed before audio generation: {e}"
+        _append_audio_log(f"{job_prefix} {result_holder['error']}")
+        done_event.set()
+        return
 
     try:
         project_manager.register_audio_finalization_listener(

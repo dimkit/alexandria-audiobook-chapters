@@ -100,5 +100,124 @@ class LMStudioUnloadRouterWiringTests(unittest.TestCase):
         unload_mock.assert_not_called()
 
 
+class EditorAudioVoiceDesignUnloadTests(unittest.TestCase):
+    def setUp(self):
+        self.original_audio_current_job = shared_module.audio_current_job
+
+    def tearDown(self):
+        shared_module.audio_current_job = self.original_audio_current_job
+
+    @staticmethod
+    def _job(kind="parallel"):
+        return {
+            "id": 99,
+            "corr_id": "audio-test",
+            "kind": kind,
+            "uids": ["chunk-1"],
+            "pending_uids": ["chunk-1"],
+            "generation_pending_uids": ["chunk-1"],
+            "pending_finalize_uids": [],
+            "generation_finished": False,
+            "processed_clips": 0,
+            "error_clips": 0,
+            "finalizer_failures": 0,
+            "retry_uids": [],
+            "run_token": "run-token",
+        }
+
+    def test_audio_job_runner_unloads_voice_design_before_parallel_generation(self):
+        job = self._job("parallel")
+        done_event = shared_module.threading.Event()
+        result_holder = {}
+        manager = mock.Mock()
+        manager.generate_chunks_parallel.return_value = {"completed": ["chunk-1"], "failed": [], "cancelled": 0}
+        settings = {"workers": 2, "batch_seed": -1, "batch_size": 2, "batch_group_by_type": False, "tts_cfg": {}}
+
+        with (
+            mock.patch.object(shared_module, "project_manager", manager),
+            mock.patch.object(shared_module, "audio_current_job", job),
+            mock.patch.object(shared_module, "_append_audio_log"),
+            mock.patch.object(shared_module, "_append_audio_log_locked"),
+            mock.patch.object(shared_module, "record_audio_perf"),
+        ):
+            shared_module._audio_job_runner(job, settings, job["run_token"], result_holder, done_event)
+
+        self.assertTrue(done_event.is_set())
+        self.assertEqual(result_holder["results"], {"completed": ["chunk-1"], "failed": [], "cancelled": 0})
+        manager.unload_voice_design_model.assert_called_once()
+        manager.generate_chunks_parallel.assert_called_once()
+        self.assertLess(
+            manager.method_calls.index(mock.call.unload_voice_design_model()),
+            manager.method_calls.index(mock.call.generate_chunks_parallel(
+                ["chunk-1"],
+                2,
+                mock.ANY,
+                cancel_check=mock.ANY,
+                item_callback=mock.ANY,
+                generation_token="run-token",
+                item_started_callback=mock.ANY,
+            )),
+        )
+
+    def test_audio_job_runner_unloads_voice_design_before_batch_generation(self):
+        job = self._job("batch_fast")
+        done_event = shared_module.threading.Event()
+        result_holder = {}
+        manager = mock.Mock()
+        manager.generate_chunks_batch.return_value = {"completed": ["chunk-1"], "failed": [], "cancelled": 0}
+        settings = {"workers": 2, "batch_seed": 7, "batch_size": 4, "batch_group_by_type": True, "tts_cfg": {}}
+
+        with (
+            mock.patch.object(shared_module, "project_manager", manager),
+            mock.patch.object(shared_module, "audio_current_job", job),
+            mock.patch.object(shared_module, "_append_audio_log"),
+            mock.patch.object(shared_module, "_append_audio_log_locked"),
+            mock.patch.object(shared_module, "record_audio_perf"),
+        ):
+            shared_module._audio_job_runner(job, settings, job["run_token"], result_holder, done_event)
+
+        self.assertTrue(done_event.is_set())
+        self.assertEqual(result_holder["results"], {"completed": ["chunk-1"], "failed": [], "cancelled": 0})
+        manager.unload_voice_design_model.assert_called_once()
+        manager.generate_chunks_batch.assert_called_once()
+        self.assertLess(
+            manager.method_calls.index(mock.call.unload_voice_design_model()),
+            manager.method_calls.index(mock.call.generate_chunks_batch(
+                ["chunk-1"],
+                7,
+                4,
+                mock.ANY,
+                batch_group_by_type=True,
+                cancel_check=mock.ANY,
+                item_callback=mock.ANY,
+                generation_token="run-token",
+                item_started_callback=mock.ANY,
+                log_callback=mock.ANY,
+            )),
+        )
+
+    def test_audio_job_runner_fails_before_generation_when_voice_design_unload_fails(self):
+        job = self._job("parallel")
+        done_event = shared_module.threading.Event()
+        result_holder = {}
+        manager = mock.Mock()
+        manager.unload_voice_design_model.side_effect = RuntimeError("designer still loaded")
+        settings = {"workers": 2, "batch_seed": -1, "batch_size": 2, "batch_group_by_type": False, "tts_cfg": {}}
+
+        with (
+            mock.patch.object(shared_module, "project_manager", manager),
+            mock.patch.object(shared_module, "audio_current_job", job),
+            mock.patch.object(shared_module, "_append_audio_log") as append_log,
+            mock.patch.object(shared_module, "_append_audio_log_locked"),
+            mock.patch.object(shared_module, "record_audio_perf"),
+        ):
+            shared_module._audio_job_runner(job, settings, job["run_token"], result_holder, done_event)
+
+        self.assertTrue(done_event.is_set())
+        self.assertIn("designer still loaded", result_holder["error"])
+        manager.generate_chunks_parallel.assert_not_called()
+        self.assertTrue(any("designer still loaded" in str(call.args[0]) for call in append_log.call_args_list))
+
+
 if __name__ == "__main__":
     unittest.main()

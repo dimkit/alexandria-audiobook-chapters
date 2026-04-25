@@ -1,4 +1,7 @@
 import os
+import json
+import subprocess
+import sys
 import tempfile
 import urllib.request
 import unittest
@@ -15,6 +18,74 @@ from runtime_layout import LAYOUT
 class MediaStaticProxyTests(unittest.TestCase):
     def tearDown(self):
         shared._shutdown_media_static_server()
+
+    def test_media_static_server_command_uses_lightweight_module(self):
+        command = shared._media_static_server_command(43123)
+
+        self.assertIn("media_static_server:app", command)
+        self.assertNotIn("api.media_static_server:app", command)
+
+    def test_media_static_server_import_stays_lightweight(self):
+        script = """
+import importlib
+import json
+import sys
+
+importlib.import_module("media_static_server")
+heavy_prefixes = (
+    "api",
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "tts",
+    "tts_providers",
+    "numpy",
+    "scipy",
+    "soundfile",
+    "pydub",
+)
+loaded = sorted(
+    name
+    for name in sys.modules
+    if name == "api" or name.startswith(tuple(f"{prefix}." for prefix in heavy_prefixes))
+)
+print(json.dumps(loaded))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=LAYOUT.app_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [])
+
+    def test_api_package_import_has_no_app_startup_side_effects(self):
+        script = """
+import importlib
+import json
+import sys
+
+importlib.import_module("api")
+loaded = sorted(
+    name
+    for name in sys.modules
+    if name in {"api.main", "api.shared"} or name.startswith("api.routers.")
+)
+print(json.dumps(loaded))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=LAYOUT.app_dir,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [])
 
     def test_voicelines_proxy_redirects_to_media_origin(self):
         with tempfile.TemporaryDirectory() as temp_root:

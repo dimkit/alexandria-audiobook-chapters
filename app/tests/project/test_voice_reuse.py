@@ -37,6 +37,18 @@ def _shutdown_manager(manager):
 
 
 class SavedVoiceReuseTests(unittest.TestCase):
+    def test_unload_voice_design_model_does_not_initialize_engine_when_unloaded(self):
+        with tempfile.TemporaryDirectory() as temp_root:
+            manager = _seed_project_manager(temp_root)
+            try:
+                manager.engine = None
+                manager.get_engine = lambda: (_ for _ in ()).throw(AssertionError("get_engine should not be called"))
+
+                self.assertFalse(manager.unload_voice_design_model())
+                self.assertIsNone(manager.engine)
+            finally:
+                _shutdown_manager(manager)
+
     def test_narrator_alias_is_resolved_for_in_project_voice_reuse(self):
         self.assertEqual(
             app_module._resolve_voice_alias_target("NARRATOR", "Kit", {"NARRATOR", "Kit", "Maddie"}),

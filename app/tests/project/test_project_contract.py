@@ -144,6 +144,7 @@ EXPECTED_PROJECT_MANAGER_METHODS = {
     "get_engine",
     "has_active_tts_work",
     "unload_tts_engine",
+    "unload_voice_design_model",
     "_load_asr_settings",
     "get_asr_engine",
     "_clear_proofread_state",

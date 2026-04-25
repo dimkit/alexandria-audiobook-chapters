@@ -154,6 +154,51 @@ class NormalizeExternalUrlTests(unittest.TestCase):
         self.assertIn(os.path.join("designed_voices", "previews"), preview_path)
         self.assertTrue(os.path.isdir(os.path.dirname(preview_path)))
 
+    def test_qwen_unload_voice_design_model_clears_only_design_state(self):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
+        custom_model = object()
+        clone_model = object()
+        design_model = object()
+        base_mlx_model = object()
+        design_mlx_model = object()
+        engine._local_custom_model = custom_model
+        engine._local_clone_model = clone_model
+        engine._local_design_model = design_model
+        engine._mlx_models = {
+            "base": base_mlx_model,
+            "voice_design": design_mlx_model,
+        }
+
+        with mock.patch.object(engine, "_clear_gpu_cache") as clear_cache:
+            self.assertTrue(engine.unload_voice_design_model())
+
+        self.assertIs(engine._local_custom_model, custom_model)
+        self.assertIs(engine._local_clone_model, clone_model)
+        self.assertIsNone(engine._local_design_model)
+        self.assertEqual(engine._mlx_models, {"base": base_mlx_model})
+        clear_cache.assert_called_once()
+
+    def test_voxcpm2_unload_voice_design_model_clears_provider_model(self):
+        engine = TTSEngine({"tts": {"provider": "voxcpm2", "mode": "local"}})
+        provider = engine._provider
+        provider._model = object()
+
+        with mock.patch.object(engine, "_clear_gpu_cache") as clear_cache:
+            self.assertTrue(engine.unload_voice_design_model())
+
+        self.assertIsNone(provider._model)
+        clear_cache.assert_called_once()
+
+    def test_unload_voice_design_model_is_safe_when_nothing_loaded(self):
+        engine = TTSEngine({"tts": {"mode": "local", "local_backend": "qwen"}})
+
+        with mock.patch.object(engine, "_clear_gpu_cache") as clear_cache:
+            self.assertFalse(engine.unload_voice_design_model())
+
+        self.assertIsNone(engine._local_design_model)
+        self.assertEqual(engine._mlx_models, {})
+        clear_cache.assert_called_once()
+
     def test_get_clone_prompt_resolves_relative_audio_against_project_root(self):
         with tempfile.TemporaryDirectory() as temp_root:
             clone_dir = os.path.join(temp_root, "clone_voices")
