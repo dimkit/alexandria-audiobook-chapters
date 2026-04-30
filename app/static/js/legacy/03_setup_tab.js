@@ -46,6 +46,14 @@
             }
         }
 
+        function toggleQwen3DesignedVoicesOption() {
+            const provider = document.getElementById('tts-provider')?.value || 'qwen3';
+            const group = document.getElementById('qwen3-designed-voices-group');
+            if (group) {
+                group.style.display = provider === 'qwen3' ? '' : 'none';
+            }
+        }
+
         function isMacHostUI() {
             const uaPlatform = navigator.userAgentData?.platform || '';
             const legacyPlatform = navigator.platform || '';
@@ -121,6 +129,7 @@
             const provider = document.getElementById('tts-provider')?.value || 'qwen3';
             applyProviderScriptMaxLengthDefault(provider);
             toggleVoxCPM2Options();
+            toggleQwen3DesignedVoicesOption();
         }
 
         let _llmToolCapabilityCache = null;
@@ -438,6 +447,7 @@
                 const ttsProvider = config.tts.provider || 'qwen3';
                 document.getElementById('tts-provider').value = ttsProvider;
                 _lastTTSProvider = ttsProvider;
+                document.getElementById('qwen3-designed-voices').checked = config.tts.designed_voices !== false;
                 document.getElementById('tts-mode').value = config.tts.mode || 'external';
                 document.getElementById('tts-url').value = config.tts.url || 'http://127.0.0.1:7860';
                 document.getElementById('tts-language').value = config.tts.language || 'English';
@@ -482,6 +492,7 @@
                 document.getElementById('voxcpm-denoise-reference').checked = coerceConfigBool(config.tts.voxcpm_denoise_reference, false);
                 document.getElementById('voxcpm-optimize').checked = coerceConfigBool(config.tts.voxcpm_optimize, false);
                 toggleTTSMode();
+                toggleQwen3DesignedVoicesOption();
                 applyBatchSettingsVisibility();
 
                 // Load custom prompts if they exist and are non-empty
@@ -756,6 +767,7 @@
                 provider,
                 mode: document.getElementById('tts-mode').value,
                 local_backend: 'auto',
+                designed_voices: document.getElementById('qwen3-designed-voices').checked,
                 url: document.getElementById('tts-url').value,
                 device: 'auto',
                 language: document.getElementById('tts-language').value,
@@ -886,7 +898,7 @@
                 // LLM
                 'llm-url': 'llm', 'llm-key': 'llm', 'llm-model': 'llm', 'llm-workers': 'llm',
                 // TTS
-                'tts-provider': 'tts', 'tts-mode': 'tts', 'tts-url': 'tts', 'tts-language': 'tts',
+                'tts-provider': 'tts', 'qwen3-designed-voices': 'tts', 'tts-mode': 'tts', 'tts-url': 'tts', 'tts-language': 'tts',
                 'parallel-workers': 'tts', 'batch-seed': 'tts',
                 'compile-codec': 'tts', 'batch-group-by-type': 'tts',
                 'sub-batch-enabled': 'tts', 'sub-batch-min-size': 'tts',

@@ -33,6 +33,9 @@ def test_get_config_exposes_expected_defaults():
     if int((data.get("tts") or {}).get("script_max_length") or 0) != 250:
         raise TestFailure(f"Expected default script_max_length=250, got {(data.get('tts') or {}).get('script_max_length')!r}")
 
+    if (data.get("tts") or {}).get("designed_voices") is not True:
+        raise TestFailure("Expected default tts.designed_voices=true")
+
     proofread_threshold = (data.get("proofread") or {}).get("certainty_threshold")
     if float(proofread_threshold or 0.0) != 0.75:
         raise TestFailure(f"Expected default proofread certainty_threshold=0.75, got {proofread_threshold!r}")
@@ -47,6 +50,7 @@ def test_get_config_backfills_missing_defaults_with_expected_values():
     modified.setdefault("tts", {})
     modified["tts"]["provider"] = None
     modified["tts"]["script_max_length"] = None
+    modified["tts"].pop("designed_voices", None)
     modified["proofread"] = {"certainty_threshold": None}
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(modified, f, indent=2, ensure_ascii=False)
@@ -59,6 +63,8 @@ def test_get_config_backfills_missing_defaults_with_expected_values():
             raise TestFailure("GET /api/config did not backfill tts.provider='qwen3'")
         if int((data.get("tts") or {}).get("script_max_length") or 0) != 250:
             raise TestFailure("GET /api/config did not backfill tts.script_max_length=250")
+        if (data.get("tts") or {}).get("designed_voices") is not True:
+            raise TestFailure("GET /api/config did not backfill tts.designed_voices=true")
         if float(((data.get("proofread") or {}).get("certainty_threshold") or 0.0)) != 0.75:
             raise TestFailure("GET /api/config did not backfill proofread.certainty_threshold=0.75")
 
@@ -68,6 +74,8 @@ def test_get_config_backfills_missing_defaults_with_expected_values():
             raise TestFailure("Backfilled tts.provider was not persisted")
         if int((persisted.get("tts") or {}).get("script_max_length") or 0) != 250:
             raise TestFailure("Backfilled script_max_length was not persisted")
+        if (persisted.get("tts") or {}).get("designed_voices") is not True:
+            raise TestFailure("Backfilled tts.designed_voices was not persisted")
         if float(((persisted.get("proofread") or {}).get("certainty_threshold") or 0.0)) != 0.75:
             raise TestFailure("Backfilled proofread certainty_threshold was not persisted")
     finally:
@@ -568,6 +576,35 @@ def test_save_setup_config_roundtrip_tts_provider():
         readback = r.json()
         if readback.get("tts", {}).get("provider") != "voxcpm2":
             raise TestFailure("POST /api/config/setup did not persist tts.provider")
+    finally:
+        post("/api/config", json=original)
+
+def test_save_setup_config_roundtrip_designed_voices_false_with_voxcpm2_provider():
+    r = get("/api/config")
+    assert_status(r, 200)
+    original = r.json()
+
+    payload = {
+        "tts": {
+            "provider": "voxcpm2",
+            "designed_voices": False,
+            "mode": original.get("tts", {}).get("mode", "local"),
+            "url": original.get("tts", {}).get("url", "http://127.0.0.1:7860"),
+            "language": original.get("tts", {}).get("language", "English"),
+            "parallel_workers": original.get("tts", {}).get("parallel_workers", 4),
+        }
+    }
+    r = post("/api/config/setup", json=payload)
+    assert_status(r, 200)
+
+    try:
+        r = get("/api/config")
+        assert_status(r, 200)
+        tts = r.json().get("tts", {})
+        if tts.get("provider") != "voxcpm2":
+            raise TestFailure("POST /api/config/setup did not persist provider=voxcpm2")
+        if tts.get("designed_voices") is not False:
+            raise TestFailure("POST /api/config/setup did not persist tts.designed_voices=false")
     finally:
         post("/api/config", json=original)
 

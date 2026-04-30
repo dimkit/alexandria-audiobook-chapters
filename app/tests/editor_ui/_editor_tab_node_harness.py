@@ -30,6 +30,7 @@ class EditorTabChunkPollTests(unittest.TestCase):
                 getNarratorSelections: () => getNarratorSelections(),
                 enqueueTrackedChunkUpdate: (chunk) => enqueueTrackedChunkUpdate(chunk),
                 flushQueuedTrackedChunkUpdates: () => flushQueuedTrackedChunkUpdates(),
+                loadChunks: (forceFullRedraw = false) => loadChunks(forceFullRedraw),
             }};
             `;
 

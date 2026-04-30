@@ -366,6 +366,7 @@ async def get_config():
             "provider": "qwen3",
             "mode": "local",
             "local_backend": "auto",
+            "designed_voices": True,
             "url": "http://127.0.0.1:7860",
             "device": "auto",
             "language": "English",

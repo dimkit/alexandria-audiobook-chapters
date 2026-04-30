@@ -43,6 +43,8 @@ _STRUCTURED_LLM_SERVICE = get_llm_gateway()
 # Matches straight (") or curly (\u201c / \u201d) double-quotes enclosing ≥2 chars.
 QUOTE_RE = re.compile(r'["\u201c][^"\u201d]{2,}["\u201d]', re.DOTALL)
 WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
+QWEN3_DESIGNED_VOICES_BYPASS_REASON = "qwen3_designed_voices"
+QWEN3_DESIGNED_VOICES_SENTIMENT = "neutral, even narration"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a narrative tone specialist helping to produce an audiobook. "
@@ -146,6 +148,88 @@ def split_paragraphs_for_temperament(paragraphs: list) -> tuple[list[tuple[int, 
         else:
             narration.append((idx, para))
     return narration, dialogue
+
+
+def _config_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
+def _qwen3_designed_voices_bypass_enabled(config: dict) -> bool:
+    tts_cfg = config.get("tts") if isinstance(config, dict) else {}
+    if not isinstance(tts_cfg, dict):
+        return False
+    provider = str(tts_cfg.get("provider") or "qwen3").strip().lower()
+    return provider == "qwen3" and _config_bool(tts_cfg.get("designed_voices"), True)
+
+
+def _clear_qwen3_designed_voices_bypass(paragraphs_doc: dict) -> bool:
+    changed = False
+    if paragraphs_doc.get("temperament_bypass_reason") == QWEN3_DESIGNED_VOICES_BYPASS_REASON:
+        paragraphs_doc.pop("temperament_bypass_reason", None)
+        paragraphs_doc["temperament_extraction_complete"] = False
+        changed = True
+
+    for para in paragraphs_doc.get("paragraphs", []) or []:
+        if not isinstance(para, dict):
+            continue
+        if para.get("temperament_bypass_reason") != QWEN3_DESIGNED_VOICES_BYPASS_REASON:
+            continue
+        para.pop("temperament_bypass_reason", None)
+        if para.get("tone") == QWEN3_DESIGNED_VOICES_SENTIMENT:
+            para["tone"] = ""
+        para["temperament_error"] = False
+        if para.get("has_dialogue"):
+            para["dialogue_moods"] = []
+            para["quote_mood_errors"] = []
+            para["dialogue_mood_error"] = False
+        changed = True
+    return changed
+
+
+def _apply_qwen3_designed_voices_bypass(paragraphs_doc: dict) -> None:
+    paragraphs = paragraphs_doc.get("paragraphs", []) or []
+    affected = 0
+    for para in paragraphs:
+        if not isinstance(para, dict) or is_structural_silence_paragraph(para):
+            if isinstance(para, dict):
+                para.pop("temperament_bypass_reason", None)
+            continue
+
+        para["tone"] = QWEN3_DESIGNED_VOICES_SENTIMENT
+        para["temperament_error"] = False
+        para["temperament_bypass_reason"] = QWEN3_DESIGNED_VOICES_BYPASS_REASON
+
+        if para.get("has_dialogue"):
+            quote_count = len(QUOTE_RE.findall(para.get("text") or ""))
+            para["dialogue_moods"] = [QWEN3_DESIGNED_VOICES_SENTIMENT] * quote_count
+            para["quote_mood_errors"] = [False] * quote_count
+            para["dialogue_mood_error"] = False
+        else:
+            para.pop("dialogue_moods", None)
+            para.pop("quote_mood_errors", None)
+            para.pop("dialogue_mood_error", None)
+        affected += 1
+
+    paragraphs_doc["temperament_bypass_reason"] = QWEN3_DESIGNED_VOICES_BYPASS_REASON
+    paragraphs_doc["temperament_extraction_complete"] = True
+    paragraphs_doc["temperament_errors"] = []
+    paragraphs_doc["dialogue_mood_errors"] = []
+    _log(
+        "QWEN3 Designed Voices enabled; assigned neutral sentiment to "
+        f"{affected} paragraph(s) and skipped LLM temperament extraction."
+    )
 
 
 def _extract_mood_from_text(text: str) -> str:
@@ -464,6 +548,14 @@ def main():
     llm_cfg = config.get("llm") or {}
     gen_cfg = config.get("generation") or {}
     prompts = config.get("prompts") or {}
+
+    if _qwen3_designed_voices_bypass_enabled(config):
+        _apply_qwen3_designed_voices_bypass(paragraphs_doc)
+        _checkpoint_write(paragraphs_path, project_root, paragraphs_doc, complete=True)
+        return
+
+    if _clear_qwen3_designed_voices_bypass(paragraphs_doc):
+        _log("QWEN3 Designed Voices bypass is no longer active; clearing bypassed sentiment for fresh extraction.")
 
     runtime = LLMRuntimeConfig.from_dict(
         llm_cfg,

@@ -174,6 +174,12 @@
                                     <option value="voxcpm2">VoxCPM2</option>
                                 </select>
                             </div>
+                            <div class="col-md-2" id="qwen3-designed-voices-group">
+                                <div class="form-check form-switch mt-4" title="QWEN3 does not support the use of instructions for designed voices. Emotions are only used when using the QWEN3 default voices.">
+                                    <input class="form-check-input" type="checkbox" id="qwen3-designed-voices" checked title="QWEN3 does not support the use of instructions for designed voices. Emotions are only used when using the QWEN3 default voices.">
+                                    <label class="form-check-label" for="qwen3-designed-voices" title="QWEN3 does not support the use of instructions for designed voices. Emotions are only used when using the QWEN3 default voices.">Designed Voices</label>
+                                </div>
+                            </div>
                             <div class="col-md-2">
                                 <label class="form-label" title="Local loads model in-process; External connects to a Gradio TTS server">TTS Mode</label>
                                 <select class="form-select" id="tts-mode" onchange="toggleTTSMode()" title="Local loads model in-process; External connects to a Gradio TTS server">

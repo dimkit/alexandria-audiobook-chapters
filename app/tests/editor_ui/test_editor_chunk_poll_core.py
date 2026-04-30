@@ -4,6 +4,90 @@ from ._editor_tab_node_harness import EditorTabChunkPollTests
 
 
 class EditorChunkPollCoreTests(EditorTabChunkPollTests):
+    def test_load_chunks_hides_instruct_column_for_qwen3_designed_voices(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                context.API.get = async (url) => {
+                    if (url === '/api/config') {
+                        return { tts: { provider: 'qwen3', designed_voices: true } };
+                    }
+                    if (url === '/api/chunks/chapters') {
+                        return { chapters: [] };
+                    }
+                    if (url === '/api/chunks/view') {
+                        return [{
+                            id: 1,
+                            uid: 'line-1',
+                            speaker: 'NARRATOR',
+                            text: 'A neutral line.',
+                            instruct: 'neutral, even narration',
+                            status: 'pending',
+                            audio_path: null,
+                            audio_validation: null,
+                        }];
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                await context.__editorTabTestHooks.loadChunks(true);
+
+                const html = context.document.getElementById('chunks-table-body').__html;
+                assert.ok(!html.includes('chunk-instruct-cell'), 'QWEN3 designed voices should remove instruct cells');
+                assert.ok(!html.includes('data-editor-field="instruct"'), 'QWEN3 designed voices should not render instruct inputs');
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
+    def test_load_chunks_shows_instruct_column_for_voxcpm2_even_when_designed_voices_true(self):
+        self._run_node_test(
+            """
+            (async () => {
+                const context = createContext();
+                context.API.get = async (url) => {
+                    if (url === '/api/config') {
+                        return { tts: { provider: 'voxcpm2', designed_voices: true } };
+                    }
+                    if (url === '/api/chunks/chapters') {
+                        return { chapters: [] };
+                    }
+                    if (url === '/api/chunks/view') {
+                        return [{
+                            id: 1,
+                            uid: 'line-1',
+                            speaker: 'NARRATOR',
+                            text: 'A voiced line.',
+                            instruct: 'somber delivery',
+                            status: 'pending',
+                            audio_path: null,
+                            audio_validation: null,
+                        }];
+                    }
+                    throw new Error(`Unexpected GET ${url}`);
+                };
+
+                vm.createContext(context);
+                vm.runInContext(source, context);
+
+                await context.__editorTabTestHooks.loadChunks(true);
+
+                const html = context.document.getElementById('chunks-table-body').__html;
+                assert.ok(html.includes('chunk-instruct-cell'), 'Non-QWEN3 designed voices should keep instruct cells');
+                assert.ok(html.includes('data-editor-field="instruct"'), 'Non-QWEN3 designed voices should keep instruct inputs');
+            })().catch((error) => {
+                console.error(error);
+                process.exit(1);
+            });
+            """
+        )
+
     def test_generate_chunk_polls_until_done_without_broad_reload(self):
         self._run_node_test(
             """

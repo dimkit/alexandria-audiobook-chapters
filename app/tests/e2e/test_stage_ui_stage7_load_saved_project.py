@@ -40,7 +40,9 @@ def test_e2e_stage7_load_saved_project_after_reset_nonlegacy_ui_only():
             },
             "tts": {
                 "mode": "local",
+                "provider": "qwen3",
                 "local_backend": "qwen",
+                "designed_voices": False,
                 "device": "cpu",
                 "language": "English",
                 "parallel_workers": 1,
@@ -81,7 +83,9 @@ def test_e2e_stage7_load_saved_project_after_reset_nonlegacy_ui_only():
             },
             "tts": {
                 "mode": "local",
+                "provider": "qwen3",
                 "local_backend": "qwen",
+                "designed_voices": False,
                 "device": "cpu",
                 "language": "English",
                 "parallel_workers": 1,

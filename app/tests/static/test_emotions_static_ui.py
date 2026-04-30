@@ -59,14 +59,27 @@ def test_setup_fragment_exposes_voxcpm2_backend_controls():
     assert 'id="voxcpm-inference-timesteps" value="10" min="4" max="30"' in fragment
 
 
+def test_setup_fragment_exposes_qwen3_designed_voices_toggle_with_exact_hint():
+    fragment = (ROOT / "app/static/fragments/setup.html").read_text(encoding="utf-8")
+    hint = "QWEN3 does not support the use of instructions for designed voices. Emotions are only used when using the QWEN3 default voices."
+
+    assert 'id="qwen3-designed-voices-group"' in fragment
+    assert 'id="qwen3-designed-voices"' in fragment
+    assert ">Designed Voices<" in fragment
+    assert f'title="{hint}"' in fragment
+
+
 def test_setup_script_loads_saves_and_toggles_voxcpm2_controls():
     script = (ROOT / "app/static/js/legacy/03_setup_tab.js").read_text(encoding="utf-8")
 
     assert "function toggleVoxCPM2Options()" in script
+    assert "function toggleQwen3DesignedVoicesOption()" in script
     assert "function getTTSScriptMaxLengthDefault" in script
     assert "function clampNumber" in script
     assert "voxcpm2-options" in script
     assert "voxcpm-optimize-group" in script
+    assert "qwen3-designed-voices-group" in script
+    assert "designed_voices" in script
     assert "isMacHostUI()" in script
     for config_key, field_id in (
         ("voxcpm_model_id", "voxcpm-model-id"),

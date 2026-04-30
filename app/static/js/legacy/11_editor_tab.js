@@ -26,6 +26,7 @@
         let latestAudioCoverage = null;
         let latestProofreadStatus = null;
         let renderPrepComplete = false;
+        let hideEditorInstructColumn = false;
         let _queueStatusToastShown = false;
         const activeChunkStatusPolls = new Map();
         const singleChunkPollIntervalMs = 1000;
@@ -1976,6 +1977,31 @@
             }
         }
 
+        function applyEditorInstructColumnVisibility() {
+            const instructHeader = document.getElementById('editor-instruct-header');
+            const textHeader = document.getElementById('editor-text-header');
+            if (instructHeader) {
+                instructHeader.style.display = hideEditorInstructColumn ? 'none' : '';
+            }
+            if (textHeader) {
+                textHeader.setAttribute('width', hideEditorInstructColumn ? '72%' : '52%');
+            }
+        }
+
+        async function refreshEditorInstructColumnVisibility() {
+            const previous = hideEditorInstructColumn;
+            try {
+                const config = await API.get('/api/config');
+                const tts = config?.tts || {};
+                hideEditorInstructColumn = String(tts.provider || 'qwen3').trim().toLowerCase() === 'qwen3'
+                    && tts.designed_voices !== false;
+            } catch (e) {
+                hideEditorInstructColumn = false;
+            }
+            applyEditorInstructColumnVisibility();
+            return previous !== hideEditorInstructColumn;
+        }
+
         function connectEditorEventStream() {
             disconnectEditorEventStream();
             const params = new URLSearchParams();
@@ -2039,12 +2065,13 @@
             const chunkRef = getChunkRef(chunk);
             const quotedChunkRef = JSON.stringify(chunkRef);
             const durVal = chunk.silence_duration_s != null ? chunk.silence_duration_s : 1.0;
+            const contentColspan = hideEditorInstructColumn ? 2 : 3;
             return `
                 <tr data-id="${escapeHtml(chunkRef)}" data-chapter="${escapeHtml(getChunkChapterName(chunk) || '')}" class="chunk-row chunk-silence-row" style="background:rgba(0,0,0,0.04);">
                     <td class="text-center align-middle" style="white-space:nowrap;">
                         <button class="chunk-expand-btn" onclick='deleteChunk(${quotedChunkRef})' title="Delete silence"><i class="fas fa-trash" style="color:#dc3545;"></i></button>
                     </td>
-                    <td colspan="3" class="align-middle ps-3">
+                    <td colspan="${contentColspan}" class="align-middle ps-3">
                         <span class="text-muted me-2"><i class="fas fa-hourglass-half"></i> Silence</span>
                         <input type="number" class="form-control form-control-sm d-inline-block" style="width:80px;" value="${durVal}" min="0" step="0.1" oninput='validateSilenceDuration(this)' onchange='saveSilenceDuration(${quotedChunkRef}, this)' title="Duration in seconds">
                         <span class="text-muted small ms-1">seconds</span>
@@ -2077,6 +2104,9 @@
                 : chunk.status === 'finalizing'
                     ? buildFinalizingProgressHtml()
                     : buildGenerateButtonHtml(chunkRef);
+            const instructCell = hideEditorInstructColumn
+                ? ''
+                : `<td class="chunk-field-cell chunk-instruct-cell"><textarea class="form-control form-control-sm chunk-field-input chunk-instruct" rows="2" data-editor-field="instruct" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})' title="Short TTS direction (3-8 words)">${escapeHtml(chunk.instruct || '')}</textarea></td>`;
 
             return `
                 <tr data-id="${escapeHtml(chunkRef)}" data-chapter="${escapeHtml(getChunkChapterName(chunk) || '')}" class="chunk-row${rowStatusClass ? ` ${rowStatusClass}` : ''}">
@@ -2090,7 +2120,7 @@
                     </td>
                     <td class="chunk-field-cell chunk-speaker-cell"><input type="text" class="form-control form-control-sm chunk-field-input chunk-speaker-input" value="${escapeHtml(chunk.speaker)}" data-editor-field="speaker" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})'></td>
                     <td class="chunk-field-cell chunk-text-cell"><textarea class="form-control form-control-sm chunk-field-input chunk-text" rows="2" data-editor-field="text" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})'>${escapeHtml(chunk.text)}</textarea></td>
-                    <td class="chunk-field-cell chunk-instruct-cell"><textarea class="form-control form-control-sm chunk-field-input chunk-instruct" rows="2" data-editor-field="instruct" oninput='scheduleEditorChunkSave(${quotedChunkRef})' onchange='flushEditorChunkSave(${quotedChunkRef})' title="Short TTS direction (3-8 words)">${escapeHtml(chunk.instruct || '')}</textarea></td>
+                    ${instructCell}
                     <td class="chunk-audio-cell"><div class="chunk-audio-slot">${audioPlayer}</div></td>
                 </tr>
             `;
@@ -2107,6 +2137,10 @@
 
             const run = (async () => {
                 const tbody = document.getElementById('chunks-table-body');
+                const instructVisibilityChanged = await refreshEditorInstructColumnVisibility();
+                if (instructVisibilityChanged) {
+                    forceFullRedraw = true;
+                }
 
                 // Show loading only if empty
                 if (tbody.children.length === 0 || (tbody.children.length === 1 && tbody.children[0].children.length === 1)) {
