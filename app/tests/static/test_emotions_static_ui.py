@@ -65,8 +65,11 @@ def test_setup_fragment_exposes_qwen3_designed_voices_toggle_with_exact_hint():
 
     assert 'id="qwen3-designed-voices-group"' in fragment
     assert 'id="qwen3-designed-voices"' in fragment
+    assert 'id="qwen3-designed-voices-hint"' in fragment
+    assert 'fa-circle-question' in fragment
     assert ">Designed Voices<" in fragment
     assert f'title="{hint}"' in fragment
+    assert f'aria-label="{hint}"' in fragment
 
 
 def test_setup_script_loads_saves_and_toggles_voxcpm2_controls():
